@@ -1,0 +1,74 @@
+# 探索区：venv、模型缓存、下载来的第三方发行包都是一次性的；只有我们自己写的脚本进版本库
+/explore/*
+!/explore/README.md
+!/explore/env.ps1
+!/explore/env.sh
+!/explore/paddleocr/
+/explore/paddleocr/*
+!/explore/paddleocr/*.py
+!/explore/rapidocr/
+/explore/rapidocr/*
+!/explore/rapidocr/*.py
+!/explore/rapidocr/*.sh
+!/explore/p1-seqmatch/
+/explore/p1-seqmatch/*
+!/explore/p1-seqmatch/*.py
+!/explore/onnxrt/
+/explore/onnxrt/*
+!/explore/onnxrt/*.py
+!/explore/a1-mask-reuse/
+/explore/a1-mask-reuse/*
+!/explore/a1-mask-reuse/*.py
+!/explore/a1-mask-reuse/*.sh
+!/explore/x4-charset/
+/explore/x4-charset/*
+!/explore/x4-charset/*.py
+!/explore/audit-probes/
+/explore/audit-probes/*
+!/explore/audit-probes/*.py
+!/explore/audit-probes/README.md
+!/explore/probes/
+/explore/probes/*
+!/explore/probes/*.py
+!/explore/probes/*.sh
+!/explore/probes/README.md
+!/explore/drop-paddle-oracle/
+/explore/drop-paddle-oracle/*
+!/explore/drop-paddle-oracle/*.py
+
+# 产物与临时文件
+/out/
+/tmp/
+# 官方 ONNX 模型（`python -m flowocr.models fetch` 取到数据根的 models/）
+/models/
+# 游戏文本包（game-text-data 的 `gametext <游戏> bundle` 出的 zip，私下拿到后放这里；flowocr.paths.gametext_root）
+/gametext/
+
+# 随手调研笔记，只留本地（正式结论写 docs/reports/ 等正式文档）。
+/docs/notes/
+
+# 并行 worktree：`git worktree add .worktrees/<slot> -b <branch>`。放在仓库里，
+# 一个父目录装下全部槽位；ignore 掉，主 checkout 就看不见槽里的树。
+# ⚠ `git clean -xdff` 会删掉它们，单 `-f` 会跳过。
+/.worktrees/
+
+# 探索用的数据只留在本地（owner 2026-09-20）：素材、索引、样本清单、真值、残留快照一概不进版本库。
+# 以后要放小的 example 再单独放行。代码（原 data/reference/）已搬到 dev_tools/reference/。
+# ⚠ worktree 槽里因此没有 data/：读 data/ 一律走 flowocr.paths 的 data_root()（解析回主 checkout）。
+/data/
+
+__pycache__/
+*.pyc
+.venv/
+
+# 助手的工作记忆目录（`.workbuddy/` 里的日志与记忆），只留在本地，不进版本库。
+# 正式结论仍然写进正式文档——这条和 /docs/notes/ 那条是同一条规矩。
+/.workbuddy/
+
+# 正式包构建残留（pyproject.toml，src 布局）
+/src/*.egg-info/
+/build/
+/dist/
+
+# 维护者的私有补充：追踪但发布时剥离（项目约定；全局 ignore 的 *.local.md 在这里放行）
+!CLAUDE.local.md

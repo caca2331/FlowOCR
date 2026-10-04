@@ -1,0 +1,63 @@
+# 公开仓库的 CI：Windows + CPU 路径（GitHub 的托管机没有 NVIDIA 显卡，GPU 路径测不了，不阻塞，靠用户反馈）。
+# dev_tools/publish.py 发布时先推到 ci-gate 分支，这个工作流全绿才把同一个提交推上 main（.publish.toml 的 ci_gate）。
+name: CI
+
+on:
+  push:
+    branches: [main, ci-gate]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Windows runner 的默认输出编码无法打印中文日志。
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  windows-cpu:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: ffmpeg
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -hide_banner -version | Select-Object -First 1
+
+      - name: 安装（CPU extras + dev 工具）
+        run: uv sync --frozen --extra cpu --group dev
+
+      - name: 守卫
+        run: .venv\Scripts\python.exe tests\test_guards.py
+
+      - name: 三步冒烟（CPU）
+        run: .venv\Scripts\python.exe dev_tools\ci_smoke.py --device cpu
+
+      # 打不出包（sdist / wheel）或元数据过不了 twine check 的提交过不了闸门；不带参数的 uv build 从 sdist 打 wheel，顺带核了 sdist 的内容
+      - name: 打包（sdist + wheel）与 twine check
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步
+          uv build --no-create-gitignore --out-dir tmp\dist
+          uvx twine check --strict (Get-ChildItem tmp\dist\*).FullName
+
+      # .venv 是 editable 安装，examples/ 和源码树挨着；这一步把 wheel 装进全新 venv，证明"装成包之后拿外部文件当扩展"这条路
+      - name: 装成包之后加载外部扩展（examples/）
+        shell: pwsh
+        run: |
+          uv venv tmp\pkgvenv
+          $whl = (Get-ChildItem tmp\dist\*.whl).FullName
+          uv pip install --python tmp\pkgvenv\Scripts\python.exe "$whl[cpu]"
+          tmp\pkgvenv\Scripts\python.exe dev_tools\ci_extensions.py --tracks tmp\ci-smoke\out\smoke-tracks.json
+
+      - name: 文档检查
+        run: .venv\Scripts\python.exe dev_tools\check_docs.py

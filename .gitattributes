@@ -1,0 +1,7 @@
+# Copied from a preset. Line endings: LF in the repo and in every checkout, whatever
+# core.autocrlf says on the machine.
+* text=auto eol=lf
+
+# cmd.exe reads batch files line by line and mis-executes LF-only ones, so these check out as CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf

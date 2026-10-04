@@ -1,0 +1,307 @@
+# 发版：手动派发，只有一个输入 target。做法与先后在维护者的 release skill 里；这里只说 workflow 自己保证什么。
+#   dry-run   gh workflow run release.yml --ref main -f target=dry-run       构建 + 全部验证，什么都不发
+#   testpypi  gh workflow run release.yml --ref main -f target=testpypi      版本改成 <版本>.dev<run_number> 传 TestPyPI，再从那里装回来跑冒烟
+#   release   gh workflow run release.yml --ref v<版本> -f target=release    GitHub Release 在前、PyPI 最后，传完从 PyPI 装回来跑冒烟
+# workflow 定义和检出的代码都取自 --ref 指的那个提交。PyPI 的版本号传过一次就永久占用，所以 PyPI 永远是最后一个 job，
+# 之前的核对（版本三处一致、这个提交的 CI 是绿的、PyPI 上还没有这个版本）都过了才走到它。
+# 输入一律经 env: 传进脚本，不在 run: 里直接写 ${{ }}。多条命令的 pwsh 步骤开头设 $PSNativeCommandUseErrorActionPreference，
+# 哪条原生命令失败就停在哪条，失败日志指向真正的原因（skill 靠日志判断能不能重跑）。
+name: Release
+run-name: "${{ inputs.target }} ${{ github.ref_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "dry-run（只构建与验证）/ testpypi / release"
+        required: true
+        type: choice
+        options: [dry-run, testpypi, release]
+        default: dry-run
+
+permissions:
+  contents: read
+
+# Windows runner 的默认输出编码无法打印中文日志。
+env:
+  PYTHONUTF8: "1"
+
+# 同一个 ref 不并行发两次
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read      # 查这个提交的 CI 结论
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: ffmpeg
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          ffmpeg -hide_banner -version | Select-Object -First 1
+
+      - name: 核对版本、ref、CI 与 PyPI
+        id: check
+        shell: pwsh
+        env:
+          TARGET: ${{ inputs.target }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $heads = Select-String -Path CHANGELOG.md -Pattern '^## (\S+?)(?=[ （]|$)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $released = $heads | Where-Object { $_ -ne '未发布' } | Select-Object -First 1
+          if ($released -ne $ver) { throw "CHANGELOG 最上面那个已发布的标题是 '$released'，pyproject.toml 是 '$ver'" }
+          if ($env:TARGET -eq 'release') {
+            if ($env:REF -ne "refs/tags/v$ver") { throw "target=release 要从 tag v$ver 派发（--ref v$ver），现在是 $($env:REF)" }
+            $code = try { (Invoke-WebRequest "https://pypi.org/pypi/flowocr/$ver/json" -UseBasicParsing).StatusCode } catch { $_.Exception.Response.StatusCode.value__ }
+            if (-not $code) { throw "查不到 PyPI（网络问题），没法确认版本号是否已占用" }
+            if ($code -ne 404) { throw "PyPI 上已经有 flowocr $ver（HTTP $code），版本号已占用" }
+          } elseif ($env:REF -ne 'refs/heads/main') {
+            throw "target=$($env:TARGET) 要从 main 派发（--ref main），现在是 $($env:REF)"
+          }
+          $ok = gh api "repos/$($env:REPO)/actions/runs?head_sha=$($env:SHA)&status=success" --paginate --jq '.workflow_runs[] | select(.name == "CI") | .id'
+          if (-not $ok) { throw "提交 $($env:SHA) 上没有一次成功的 CI" }
+          if ($env:TARGET -eq 'testpypi') {
+            $ver = "$ver.dev$($env:RUN_NUMBER)"
+            (Get-Content pyproject.toml) -replace '^version = ".*"', "version = `"$ver`"" | Set-Content pyproject.toml
+          }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "版本 $ver，提交 $($env:SHA)，target $($env:TARGET)"
+
+      - name: 打包（sdist + wheel）与 twine check
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          uv build --no-create-gitignore --out-dir dist
+          uvx twine check --strict (Get-ChildItem dist\*).FullName
+
+      - name: 打模型包
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          uv sync --frozen --extra cpu
+          .venv\Scripts\flowocr-models fetch
+          .venv\Scripts\flowocr-models pack "dist\flowocr-models-$($env:VERSION).zip"
+
+      - name: 不带 extra 装：起跑时说要选哪个 extra
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          uv venv tmp\v-bare --python 3.12
+          $whl = (Get-ChildItem dist\*.whl).FullName
+          uv pip install --python tmp\v-bare\Scripts\python.exe $whl
+          ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=black:s=320x240:d=1 -y tmp\blank.mp4
+          $PSNativeCommandUseErrorActionPreference = $false   # 下面这条本来就该非 0 退出
+          $out = & tmp\v-bare\Scripts\flowocr-ocr.exe tmp\blank.mp4 --out tmp\blank.jsonl 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) { throw "不带 extra 时 flowocr-ocr 居然退出 0" }
+          $LASTEXITCODE = 0
+          if ($out -notmatch '没装推理后端') { throw "不带 extra 时没打出选 extra 的提示：`n$out" }
+
+      - name: "[cpu] 装：三步冒烟"
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          uv venv tmp\v-cpu --python 3.12
+          $whl = (Get-ChildItem dist\*.whl).FullName
+          uv pip install --python tmp\v-cpu\Scripts\python.exe "$whl[cpu]"
+          tmp\v-cpu\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-cpu
+          if ($LASTEXITCODE) { throw "冒烟失败" }
+
+      - name: 模型包离线装：不联网跑第 1 步
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          FLOWOCR_MODELS: ${{ github.workspace }}\tmp\offline-models
+          HF_ENDPOINT: http://127.0.0.1:9
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          New-Item -ItemType Directory -Force $env:FLOWOCR_MODELS | Out-Null
+          tmp\v-cpu\Scripts\flowocr-models.exe install "dist\flowocr-models-$($env:VERSION).zip"
+          if ($LASTEXITCODE) { throw "装模型包失败" }
+          tmp\v-cpu\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-offline
+          if ($LASTEXITCODE) { throw "离线冒烟失败" }
+
+      - name: 附件恰好是 wheel、sdist、模型包
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          $want = @("flowocr-$($env:VERSION)-py3-none-any.whl", "flowocr-$($env:VERSION).tar.gz", "flowocr-models-$($env:VERSION).zip") | Sort-Object
+          $have = Get-ChildItem dist | ForEach-Object Name | Sort-Object
+          if (Compare-Object $want $have) { throw "dist 里是 $($have -join ', ')，应当恰好是 $($want -join ', ')" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: true
+
+  testpypi:
+    needs: build
+    if: inputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: rm dist/flowocr-models-*.zip
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true    # .devN 每个 run 唯一；重跑失败 job 时跳过已传的那个
+
+  testpypi-verify:
+    needs: [build, testpypi]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: 按 TestPyPI 上 wheel 的直接链接装 [cpu]（依赖照常从 PyPI 取），跑冒烟
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
+          $url = $null
+          foreach ($i in 1..20) {
+            try { $url = ((Invoke-RestMethod "https://test.pypi.org/pypi/flowocr/$($env:VERSION)/json").urls | Where-Object packagetype -eq 'bdist_wheel').url } catch {}
+            if ($url) { break }; Start-Sleep 15
+          }
+          if (-not $url) { throw "TestPyPI 上等不到 flowocr $($env:VERSION) 的 wheel" }
+          uv venv tmp\v-test --python 3.12
+          uv pip install --python tmp\v-test\Scripts\python.exe "flowocr[cpu] @ $url"
+          tmp\v-test\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-test
+          if ($LASTEXITCODE) { throw "冒烟失败" }
+
+  github-release:
+    needs: build
+    if: inputs.target == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: 建 GitHub Release（直接公开），说明取 CHANGELOG 里这一节
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          awk -v v="$VERSION" 'BEGIN { gsub(/\./, "\\.", v) }
+            /^## / { if (p) exit; if ($0 ~ ("^## " v "([ （]|$)")) { p = 1; next } }
+            p' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then echo "CHANGELOG 里 $VERSION 那一节是空的" >&2; exit 1; fi
+          gh release create "v$VERSION" --verify-tag --title "flowocr $VERSION" --notes-file notes.md dist/*
+
+  pypi:
+    needs: [build, github-release]
+    if: inputs.target == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write    # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - run: rm dist/flowocr-models-*.zip
+      - name: PyPI 上这个版本已有的文件只能是这次 artifact 里的同一份（第一次跑时一个都没有；重跑时可能已传了一部分）
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, pathlib, sys, urllib.error, urllib.request
+          ver = os.environ["VERSION"]
+          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          try:
+              urls = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/flowocr/{ver}/json"))["urls"]
+          except urllib.error.HTTPError as e:
+              if e.code == 404:
+                  sys.exit(0)
+              raise
+          bad = [u["filename"] for u in urls if local.get(u["filename"]) != u["digests"]["sha256"]]
+          sys.exit(f"PyPI 上已有 flowocr {ver} 的别的文件：{bad}" if bad else 0)
+          EOF
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+      - name: PyPI 上两个文件的 sha256 与 artifact 相同
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, pathlib, sys, time, urllib.request
+          ver = os.environ["VERSION"]
+          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          for _ in range(20):
+              try:
+                  urls = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/flowocr/{ver}/json"))["urls"]
+                  remote = {u["filename"]: u["digests"]["sha256"] for u in urls}
+                  if set(remote) >= set(local):
+                      break
+              except Exception:
+                  pass
+              time.sleep(15)
+          else:
+              sys.exit(f"PyPI 上等不齐 {sorted(local)}")
+          bad = [n for n in local if remote[n] != local[n]]
+          sys.exit(f"sha256 对不上：{bad}" if bad else 0)
+          EOF
+
+  pypi-verify:
+    needs: [build, pypi]
+    if: inputs.target == 'release'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ffmpeg
+        run: choco install ffmpeg -y --no-progress
+      - name: 从 PyPI 装 [cpu]（刚上可能要等几分钟），跑冒烟
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $ok = $false   # 这里的 uv tool install 失败是预期内的（PyPI 还没生效），靠循环重试，不设 PSNativeCommandUseErrorActionPreference
+          foreach ($i in 1..20) {
+            uv tool install --refresh "flowocr[cpu]==$($env:VERSION)"
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep 30
+          }
+          if (-not $ok) { throw "从 PyPI 装不上 flowocr[cpu]==$($env:VERSION)" }
+          $py = Join-Path (uv tool dir) 'flowocr\Scripts\python.exe'
+          & $py dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-pypi
+          if ($LASTEXITCODE) { throw "冒烟失败" }

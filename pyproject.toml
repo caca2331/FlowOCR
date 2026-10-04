@@ -1,0 +1,105 @@
+# flowocr 正式包。推理只用 ONNX Runtime（2026-10 运行时去掉了 Paddle：默认路径从 09-25 起就不 import 它，drop-paddle 计划）。
+#   * `[nvidia]`：onnxruntime-gpu 1.29.0（CUDA 13 构建，sm_120 有原生 SASS，默认的 fp16 rec 模型能用）。ORT 的 `[cuda,cudnn]` extras
+#     只写 `~=13.0` / `~=9.0`，这里把 CUDA 运行库钉在 ORT 1.29 验证过的那一套（13.0.x / cuDNN 9.13；不钉的话 nvjitlink 在 Windows 上会解析成 13.4）。
+#     驱动下限按 CUDA 13.0 的要求（Windows R580 系列）；
+#   * `[cpu]`：onnxruntime 的 CPU 包，版本和 `[nvidia]` 同一个（后端行为一致）；
+#   * cv2 声明 `opencv-contrib-python` 4.10 系列：det / rec 的前处理都靠它，升级会改产物，要单独 A/B。
+# `[nvidia]` 和 `[cpu]` 互斥（同一个 `onnxruntime` 顶层包两份实现），`tool.uv.conflicts` 声明了；装成包时这条不进元数据，启动时另查。
+# `uv.lock` 是解析结果（`uv lock`）；源码装按 `uv sync --frozen --extra nvidia|cpu`。
+
+[build-system]
+requires = ["setuptools>=77"]   # PEP 639：license 写 SPDX 表达式 + license-files
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowocr"
+version = "0.1.0"
+description = "从视频里抽全部屏幕文字、带起止时间、按区域聚类，导出 SRT / ASS"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "LICENSES/*"]   # 本项目的 GPL 与第三方模型（PP-OCRv6，Apache-2.0）的许可与改动说明，随 wheel / sdist 走
+authors = [{ name = "caca2331" }]
+keywords = ["ocr", "subtitle", "video", "srt", "ass", "onnxruntime"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: Microsoft :: Windows",   # 只在 Windows 上验证过；别的平台起跑时打警告（owner 2026-10-02）
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+dependencies = [
+    "numpy>=2.3,<3",
+    "opencv-contrib-python>=4.10,<4.11",   # det / rec 前处理都靠它；升级会改产物，单独 A/B 之后再放宽
+    "pillow>=10",
+    "psutil>=6",
+    "pyclipper>=1.3",   # det 的 DB 后处理（flowocr.extract.detpost）
+    "pyyaml>=6",        # det 的前后处理配置读模型目录的 inference.yml（detpost.DetSpec.from_yml）
+    "zstandard>=0.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/caca2331/FlowOCR"
+Documentation = "https://github.com/caca2331/FlowOCR/blob/main/docs/manual/README.md"
+Issues = "https://github.com/caca2331/FlowOCR/issues"
+Changelog = "https://github.com/caca2331/FlowOCR/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# 推理后端，二选一：有 NVIDIA 显卡装 nvidia，否则 cpu。没有可用的卡时 nvidia 也会退回 CPU。
+nvidia = [
+    "onnxruntime-gpu[cuda,cudnn]==1.29.0",
+    "onnx>=1.17",   # 取官方 ONNX 模型后把 CTC 的 argmax 融进图里（flowocr.models；只加两个节点、不动权重）
+    "nvidia-cuda-runtime==13.0.88",
+    "nvidia-cudnn-cu13==9.13.0.50",
+    "nvidia-cublas==13.0.2.14",
+    "nvidia-cufft==12.0.0.61",
+    "nvidia-curand==10.4.0.35",
+    "nvidia-cuda-nvrtc==13.0.*",
+    "nvidia-nvjitlink==13.0.88",   # cufft 要它
+]
+cpu = [
+    "onnxruntime==1.29.0",
+    "onnx>=1.17",
+]
+# 实验性聚类 `--cluster learned`（不进默认）
+learned = ["scikit-learn>=1.5"]
+
+[project.scripts]
+# 薄入口：每个都只是包里那个模块的 main。`flowocr-ocr` 指向监督者模块而不是 run_ocr2（后者顶层 import 推理库）
+flowocr-ocr = "flowocr.extract.supervisor:main"
+flowocr-tracks = "flowocr.analyze.build_tracks:main"
+flowocr-gamescript = "flowocr.analyze.gamescript:main"
+flowocr-match = "flowocr.analyze.match:main"        # 通用匹配入口（内置 / 用户匹配器同一条路）；scriptmatch 的 CLI 仍在，带评测报表
+flowocr-export = "flowocr.output.export:main"
+flowocr-render = "flowocr.output.render:main"
+flowocr-typeset = "flowocr.typeset.__main__:main"     # 阶段 4：字幕稿 -> 最终叠加 ASS
+flowocr-paths = "flowocr.paths:main"
+flowocr-models = "flowocr.models:main"      # 取官方 ONNX 模型（缺了管线也会自己取；离线机器先在联网处取好）
+
+[dependency-groups]
+# 开发：守卫、评测、探针要的。不进发行包。
+dev = [
+    "scikit-learn>=1.5",
+    "pyflakes>=3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# 实验性聚类 `--cluster learned` 的模型随代码走（slot_learned.MODEL_PATH）
+"flowocr.analyze" = ["models/*.json"]
+
+[tool.uv]
+package = true
+# `uv sync` 默认不装 dev 组：使用者照手册装只拿运行时依赖；开发 / CI 显式 `--group dev`
+default-groups = []
+# 两个后端互斥：同一个 `onnxruntime` 顶层包两份实现
+conflicts = [
+    [{ extra = "nvidia" }, { extra = "cpu" }],
+]
