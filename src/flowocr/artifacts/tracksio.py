@@ -43,11 +43,12 @@ text_effect? : 回抠写的整段素材的效果统计：samples, verdict?（ins
    常驻 UI 的判定是**逐轨**的（同一行在区域轨里够比例、并进主轨后不一定够），
    所以权威清单是 `tracks[].ui_lines`；`events[].flags` 里的 `ui_filtered`
    是"在它自己的区域轨里被剔了"的方便标记，别拿它去投影主轨。
-2. **cue 里的事件顺序就是 SRT 的行序**，不要在导出器里重排——
-   区域轨按 `(cy, cx)` 排、`segment` 模式另有排法，重排一次就对不上原产物了。
+2. **cue 里的事件顺序就是 SRT 的行序**，不要在导出器里重排：建轨按 `row_order` 排（先分行、行按纵向位置、行内从左到右），
+   重排一次就对不上原产物了。
 """
 from __future__ import annotations
 
+import bisect
 import json
 from pathlib import Path
 
@@ -55,6 +56,70 @@ SCHEMA = "flowocr-tracks/1"
 
 ALIGNS = ("left", "center", "right")
 """`regions[].align` 的取值。"""
+
+ROW_OVERLAP = 0.5
+"""两个框算同一行：纵向重叠至少是较矮那个字高的这么多（`same_row`）。"""
+ROW_H_RATIO = 1.7
+"""两个框算同一行：字高比不超过这么多。和建轨里"同一行字高"的门同一个值（`build_tracks.REGION_H_RATIO` / `GROW_H_RATIO`）——
+一个装着两行的高框不和旁边单行的框串成一行。"""
+SAMPLE_SLACK = 1.5
+"""采样级时刻的容差是这么多个采样间隔：采样点的实际间隔有抖动，名牌比正文早出现一个采样点的（yuka-f3 上 17 条，早 0.5002–0.5007 s，
+`frame_us` 0.50018 s）卡在"一个间隔"的边上，它们也不是"被拉早"。时间疑点检测（`timing_check`）和正文块起点的修正（`scriptmatch.body_start`）共用。"""
+
+
+def same_row(a, b) -> bool:
+    """两个框（`[x0, y0, x1, y1]`）在不在同一行。"""
+    ha, hb = a[3] - a[1], b[3] - b[1]
+    lo, hi = min(ha, hb), max(ha, hb)
+    if lo <= 0 or hi > ROW_H_RATIO * lo:
+        return False
+    return min(a[3], b[3]) - max(a[1], b[1]) >= ROW_OVERLAP * lo
+
+
+def boxes_cross(a, b) -> bool:
+    """两个框（`[x0, y0, x1, y1]`）相交（两个方向都有重叠）。"""
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
+class EventIndex:
+    """事件按起点排好，按时间窗取。比 `span_us` 还长的事件另存一份、每次都带上：它们的起点可能早在窗口之前，却一直挂过窗口。
+    所以 `window(t - span_us, t)` 里 `t_end > t` 的就是 `t` 那一刻在屏的全部事件，不用扫整份。
+    正文块起点的修正（`scriptmatch.body_start`）和时间疑点检测（`timing_check`）共用。"""
+
+    def __init__(self, events: list[dict], span_us: int):
+        self.span_us = span_us
+        self.events = sorted(events, key=lambda e: e["t_start"])
+        self.starts = [e["t_start"] for e in self.events]
+        self.long = [e for e in self.events if e["t_end"] - e["t_start"] > span_us]
+
+    def window(self, lo: int, hi: int) -> list[dict]:
+        """起点在 `[lo, hi]` 里的事件，加上起点在 `lo` 之前的长事件。"""
+        return [e for e in self.long if e["t_start"] < lo] + \
+            self.events[bisect.bisect_left(self.starts, lo):bisect.bisect_right(self.starts, hi)]
+
+    def on_screen(self, t: int, slack: int = 0) -> list[dict]:
+        """`t` 那一刻在屏的事件（起点放宽 `slack`：起点在 `t + slack` 之前、终点在 `t` 之后）。"""
+        return [e for e in self.window(t - self.span_us, t + slack) if e["t_end"] > t]
+
+
+def row_index(boxes: list) -> list[int]:
+    """每个框归到第几行：按纵向中心从上往下贪心归行，一个框要和这一行的**每个**成员都 `same_row` 才进这一行，
+    不做传递闭包——一个字高介于两行之间的框（称号、略大的一行）同时压着上下两行时，并查集会把两行串成一行，
+    拼行时横向间隙是负数、两行字被横着拼在一起。行按成员纵向中心的均值从上往下编号；结果只看几何，和输入顺序无关。"""
+    n = len(boxes)
+    groups: list[list[int]] = []
+    for i in sorted(range(n), key=lambda i: ((boxes[i][1] + boxes[i][3]) / 2, boxes[i][0], i)):
+        g = next((g for g in groups if all(same_row(boxes[i], boxes[j]) for j in g)), None)
+        if g is None:
+            groups.append([i])
+        else:
+            g.append(i)
+    order = sorted(groups, key=lambda m: (sum((boxes[i][1] + boxes[i][3]) / 2 for i in m) / len(m), min(m)))
+    out = [0] * n
+    for k, m in enumerate(order):
+        for i in m:
+            out[i] = k
+    return out
 
 
 class SchemaError(ValueError):
@@ -123,6 +188,8 @@ def validate(doc: dict) -> None:
         for cue in tr["cues"]:
             if not cue["events"]:
                 raise SchemaError(f"{tr['id']} 的 cue {cue['id']} 是空的")
+            if not set(cue.get("partial") or ()) <= set(cue.get("hide") or ()) <= set(cue["events"]):
+                raise SchemaError(f"{tr['id']}/{cue['id']}：partial ⊂ hide ⊂ events 不成立")
             for eid in cue["events"]:
                 if not 0 <= eid < n:
                     raise SchemaError(f"{tr['id']}/{cue['id']} 指向不存在的事件 {eid}")
@@ -141,6 +208,22 @@ def main_track(doc: dict) -> dict | None:
     return track(doc, tid) if tid else None
 
 
+def main_regions(doc: dict) -> set[int]:
+    """**整块**并进主轨的区域（主轨是真实区域时就是它自己）；没有主轨是空集。"""
+    main = main_track(doc)
+    if not main:
+        return set()
+    return set(main.get("regions") or ([main["region"]] if "region" in main else []))
+
+
+def in_main(ev: dict, regions: set[int]) -> bool:
+    """一个事件在不在主轨上——**按事件判**，`regions` 给 `main_regions(doc)`（调用方算一次）。
+
+    并带按窗补进来的事件（`build_tracks --main-band-unit window`）只有所在区域的一部分进了主轨，那块区域不在 `regions` 里，
+    靠事件上的 `band_merged` 标认；只按区域判的话，它在叠加 / 字幕稿里被当成主轨外，在 `choice_items` 里又会被当成选项候选。"""
+    return ev["region"] in regions or "band_merged" in (ev.get("flags") or ())
+
+
 def cue_lines(doc: dict, tr: dict, cue: dict, drop_filtered: bool = True) -> list[dict]:
     """一条 cue 在这条轨上要导出的事件。**投影，不是判断**：
 
@@ -157,16 +240,68 @@ def cue_lines(doc: dict, tr: dict, cue: dict, drop_filtered: bool = True) -> lis
     带进主轨，主轨 592 → 541 条、和 `build_tracks` 自己写的对不上（守卫当场抓到）。
     旧产物（只有 ui_lines、事件没标）照旧能投影。
 
+    cue 上的 `hide`（同句合并留作成员的半截行和杂行，`build_tracks.seg_hide`）只在这条 cue 里不给：`drop_filtered=True` 全剔，
+    `False` 只剔其中的半截行 `partial`（它是另一行的早先状态，不是另一段字），杂行照给、由调用方按 UI 换外观。
+
     事件上的 `ruby` 标（振り仮名，`build_tracks.ruby_runs`，全局、按几何）也只在 `drop_filtered=True` 时剔：
     它不是 UI，是正文的注音，SRT / 匹配器 / `default` 叠加不单独画它；可判据是几何的、会误标
     （任务 HUD 里的假名、面板小标题），所以全部文字的视图（`False`）照给，由调用方按标换外观——
     分类写进产物，藏不藏是输出的策略（2026-09-26 审计）。
     """
     ui = set(tr.get("ui_lines") or ())
-    evs = [doc["events"][i] for i in cue["events"]]
+    gone = set(cue.get("hide") or ()) if drop_filtered else set(cue.get("partial") or ())
+    evs = [doc["events"][i] for i in cue["events"] if i not in gone]
     return [e for e in evs
             if not (drop_filtered and (e["text"].strip() in ui
                                        or {"ui_footprint", "ruby"} & set(e.get("flags") or ())))]
+
+
+ROW_JOIN_GAP = 3.0
+"""同一行里相邻两段拼成一行的横向间隙上限，单位是行高（`cue_rows`）：破折号断开的那一例间隙约两个字宽；
+并带主轨里左右并排的两个对话框、表格的两栏远在这之外。"""
+
+
+def _cjk(ch: str) -> bool:
+    import unicodedata
+    return unicodedata.east_asian_width(ch) in ("W", "F")
+
+
+def join_row_text(a: str, b: str) -> str:
+    """同一行的两段字拼起来：交界处有一边是全角字（中日韩）就直接相连，否则空一格。"""
+    a, b = a.rstrip(), b.lstrip()
+    if not a or not b:
+        return a + b
+    return a + b if _cjk(a[-1]) or _cjk(b[0]) else a + " " + b
+
+
+def rows_of_events(evs: list[dict]) -> list[dict]:
+    """一组事件按可见的行拼好：`row_index` 分行，行内从左到右，横向间隙 ≤ `ROW_JOIN_GAP` 倍行高的相邻两段拼成一行
+    （框取并集、文字按 `join_row_text` 相接），隔得更远的同一行各自成行。返回 `[{"events", "box", "text"}]`，按行从上往下、行内从左往右。"""
+    if not evs:
+        return []
+    row = row_index([e["box"] for e in evs])
+    order = sorted(range(len(evs)), key=lambda i: (row[i], evs[i]["box"][0], i))
+    out: list[dict] = []
+    for i in order:
+        e = evs[i]
+        b = list(e["box"])
+        last = out[-1] if out else None
+        if last is not None and last["row"] == row[i]:
+            h = max(b[3] - b[1], last["box"][3] - last["box"][1])
+            if b[0] - last["box"][2] <= ROW_JOIN_GAP * h:
+                last["events"].append(e)
+                last["box"] = [min(last["box"][0], b[0]), min(last["box"][1], b[1]), max(last["box"][2], b[2]), max(last["box"][3], b[3])]
+                last["text"] = join_row_text(last["text"], e["text"])
+                continue
+        out.append({"row": row[i], "events": [e], "box": b, "text": e["text"]})
+    for r in out:
+        del r["row"]
+    return out
+
+
+def cue_rows(doc: dict, tr: dict, cue: dict, drop_filtered: bool = True) -> list[dict]:
+    """一条 cue 要导出的事件（`cue_lines`）按可见的行拼好（`rows_of_events`）：字幕稿的一句一条、阶段 3 的 SRT 都用它。"""
+    return rows_of_events(cue_lines(doc, tr, cue, drop_filtered))
 
 
 def ui_flagged(ev: dict) -> bool:

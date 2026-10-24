@@ -8,10 +8,11 @@
 
 * **块**：窗口按约 `block_sec` 切，块边界对齐**关键帧**（`ffprobe` 只读包头，**边探边切**——整片 f4 探完要 41 s，起流不能等它），
   所以每块从关键帧起解、不多解一帧。第一块从窗口起点走普通路径（文件头有前摇的 av1 要 `-ignore_editlist` 平移，§8.6）；
-  剩下不到半块时不再切（末块并进上一块，免得为几帧起一个 ffmpeg）。每块一个 `FfmpegSource(block_seek=…)`：
+  剩下不到半块时不再切（末块并进上一块，免得为几帧起一个 ffmpeg）。**尾部按路数均分**：剩下的不到"路数 × 块长"时，
+  块长缩成"剩下的 / 路数"（每切一块重算一次，所以越切越短；不短于 `TAIL_MIN_SEC`），免得最后一块只有一路在解、其余路空着；窗口不到两块长时也照样切开。每块一个 `FfmpegSource(block_seek=…)`：
   身份核对（showinfo 的 `n` / pts 帧号 / 帧号唯一 / 硬解的格子核对）**原样逐块做**；块和块之间不重不漏靠帧号区间 `[lo, hi)`。
 * **几路"谁空谁领下一块"**：每路各自选硬解（`hw`）或软解（`sw`，CPU 那一路）；快慢自动配平。
-* **按序、边解边交**：同时在解 / 解完没交完的块最多 `ahead` 个（默认 = 路数）；当前那一块**解出一帧就交一帧**。
+* **按序、边解边交**：同时在解 / 解完没交完的块最多 `ahead` 个（默认 = 路数 + 1：尾部均分后某一路先解完时不用干等在途名额，多出的那一块受字节预算管）；当前那一块**解出一帧就交一帧**。
   采样帧按块序从 `__iter__` 交出，辅助流由转发线程按块序写给回抠进程（它看到的和一路 ffmpeg 直连时一样：一条 TCP 流 + 逐帧 pts）。
 * **内存按字节封顶**（2026-09-24 Codex 审计 P2：块数有界不等于内存有界——长 GOP 能切出 150 s 的块、4K 上一块 20 s 就是 2 GB）：
   **没有消费者在等**的块，各路往里放东西前先看总缓冲过没过 `budget_mb`，过了就停着（ffmpeg 跟着阻塞在管道上）。
@@ -30,7 +31,6 @@
 """
 from __future__ import annotations
 
-import socket
 import subprocess
 import threading
 import time
@@ -38,7 +38,10 @@ from collections.abc import Iterable, Iterator
 
 from flowocr.extract import framesource
 from flowocr.extract import timeline as _tl
+from flowocr.extract.aux_transport import TcpAux
 from flowocr.extract.framegrid import AuxGrid, TimeGrid
+
+TAIL_MIN_SEC = 10.0      # 尾部均分时块长的下限：再短，每块起 ffmpeg + 从前一个关键帧预解的开销（约 0.3 s）就不划算
 
 BUDGET_MB = 1024
 """纯预取（没有消费者在等的块）最多攒这么多字节。1080p60、采样 2 fps + 0.35 辅助流约 28 MB / 秒素材，即约 37 s。"""
@@ -88,38 +91,42 @@ class KeyframeStream:
 
 
 def iter_blocks(kfs: Iterable[float], start_idx: int, end_idx: int, src_fps: float,
-                block_sec: float) -> Iterator[tuple[int, int, float | None]]:
+                block_sec: float, lanes: int = 1) -> Iterator[tuple[int, int, float | None]]:
     """`(lo, hi, 关键帧秒或 None)`，关键帧来一个判一个（**纯函数**，守卫直接测）：第一块从窗口起点起（None = 普通路径），
-    之后在"上一块起点 + block_sec"之后的第一个关键帧处切——**切完剩下的不到半块就不切**（末块并进上一块）。
+    之后在"上一块起点 + 块长"之后的第一个关键帧处切——**切完剩下的不到半块就不切**（末块并进上一块）。
+    块长平时是 block_sec；剩下的不到 `lanes` 块时缩成"剩下的 / lanes"（每块重算，300 s 窗口两路是 60×4 + 30 + 16 + 14；
+    不短于 `TAIL_MIN_SEC`，block_sec 不到它的两倍时不短于半块），先解完的那一路接着领下一小块；`lanes=1` 时就是 block_sec。
     关键帧秒加 0.5 ms 给 `-ss`：seek 找的是"不晚于目标"的关键帧，ffprobe 印出来的秒数往下舍入时会落到前一个关键帧上（多解一段，结果仍对）。"""
     span = block_sec * src_fps
+    floor = min(TAIL_MIN_SEC * src_fps, span / 2)
     lo, seek = start_idx, None
     for kf in kfs:
         k = round(kf * src_fps)
-        if lo + span <= k and k + span / 2 <= end_idx:
+        want = min(span, max(floor, (end_idx - lo) / lanes))
+        if lo + want <= k and k + max(want / 2, floor) <= end_idx:
             yield lo, k, seek
             lo, seek = k, kf + 0.0005
     yield lo, end_idx, seek
 
 
 def plan_blocks(video: str, start_idx: int, end_idx: int, src_fps: float, block_sec: float,
-                kfs: list[float] | None = None) -> list[tuple[int, int, float | None]]:
+                kfs: list[float] | None = None, lanes: int = 1) -> list[tuple[int, int, float | None]]:
     """整张块表（给了 `kfs` 就不探）。管线里用 `BlockPlan`（边探边给）。"""
     if kfs is None:
         ks = KeyframeStream(video, start_idx / src_fps, end_idx / src_fps)
         try:
-            return list(iter_blocks(ks, start_idx, end_idx, src_fps, block_sec))
+            return list(iter_blocks(ks, start_idx, end_idx, src_fps, block_sec, lanes))
         finally:
             ks.close()
-    return list(iter_blocks(kfs, start_idx, end_idx, src_fps, block_sec))
+    return list(iter_blocks(kfs, start_idx, end_idx, src_fps, block_sec, lanes))
 
 
 class BlockPlan:
     """管线用的块表：ffprobe 边探关键帧、边吐块（`ShardedSource` 的规划线程读它）。`close()` 停掉 ffprobe。"""
 
-    def __init__(self, video: str, start_idx: int, end_idx: int, src_fps: float, block_sec: float) -> None:
+    def __init__(self, video: str, start_idx: int, end_idx: int, src_fps: float, block_sec: float, lanes: int = 1) -> None:
         self.ks = KeyframeStream(video, start_idx / src_fps, end_idx / src_fps)
-        self.args = (start_idx, end_idx, src_fps, block_sec)
+        self.args = (start_idx, end_idx, src_fps, block_sec, lanes)
         self.error = ""                              # 非空 = ffprobe 出错、后面没切开的部分由一路整段解（进 `_meta.decode_shards.plan_error`）
 
     def __iter__(self) -> Iterator[tuple[int, int, float | None]]:
@@ -130,32 +137,6 @@ class BlockPlan:
 
     def close(self) -> None:
         self.ks.close()
-
-
-class TcpAux:
-    """辅助流写给**一个**回抠进程：像素走本机 TCP（它 listen 的 `url`），逐帧 pts 走 `pts_put`（同一路 ffmpeg 直连时的形状）。
-    `ShardedSource` 的 `aux_remote` 也可以是任何带 `open()` 的对象（返回同样有 `send` / `close` 的写端）——
-    多组共用解码时是 `decode_proc.AuxFanout`，一份辅助流按订阅者各一条有界队列转出去。"""
-
-    def __init__(self, remote) -> None:
-        host, port = remote.url.removeprefix("tcp://").rsplit(":", 1)
-        self.remote = remote
-        self.sock = socket.create_connection((host, int(port)), timeout=60)
-        self.sock.settimeout(None)
-
-    def send(self, frame, n: int, t_sec: float) -> None:
-        self.sock.sendall(memoryview(frame).cast("B"))
-        self.remote.pts_put((n, t_sec))
-
-    def close(self) -> None:
-        try:
-            self.remote.pts_put(framesource.QUEUE_SENTINEL)
-        except Exception:                               # noqa: BLE001
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
 
 
 def _nbytes(item) -> int:
@@ -183,7 +164,7 @@ class _Block:
     def push(self, key, frame) -> None:
         o = self.owner
         with o._cv:
-            o._admit(self, getattr(frame, "nbytes", 0))
+            o._admit(self, getattr(frame, "nbytes", 0), aux=True)
             self.aux.append((key, frame))
             self.last_aux = key
             o._cv.notify_all()
@@ -215,7 +196,7 @@ class ShardedSource:
         # 辅助流取哪些帧（`AuxGrid.as_list()`；没给 = 每帧都要）
         self.aux_grid = AuxGrid.from_list(aux_grid) if aux_grid else AuxGrid(TimeGrid(1, 1), grid)
         self.aux_remote, self.aux_scale = aux_remote, aux_scale
-        self.ahead = max(1, ahead or len(lanes))
+        self.ahead = max(1, ahead or len(lanes) + 1)
         self.budget = int(budget_mb * (1 << 20))
         self.start_idx, self.end_idx = start_idx, end_idx
         self.hwaccel = hwaccel if "hw" in lanes else None
@@ -231,6 +212,7 @@ class ShardedSource:
         self.peak_mb = 0.0                               # 缓冲的峰值（报表用）
         self.probe_unknown = 0                           # 软解路块尾缺格、源探不出来、放行了的次数
         self._cv = threading.Condition()
+        self._close_lock = threading.Lock()
         if isinstance(blocks, list):
             self.blocks, self._plan, self._planned = list(blocks), None, True
         else:
@@ -242,6 +224,9 @@ class ShardedSource:
         self._fail: BaseException | None = None          # 共享的失败状态（转发 / 规划的错；块自己的错在 `_Block.err`）
         self._buffered = 0
         self._live: dict[int, framesource.FfmpegSource] = {}
+        self._aux_writer = None                         # 登记在 open / 网络 IO 之前，取消可立即找到它
+        self._threads: list[threading.Thread] = []
+        self._cleanup_errors: list[str] = []
 
     @property
     def plan_error(self) -> str:
@@ -261,17 +246,23 @@ class ShardedSource:
             self._cv.wait(0.5)
         return k < len(self.blocks) and not self._closed and self._fail is None
 
-    def _admit(self, b: _Block, n: int) -> None:
+    def _admit(self, b: _Block, n: int, aux: bool = False) -> None:
         """往块 b 里放 n 字节之前（持锁）：没人在等 b、而总缓冲会过预算，就等。
         **主流已经交到这块最后一个格**时不挡（2026-09-24 审核第三轮）：那之后 `FfmpegSource` 会自己收摊（关管道、等 10 s、不退就杀），
         ffmpeg 还没写完的辅助帧要是被预算挡在这里，它就卡在写上被杀掉、辅助流真的被截断。块尾这几帧（不到一个采样间隔）不是预取。"""
         def main_eof() -> bool:                     # 每轮重算：等的时候主流可能正好交到块尾（审计 2026-09-25，Codex P1）
             return b.last_main is not None and self.grid.next(b.last_main) >= b.hi
+        def dead() -> bool:                         # 这一块已失败，或辅助读端已被取消：不再等预算，让写入方退出
+            return b.err is not None or (aux and b.aux_done)
         while (self._buffered + n > self.budget and b.waiting == 0 and not main_eof()
-               and not self._closed and self._fail is None):
+               and not self._closed and self._fail is None and not dead()):
             b.throttled = True
             self._cv.wait(0.5)
         b.throttled = False
+        if self._closed or self._fail is not None:
+            raise framesource.SinkClosed("解码分片已收摊，不再接纳像素")
+        if dead():
+            raise framesource.SinkClosed(f"第 {b.k} 块已失败或取消，不再接纳像素")
         self._buffered += n
         b.nbytes += n
         self.peak_mb = max(self.peak_mb, self._buffered / (1 << 20))
@@ -283,12 +274,32 @@ class ShardedSource:
             self._cv.notify_all()
         self._stop_live()
 
+    def _abort_aux(self) -> None:
+        with self._cv:
+            writer = self._aux_writer
+        target = writer if writer is not None else self.aux_remote
+        if target is not None:
+            target.abort()
+
     def _stop_live(self) -> None:
-        for src in list(self._live.values()):
+        try:
+            self._abort_aux()
+        except BaseException as exc:                    # 仍须取消所有源；错误由主路 / close 交回调用方
+            self._remember_cleanup(f"辅助写端取消失败：{exc!r}")
+        with self._cv:
+            sources = list(self._live.values())
+        for src in sources:
             try:
-                src.close()
-            except Exception:                           # noqa: BLE001
-                pass
+                src.cancel()
+            except BaseException as exc:
+                self._remember_cleanup(f"解码源取消失败：{exc!r}")
+
+    def _remember_cleanup(self, message: str) -> None:
+        """清理错误只登记、由 close() 交回调用方；不升格为共享失败，免得盖掉按块序该抛的根因（例如硬解失败）。"""
+        with self._cv:
+            if message not in self._cleanup_errors:
+                self._cleanup_errors.append(message)
+            self._cv.notify_all()
 
     # ---------- 规划 ----------
     def _planner(self) -> None:
@@ -338,11 +349,13 @@ class ShardedSource:
                     aux=({"sink": b, "grid": self.aux_grid.as_list(), "scale": self.aux_scale}
                          if self.aux_remote is not None else None))
                 b.src = src
-                with self._cv:                           # 和 close() 同一把锁：要么这里看见收摊，要么 close() 看见这一路
-                    if self._closed or self._fail is not None:
-                        src.close()
-                        raise RuntimeError(f"第 {k} 块没开解：已经收摊")
-                    self._live[i] = src
+                with self._cv:                           # 登记与取消共享锁；cancel 还阻止登记后才启动的 ffmpeg
+                    cancelled = self._closed or self._fail is not None
+                    if not cancelled:
+                        self._live[i] = src
+                if cancelled:
+                    src.cancel()
+                    raise RuntimeError(f"第 {k} 块没开解：已经收摊")
                 for item in src:
                     with self._cv:
                         self._admit(b, _nbytes(item))
@@ -351,15 +364,26 @@ class ShardedSource:
                         self._cv.notify_all()
                 if self.aux_remote is not None and src.aux is not None:
                     self._join_aux(k, b, src.aux)
+                    if src.aux.refused:
+                        raise RuntimeError(f"第 {k} 块的辅助流写入被拒：{src.aux.refused}")
                     if src.aux.misaligned:
                         raise RuntimeError(f"第 {k} 块的辅助流 pts 对不上：{src.aux.misaligned}")
                     if b.last_main is not None and (b.last_aux is None or b.last_aux < self.aux_grid.cover_floor(b.last_main)):
                         # 同一个 ffmpeg 出两路：辅助流至少要盖到这一块最后一个采样帧（`AuxGrid.cover_floor`）
                         raise RuntimeError(f"第 {k} 块的辅助流只到帧 {b.last_aux}、采样流到了 {b.last_main}（辅助流半路断了）")
             except BaseException as exc:                # noqa: BLE001  交给读的人按块序抛
-                b.err = exc
+                with self._cv:                          # 叫醒被预算挡在 _admit 里的辅助读线程，下面的 cancel 才 join 得到它
+                    b.err = exc
+                    self._cv.notify_all()
             finally:
-                self._live.pop(i, None)
+                try:
+                    if b.err is not None and b.src is not None:
+                        b.src.cancel()
+                except BaseException as exc:
+                    self._remember_cleanup(f"第 {k} 块失败后的清理失败：{exc!r}")
+                finally:
+                    with self._cv:
+                        self._live.pop(i, None)
             dt = _tl.span("shard_block", t0, a=k) - t0
             with self._cv:
                 self.lane_blocks[i] += 1
@@ -404,6 +428,8 @@ class ShardedSource:
                 while True:
                     if self._fail is not None:           # 先报根因：共享失败会停掉在解的 ffmpeg，那几块跟着出的错是次生的
                         raise self._fail
+                    if self._closed:
+                        return
                     if b.err is not None:
                         raise b.err
                     if j < len(seq):
@@ -414,8 +440,6 @@ class ShardedSource:
                         self._cv.notify_all()            # 缓冲降了：被预算挡着的那几路可以接着放
                         break
                     if b.main_done if which == "main" else b.aux_done:
-                        return
-                    if self._closed:
                         return
                     b.waiting += 1
                     self._cv.notify_all()           # 被预算挡着的那一路：有人在等你了（不等它 0.5 s 轮询）
@@ -444,15 +468,26 @@ class ShardedSource:
     def _forward(self) -> None:
         n, k = 0, 0
         w = None
+        drained = False
         try:
             try:
-                w = self.aux_remote.open() if hasattr(self.aux_remote, "open") else TcpAux(self.aux_remote)
-            except OSError as exc:
-                self._set_fail(RuntimeError(f"辅助流转发连不上回抠进程：{exc!r}"))
+                w = self.aux_remote if hasattr(self.aux_remote, "open") else TcpAux(self.aux_remote)
+                with self._cv:
+                    self._aux_writer = w
+                    cancelled = self._closed or self._fail is not None
+                if cancelled:
+                    return
+                w.open()
+            except OSError as exc:                       # 含连接中途被 abort（`OwnedSocket.connect` 转成 OSError）
+                with self._cv:
+                    cancelled = self._closed or self._fail is not None
+                if not cancelled:
+                    self._set_fail(RuntimeError(f"辅助流转发连不上回抠进程：{exc!r}"))
                 return
             while True:
                 with self._cv:
                     if not self._block_ready(k):
+                        drained = not self._closed and self._fail is None and self._planned and k >= len(self.blocks)
                         return
                 it = self._items(k, "aux")
                 while True:
@@ -472,12 +507,13 @@ class ShardedSource:
                 k += 1
         finally:
             if w is not None:
-                w.close()
-            elif not hasattr(self.aux_remote, "open"):
                 try:
-                    self.aux_remote.pts_put(framesource.QUEUE_SENTINEL)   # 连都没连上：也要让那边的 pts 队列收尾
-                except Exception:                       # noqa: BLE001
-                    pass
+                    if drained:
+                        w.close()
+                    else:
+                        w.abort()
+                except BaseException as exc:            # noqa: BLE001  正常尾标记失败也必须拒绝完成
+                    self._set_fail(RuntimeError(f"辅助流结束交付失败：{exc!r}"))
 
     # ---------- 块尾核对 ----------
     def _check_tail(self, k: int, is_last: bool) -> None:
@@ -514,8 +550,12 @@ class ShardedSource:
         if self.aux_remote is not None:
             fwd = threading.Thread(target=self._forward, daemon=True, name="shard-aux-fwd")
             ths.append(fwd)
-        for th in ths:
-            th.start()
+        with self._cv:
+            if self._closed:
+                return
+            self._threads = ths
+            for th in ths:
+                th.start()
         prev_idx: int | None = None
         try:
             k = 0
@@ -558,17 +598,44 @@ class ShardedSource:
                     fwd.join(1.0)
                 if self._fail is not None:
                     raise self._fail
-        finally:
-            self.close()
+        except BaseException:
+            # 已有异常在传播（含消费者提前 close 的 GeneratorExit）：只收摊，清理错误留给调用方之后的 close() 报，
+            # 不能拿它替换原异常——硬解失败要原样交到 decode_proc，才会发 "hw" 走软解重跑
+            with self._close_lock:
+                self._close()
+            raise
+        self.close()
 
     def close(self) -> None:
         """收摊：不再领新块，正在解的那几块的 ffmpeg 收掉，边探的 ffprobe 停掉。"""
+        # recv 与主路可以同时取消；后来的 close 必须等前一次清理登记完错误，
+        # 不能仅凭源已从 _live 移除就宣告成功。工作线程不调用 close。
+        with self._close_lock:
+            self._close()
+        if self._cleanup_errors:
+            raise RuntimeError("解码分片清理失败：" + "；".join(self._cleanup_errors)) from self._fail
+
+    def _close(self) -> None:
         with self._cv:
             self._closed = True
+            for b in self._blk.values():
+                b.main.clear()
+                b.aux.clear()
+                b.nbytes = 0
+            self._buffered = 0
             self._cv.notify_all()
         self._stop_live()
         closer = getattr(self._plan, "close", None)
         if closer is not None:
-            closer()
+            try:
+                closer()
+            except BaseException as exc:
+                self._remember_cleanup(f"块规划器取消失败：{exc!r}")
         for _ in range(len(self.lanes) + 1):
             self._sem.release()
+        deadline = time.monotonic() + 10
+        for th in self._threads:
+            if th is not threading.current_thread():
+                th.join(max(0, deadline - time.monotonic()))
+        if any(th.is_alive() and th is not threading.current_thread() for th in self._threads):
+            self._remember_cleanup("解码分片取消后仍有工作线程未退出")

@@ -7,6 +7,8 @@ console script 会先把模块整个 import 进来，监督者"自己不占显�
 
 常量（环境变量名 / 退出码）也住在这里：worker 侧（`run_ocr2`）从这里 import。
 契约测试：`dev_tools/hw_retry_check.py`（重试前整棵树退干净，Job Object 与 psutil 兜底两条路）。
+Linux 没有 Job Object（2026-10-17，WSL 上的 Linux 试跑后补）：监督者设成 child subreaper、worker 设 `PR_SET_PDEATHSIG`，
+收尾照样按进程树（`_become_subreaper` / `_die_with_parent`）。
 """
 from __future__ import annotations
 
@@ -28,12 +30,19 @@ EXIT_HW_MISMATCH = 75
 """硬解跑到一半交付不对时 worker 的退出码：外层监督者见到它，**等这一趟完全退出之后**再起软解那一趟。"""
 EXIT_HW_UNCLEAN = 76
 """硬解交付不对、而且第一趟的子进程没能确认全部退出：监督者**不重试**，也不许调用方（`run_groups` 的整批软解重跑）重试——
-残留和新一趟会同时占卡（显存配额 8 GB）。2026-09-25 审计（Codex P1）：广播解码那条路原来仍退 75，run_groups 照样重跑。"""
+残留和新一趟会同时占卡（显存预算 6.5 GB，owner 2026-10-05）。2026-09-25 审计（Codex P1）：广播解码那条路原来仍退 75，run_groups 照样重跑。"""
+OCR_LANG_ENV = "FLOWOCR_OCR_LANG_PROBE"
+"""`--ocr-lang auto` 判出的结果（`langprobe` 写的 JSON 文件路径）。监督者 / run_groups 探测一次后设，worker、切段的子进程、
+整段重跑和多组的各组都读同一份；已经设了的（多组的各组子进程又经过一次监督者）不再探。"""
 FAULT_ORPHAN_ENV = "FLOWOCR_FAULT_ORPHAN"
 """**只给测试用**：值是一个文件路径。硬解故障那一刻 worker 故意留下一个**不收的孙进程**（模拟不听话的模型服务），
 pid 写进这个文件——验证监督者在起第二趟之前把它清掉（`hw_retry_check.py`）。"""
 FAULT_NO_JOB_ENV = "FLOWOCR_FAULT_NO_JOB"
 """**只给测试用**：假装 Job Object 建不起来，验证 psutil 兜底那条路。"""
+PR_SET_PDEATHSIG, PR_SET_CHILD_SUBREAPER = 1, 36
+"""Linux `prctl` 的两个选项（`<linux/prctl.h>`）。"""
+_SUBREAPER = False
+"""这个进程已经设成 child subreaper（`_become_subreaper`）：`_drain_tree` 把归到自己名下的孤儿也算进这棵树。"""
 
 
 def supervise(argv: list[str] | None = None) -> int:
@@ -50,10 +59,18 @@ def supervise(argv: list[str] | None = None) -> int:
     契约测试 `hw_retry_check.py` 跑出来的是"worker 一行输出都没有就卡死"。ORT 服务端用同一招没事，
     是因为它启动看门狗之后不再起子进程。"""
     import tempfile
-    argv = [sys.executable, "-m", "flowocr.extract.run_ocr2", *(sys.argv[1:] if argv is None else argv)]
+    args = list(sys.argv[1:] if argv is None else argv)
+    argv = [sys.executable, "-m", "flowocr.extract.run_ocr2", *args]
     fd, reason_file = tempfile.mkstemp(prefix="flowocr-hw-", suffix=".txt")
     os.close(fd)
     env = child_env(dict(os.environ, **{WORKER_ENV: "1", HW_REASON_ENV: reason_file}))
+    probe_file = None
+    if wants_auto(args) and not os.environ.get(OCR_LANG_ENV):
+        probe_file = probe_lang(args, env)
+        if probe_file is None:
+            os.unlink(reason_file)
+            return 2
+        env[OCR_LANG_ENV] = probe_file
     try:
         rc, clean = _run_worker(argv, env)
         if rc == EXIT_HW_MISMATCH and os.environ.get("FLOWOCR_DECODE_HUB"):
@@ -68,17 +85,58 @@ def supervise(argv: list[str] | None = None) -> int:
             reason = Path(reason_file).read_text(encoding="utf-8").strip() or "（原因没写出来）"
             if not clean:
                 # 确认不了第一趟的整棵进程树（ORT 服务 / ffmpeg）都退了，就**不起**第二趟——
-                # 宁可这一段失败，也不让两套推理资源同时占卡（显存配额 8 GB）
+                # 宁可这一段失败，也不让两套推理资源同时占卡（显存预算 6.5 GB，owner 2026-10-05）
                 print(f"[硬解] 交付不对（{reason}），但第一趟的子进程没能确认全部退出，**不重试**", flush=True)
                 return EXIT_HW_UNCLEAN
             print(f"[硬解] 跑到一半交付不对，第一趟的整棵进程树已清空；整段改软解重跑：{reason}", flush=True)
             rc, _ = _run_worker(argv + ["--hwaccel", ""], dict(env, **{HW_RETRY_ENV: reason[:500]}))
         return rc
     finally:
+        for f in (reason_file, probe_file):
+            try:
+                if f:
+                    os.unlink(f)
+            except OSError:
+                pass
+
+
+def arg_value(args: list[str], name: str) -> str | None:
+    """命令行里某个选项的值（最后一个算数，同 argparse；`--x v` 和 `--x=v` 都认）。不 import 解析器：监督者不碰推理库，也不为这个多载一层。"""
+    got = None
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            got = args[i + 1]
+        elif a.startswith(name + "="):
+            got = a.split("=", 1)[1]
+    return got
+
+
+def wants_auto(args: list[str]) -> bool:
+    """命令行里要 `--ocr-lang auto`。"""
+    return arg_value(args, "--ocr-lang") == "auto"
+
+
+def probe_lang(args: list[str], env: dict, extra: tuple[str, ...] = ()) -> str | None:
+    """`--ocr-lang auto`：起一个**独立的探测子进程**（`flowocr.extract.langprobe`）跑完、整棵进程树退干净，返回结果文件；
+    失败（取不到模型、打不开视频……）打出原因、返回 None——不悄悄退回默认语言（韩语片按默认模型读出来全是错字）。"""
+    import tempfile
+    if arg_value(args, "--rec-onnx"):
+        # 冲突要在探测之前报：探测子进程只解析不补全参数，等 worker 的 resolve 报出来时三个模型已经下完、探测已经跑完
+        print("[判语言] --rec-onnx 和 --ocr-lang auto 只能给一个：自带的 rec 模型认哪些字由它自己的字表定", flush=True)
+        return None
+    fd, out = tempfile.mkstemp(prefix="flowocr-lang-", suffix=".json")
+    os.close(fd)
+    cmd = [sys.executable, "-m", "flowocr.extract.langprobe", "--probe-out", out, *extra, *args]
+    rc, clean = _run_worker(cmd, {k: v for k, v in env.items() if k != WORKER_ENV})
+    if rc != 0 or not clean or not Path(out).read_text(encoding="utf-8").strip():
+        print(f"[判语言] 探测没成（退出码 {rc}{'、子进程没确认退干净' if not clean else ''}）：不开跑。"
+              "要先在联网处取好模型就跑 `flowocr-models fetch rec-ko rec-ru rec-th`，或者直接点名 --ocr-lang", flush=True)
         try:
-            os.unlink(reason_file)
+            os.unlink(out)
         except OSError:
             pass
+        return None
+    return out
 
 
 def _kill_on_close_job():
@@ -131,6 +189,44 @@ def _job_active(k32, h) -> int:
     return int(acc.ActiveProcesses)
 
 
+def _prctl():
+    """Linux 的 `prctl`（libc）；别的系统或取不到返回 None。在 fork 之前取好：`preexec_fn` 里别再 dlopen。"""
+    if not sys.platform.startswith("linux"):
+        return None
+    import ctypes
+    try:
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+
+
+def _become_subreaper() -> bool:
+    """Linux：把本进程设成 child subreaper。没有 Job Object 时收尾按 ppid 求闭包，Windows 上成立是因为孤儿的 ppid 仍指着
+    死掉的父进程；Linux 上孤儿被 init 收养、ppid 指不回这棵树。设成 subreaper 后，树里谁的父进程先死，孤儿都归到本进程名下，
+    `_drain_tree` 顺着 ppid = 本进程找得到（也由本进程收尸）。设不上返回 False（照常跑，只是少一道保险）。"""
+    global _SUBREAPER
+    prctl = _prctl()
+    if not _SUBREAPER and prctl is not None:
+        _SUBREAPER = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    return _SUBREAPER
+
+
+def _die_with_parent():
+    """Linux：给 worker 的 `preexec_fn`——监督者一死，worker 收 SIGKILL（`PR_SET_PDEATHSIG`，对应 Windows 上 Job 的
+    `KILL_ON_JOB_CLOSE`）。worker 起的 ffmpeg / ORT 服务靠连锁反应跟着退（管道断、stdin EOF），和 Windows 上
+    逃出 Job 的那些一样。别的系统返回 None。"""
+    import signal
+    prctl, parent = _prctl(), os.getpid()
+    if prctl is None:
+        return None
+
+    def f() -> None:
+        prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0)
+        if os.getppid() != parent:           # fork 之后、prctl 之前监督者已经死了：信号不会再来，自己退
+            os._exit(1)
+    return f
+
+
 def _drain_job(job, timeout: float = 30.0) -> bool:
     """**这一趟结束后，把 Job 里剩下的进程全杀掉、等到清零、再关句柄**（2026-09-20，Codex 复审第四轮）。
 
@@ -178,13 +274,14 @@ def _drain_tree(seen: dict, root_pid: int, t_start: float, timeout: float = 30.0
     """兜底的收尾：记下来的那些进程里还活着的（create_time 对得上），逐个杀掉并等它们退出。
 
     ⚠ 轮询是每 0.5 s 一次，**worker 退出前一瞬间才起的子进程**记不到——所以收尾时再按 `ppid` 扫一遍、求闭包：
-    Windows 上孤儿进程的 `ppid` 仍然指着已经死掉的父进程，起始时间晚于这一趟开始的就是它的后代。"""
+    Windows 上孤儿进程的 `ppid` 仍然指着已经死掉的父进程，起始时间晚于这一趟开始的就是它的后代；
+    Linux 上孤儿归到设成 subreaper 的本进程名下（`_become_subreaper`），所以本进程也算一个根。"""
     try:
         import psutil
     except ImportError:
         print("[监督] ⚠ 没有 Job Object、也没有 psutil：确认不了第一趟的子进程都退了", flush=True)
         return False
-    roots = {root_pid, *seen}
+    roots = {root_pid, *seen, *([os.getpid()] if _SUBREAPER else [])}
     grew = True
     while grew:
         grew = False
@@ -221,7 +318,8 @@ def _drain_tree(seen: dict, root_pid: int, t_start: float, timeout: float = 30.0
 def _run_worker(argv: list[str], env: dict) -> tuple[int, bool]:
     """跑一趟 worker，返回 `(退出码, 这一趟的整棵进程树确认清空了没有)`。"""
     t_start = time.time()
-    p = subprocess.Popen(argv, env=env)
+    _become_subreaper()
+    p = subprocess.Popen(argv, env=env, preexec_fn=_die_with_parent())
     job = _kill_on_close_job()
     if job is not None:
         from ctypes import wintypes

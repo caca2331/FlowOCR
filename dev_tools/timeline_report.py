@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import sys
 from pathlib import Path
@@ -85,6 +86,43 @@ def split(label: str, cond: np.ndarray, parts: list[tuple[str, np.ndarray]]) -> 
     print(f"  {label} {tot:5.1f} s：" + "、".join(cells))
 
 
+def server_split(ev: list[dict], t_lo: float, t_hi: float) -> None:
+    """ORT 服务那份（`ort` 角色）按请求累加，和客户端这边等推理的时间对账：差的就是服务端请求之外的（IPC、排队、收发）。
+    区间按请求逐个相加（两路 rec 并发时会重叠，所以不栅格化）。**先选请求、再收它的各段**：请求（`ort_req`）起点落在主循环里的才算，
+    取 session / 前处理 / 等闸 / 推理 / 写输出按"同一线程上落在哪个请求里"归过去，跨窗口边的请求整个进或整个不进。
+    客户端那边按自己的起点筛：两边的请求数对不上时（窗口边上的请求一边算了、一边没算），"服务端请求之外"含这份集合差，
+    不能全归到 IPC / 排队上，报告里会标出来。"""
+    inside = [e for e in ev if t_lo <= e["t0"] < t_hi]
+    reqs: dict = {}                              # 服务线程 -> [(起, 止, 算不算)]，按起点排
+    for e in ev:
+        if e["role"] == "ort" and e["k"] == "ort_req":
+            reqs.setdefault(e["th"], []).append((e["t0"], e["t1"], t_lo <= e["t0"] < t_hi))
+    for v in reqs.values():
+        v.sort()
+
+    def counted(e) -> bool:
+        v = reqs.get(e["th"], [])
+        i = bisect.bisect_right(v, (e["t0"] + 1e-6, float("inf"), True)) - 1
+        return i >= 0 and e["t1"] <= v[i][1] + 1e-6 and v[i][2]
+    srv = [e for e in ev if e["role"] == "ort" and e["k"].startswith("ort_") and counted(e)]
+    if not srv:
+        return
+    model = lambda e: e["a"][0] if isinstance(e["a"], list) else e["a"]
+    print("\n推理服务（按请求累加，秒）：")
+    for name, client_kind in (("rec", "rec_infer"), ("det", "det_infer")):
+        tot = {k: sum(e["t1"] - e["t0"] for e in srv if e["k"] == k and model(e) == name)
+               for k in ("ort_req", "ort_sess", "ort_pre", "ort_wait", "ort_run", "ort_out")}
+        n = sum(1 for e in srv if e["k"] == "ort_req" and model(e) == name)
+        if not n:
+            continue
+        cli_ev = [e for e in inside if e["k"] == client_kind and e["role"] == "main"]
+        cli = sum(e["t1"] - e["t0"] for e in cli_ev)
+        rest = tot["ort_req"] - tot["ort_sess"] - tot["ort_pre"] - tot["ort_wait"] - tot["ort_run"] - tot["ort_out"]
+        print(f"  {name} {n} 次：客户端等 {cli:6.2f}，服务端请求 {tot['ort_req']:6.2f} = 取 session {tot['ort_sess']:5.2f} + 前处理 {tot['ort_pre']:5.2f}"
+              f" + 准入 / 等闸 {tot['ort_wait']:5.2f} + 推理 {tot['ort_run']:6.2f} + 写输出 {tot['ort_out']:5.2f} + 其它 {rest:5.2f}；服务端请求之外 {cli - tot['ort_req']:5.2f}"
+              + ("" if len(cli_ev) == n else f"（客户端 {len(cli_ev)} 次、服务端 {n} 次，差值含窗口边上的请求）"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("timeline", type=Path)
@@ -152,6 +190,8 @@ def main() -> int:
     infer = R.kind("rec_infer")
     split("主线程等 rec 结算时，rec 池", w_rec, [("在推理", infer)])
     split("主线程等回抠时，回抠工作线程", w_edge, [("在等辅助帧", e_frame), ("在算", e_busy), ("闲着", e_idle)])
+
+    server_split(ev, t_lo, t_hi)
 
     if args.series:
         step = int(args.series / BIN)

@@ -10,8 +10,11 @@
 
 旁注字段：`cpu_sec`（用户 + 内核，不含本进程）、`user_sec` / `kernel_sec`、`wall_sec`（含起动，和 `_meta.wall_sec` 不是一个口径）、
 `processes`（Job 里一共起过几个进程）、`peak_commit_mb`（Job 里**同一时刻**提交内存之和的峰值，`PeakJobMemoryUsed`）；
+`res`：按进程的资源画像（私有工作集、独占 / 共享显存、显存上界，`dev_tools/resmon.py`；逐次采样在 `<旁注主名>.res.jsonl`）；
 有 `nvidia-smi` 时另记**整卡**显存：`gpu_mem_base_mb`（命令起之前）、`gpu_mem_peak_mb`、`gpu_mem_delta_mb`（峰值减起前，0.25 s 采一次）——
 WDDM 下看不到单进程显存，所以是整卡读数，桌面和别的程序的波动也在里面，只宜比同一批里的臂。采样进程在 Job 之外起，不算进 CPU 账。
+同一路采样还记**整卡有核在跑的时间**：`gpu_busy_sec` = 平均 `utilization.gpu` × 实际采样跨度（`gpu_sample_span_sec`；2026-10-16 前按每样本 0.25 s 累加，`-lms 250` 实际间隔长约 3%，忙秒偏低约 3%），即"这段时间里有没有核在跑"的比例累加，
+分不出小核和满核、含起动和别的程序（桌面空闲时约 5%）；和 `wall_sec` 相减就是 GPU 空着的秒数（owner 2026-10-12：先看硬件闲没闲）。
 不是 Windows、或 Job 建不起来时照样跑命令，旁注写 `{"error": …}`，退出码照传。
 """
 from __future__ import annotations
@@ -25,7 +28,7 @@ from pathlib import Path
 
 
 def _job():
-    """建一个 Job 并把本进程放进去；返回 (kernel32, 句柄, 查账函数) 或抛 OSError。"""
+    """建一个 Job 并把本进程放进去；返回 (查账函数, kernel32, 句柄) 或抛 OSError。"""
     import ctypes
     from ctypes import wintypes
 
@@ -66,17 +69,25 @@ def _job():
         return {"user_sec": acc.TotalUserTime / 1e7, "kernel_sec": acc.TotalKernelTime / 1e7,
                 "processes": int(acc.TotalProcesses), "peak_commit_mb": round(ext.PeakJobMemoryUsed / (1 << 20), 1)}
 
-    return account
+    return account, k32, h
 
 
 class _GpuMem:
-    """后台跑 `nvidia-smi -lms 250` 记整卡显存（MiB）；没有 nvidia-smi 就什么都不记。"""
+    """后台跑 `nvidia-smi -lms 250` 记被测那张卡的显存（MiB）和有核在跑的比例（%）；没有 nvidia-smi 就什么都不记。
+    被测的卡 = `CUDA_VISIBLE_DEVICES` 的第一项（是数字时），否则 0 号：只查这一张（`-i`），多卡时别的卡上的活不混进来。
+    ⚠ `nvidia-smi -i` 按 PCI 顺序编号，CUDA 默认按快卡优先：多卡机器上要 `CUDA_DEVICE_ORDER=PCI_BUS_ID` 两边才对得上；`run_ocr2 --device gpu:N` 不经过这个变量。"""
+    STEP = 0.25                                           # 采样间隔（秒）
 
     def __init__(self) -> None:
         import threading
         self.vals: list[int] = []
+        self.util: list[int] = []
+        self.t_first: float | None = None
+        first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+        self.index = int(first) if first.isdigit() else 0
         try:
-            self.p = subprocess.Popen(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-lms", "250"],
+            self.p = subprocess.Popen(["nvidia-smi", "-i", str(self.index), "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader,nounits",
+                                       "-lms", str(int(self.STEP * 1000))],
                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         except OSError:
             self.p = None
@@ -91,17 +102,28 @@ class _GpuMem:
     def _read(self) -> None:
         for ln in self.p.stdout:
             try:
-                self.vals.append(int(ln.split(",")[0].strip()))   # 多卡时只看第一张
+                mem, util = (int(x.strip()) for x in ln.split(",")[:2])
             except ValueError:
-                pass
+                continue
+            if self.t_first is None:
+                self.t_first = time.monotonic()
+            self.vals.append(mem)
+            self.util.append(util)
 
     def stop(self) -> dict:
-        if self.p is None or self.base is None:
+        if self.p is None:
             return {}
-        self.p.terminate()
+        self.p.terminate()                                # 没读到第一行（驱动忙）也要停，不然 nvidia-smi 在 Job 外成孤儿
+        if self.base is None:
+            return {}
         self.th.join(2)
         peak = max(self.vals)
-        return {"gpu_mem_base_mb": self.base, "gpu_mem_peak_mb": peak, "gpu_mem_delta_mb": peak - self.base}
+        # 忙秒 = 平均利用率 × 实际采样跨度：`-lms 250` 的实际间隔比 250 ms 长约 3%（400 份旁注里 采样数 × 0.25 / 墙钟 中位 0.972），
+        # 按"每个样本 0.25 s"累加会系统性偏低、"GPU 空 = 墙钟 − 忙"跟着偏高
+        span = max(self.STEP, time.monotonic() - self.t_first) if self.t_first is not None else self.STEP * len(self.util)
+        return {"gpu_mem_base_mb": self.base, "gpu_mem_peak_mb": peak, "gpu_mem_delta_mb": peak - self.base,
+                "gpu_busy_sec": round(sum(self.util) / len(self.util) / 100 * span, 2), "gpu_samples": len(self.util),
+                "gpu_sample_span_sec": round(span, 2), "gpu_index": self.index}
 
 
 def main(argv: list[str]) -> int:
@@ -111,14 +133,25 @@ def main(argv: list[str]) -> int:
     out, cmd = Path(argv[0]), argv[2:]
     gpu = _GpuMem()                                       # 先于 Job 起：采样进程不进 Job、不算 CPU
     try:
-        account = _job() if os.name == "nt" else None
+        account, k32, job = _job() if os.name == "nt" else (None, None, None)
         err = "" if account else "不是 Windows：没有 Job 记账"
     except OSError as exc:
         account, err = None, f"Job 记账不可用：{exc}"
+    mon, res_err = None, ""
+    if account is not None:
+        try:
+            import resmon
+            stem = out.name[:-len(".cpu.json")] if out.name.endswith(".cpu.json") else out.stem
+            mon = resmon.ResMon(k32, job, out.with_name(stem + ".res.jsonl"))
+        except Exception as exc:                          # 画像起不来照样跑命令（同 Job 记账）
+            res_err = f"按进程画像不可用：{type(exc).__name__}: {exc}"
     t0 = time.perf_counter()
     try:
         rc = subprocess.call(cmd)
     except OSError as exc:                                # 命令本身起不来：旁注写原因，退出码 127（同 shell）
+        if mon is not None:
+            mon.stop()
+        gpu.stop()                                        # nvidia-smi 在 Job 外，不停就成孤儿
         out.write_text(json.dumps({"error": f"起不来：{exc}", "cmd": cmd}, ensure_ascii=False) + "\n", encoding="utf-8")
         print(f"[jobcpu] 起不来：{exc}", file=sys.stderr)
         return 127
@@ -133,6 +166,12 @@ def main(argv: list[str]) -> int:
         rec["cpu_sec"] = round(rec["user_sec"] + rec["kernel_sec"], 2)
         rec["processes"] -= 1
     rec.update(gpu.stop())
+    if mon is not None:
+        rec["res"] = mon.stop()
+        if rec["res"].get("killed") and rc == 0:          # 被内存闸杀掉的不算跑完
+            rc = 137
+    elif res_err:
+        rec["res"] = {"error": res_err}
     rec.update(wall_sec=round(wall, 2), rc=rc, cmd=cmd)
     out.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
     return rc

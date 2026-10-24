@@ -33,7 +33,7 @@ flowocr-ocr video.mp4 --out out\v\v.jsonl           # 阶段 1：读字
 flowocr-gamescript out\v\v.jsonl --out out\v\v-ref.json --game starrail
 flowocr-tracks out\v\v.jsonl --outdir out\v --tag v --matcher gametext --matcher-ctx game=starrail
 flowocr-match out\v\v-tracks.json --matcher gametext --ctx ref=out\v\v-ref.json --out out\v\v-matched.json
-flowocr-render out\v\v-matched.json --preset script # 阶段 3：只写 v-jp-main.script.ass，默认保留正文与名牌
+flowocr-render out\v\v-matched.json --preset script # 阶段 3：只写 v-jp-main.script.ass，默认画匹配器声明的默认组（台词、名牌、选项…）
 ```
 
 在 Aegisub 中检查并保存 `out\v\v-jp-main.script.ass`，然后用 `default` 预设出特效字幕：
@@ -57,4 +57,4 @@ flowocr-typeset out\v\v-jp-main.script.ass --preset default # 阶段 4：写 v-j
 
 ## 许可
 
-GPL-3.0-or-later，全文见 [LICENSE](https://github.com/caca2331/FlowOCR/blob/main/LICENSE)。识别用的 PP-OCRv6 模型由 PaddlePaddle 以 Apache-2.0 发布，来源与我们的改动见 [LICENSES/](https://github.com/caca2331/FlowOCR/blob/main/LICENSES/PP-OCRv6-NOTICE.md)。
+GPL-3.0-or-later，全文见 [LICENSE](https://github.com/caca2331/FlowOCR/blob/main/LICENSE)。识别用的 PP-OCRv6 模型由 PaddlePaddle 以 Apache-2.0 发布，来源与我们的改动见 [LICENSES/](https://github.com/caca2331/FlowOCR/blob/main/LICENSES/PP-OCRv6-NOTICE.md)。可选的 TensorRT 后端由用户自己从 NVIDIA 下载、按 NVIDIA 的许可协议使用，flowocr 不分发它（[说明](https://github.com/caca2331/FlowOCR/blob/main/LICENSES/TensorRT-NOTICE.md)）。

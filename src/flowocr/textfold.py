@@ -1,0 +1,46 @@
+"""比较 OCR 读数用的字形折叠：同一个字被 rec 读成不同字形时，比较前先折成一样。
+
+只折**读法差、不改内容**的两类：NFKC（全角 / 半角、兼容字形：`！` / `!`、`…` / `...`）和小书写假名折大（`っ` / `つ`、`ょ` / `よ`）。
+`fold` 不去标点、不去空白——要不要去由调用方定（匹配器的 `norm` 去，打字机生长判前缀时不去：标点也是打出来的字）；
+要去的用 `bare`，判两个读数是不是同一句字用 `same_reading`，判一个读数能不能是一句字出现的开头用 `leads`。
+"""
+from __future__ import annotations
+
+import unicodedata
+
+SMALL_KANA = str.maketrans("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ",
+                           "あいうえおつやゆよわアイウエオツヤユヨワカケ")
+"""小书写假名折成大的。日文 rec 常把大小写读反（`あてぃし` → `あていし`，同一句前后两帧也会读得不一样）。"""
+
+
+def fold(t: str) -> str:
+    """NFKC + 小书写假名折大。"""
+    return unicodedata.normalize("NFKC", t).translate(SMALL_KANA)
+
+
+SAME_READING_MIN = 2
+"""`same_reading` 认前缀时，短的那个至少这么多个字（去掉标点、空白之后）：一个字的前缀几乎什么都配得上。"""
+
+
+def bare(t: str) -> str:
+    """`fold` 之后去掉空白和标点（Unicode 类别 P*）。"""
+    return "".join(c for c in fold(t) if not c.isspace() and not unicodedata.category(c).startswith("P"))
+
+
+def same_reading(a: str, b: str) -> bool:
+    """两个读数是不是同一句字：`bare` 之后相等，或者一个是另一个的前缀（打字中途的读数），短的至少 `SAME_READING_MIN` 个字。
+    「裁判の後。」和「裁判の後」、「雪だ！ヒュー」和「雪だ！ヒューヒュー!」都算。"""
+    x, y = bare(a), bare(b)
+    if not x or not y:
+        return False
+    if x == y:
+        return True
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    return len(short) >= SAME_READING_MIN and long_.startswith(short)
+
+
+def leads(a: str, b: str) -> bool:
+    """读数 `a` 可以是 `b` 这句字出现的开头：同一句（`same_reading`），或者是 `b` 的开头几个字（打字刚出一两个字，不设字数下限），
+    或者只有标点（打字机先打出来的「……」）。只看字，在不在同一处由调用方判。"""
+    x = bare(a)
+    return not x or bare(b).startswith(x) or same_reading(a, b)

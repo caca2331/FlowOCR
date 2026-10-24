@@ -1,7 +1,7 @@
 """阶段 3 的薄入口：拿一份**阶段 2 的产物**，跑一个输出预设。
 
     python -m flowocr.output.render out/x/x-tracks.json --outdir tmp/x                       # 默认预设 default
-    python -m flowocr.output.render out/x/x-tracks.json --preset srt_main --outdir tmp/x
+    python -m flowocr.output.render out/x/x-tracks.json --preset default_srt --outdir tmp/x
     python -m flowocr.output.render out/x/x-matched.json --preset dev --outdir tmp/x --opt lang=cn
     python -m flowocr.output.render out/x/x-tracks.json --preset D:/mine/preset.py --outdir tmp/x --opt start=full
 
@@ -9,13 +9,17 @@
 
 | schema | 读法 | 内置预设 |
 | --- | --- | --- |
-| `flowocr-tracks/1` | `tracksio.load` | 叠加三个（`default` / `default_all` / `dev`，叠 OCR 原文）、`script`（只写字幕稿）、`srt_main`（只取主轨） |
-| `flowocr-matched/2` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`matched_srt`（拍平成 SRT） |
+| `flowocr-tracks/1` | `tracksio.load` | 叠加三个（`default` / `default_all` / `dev`，叠 OCR 原文）、`script`（只写字幕稿）、`default_srt`（主轨一份 SRT） |
+| `flowocr-matched/6` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`default_srt`（叠上去的译文一份 SRT）、`matched_srt`（拍平成 SRT） |
 | 别的（用户匹配器自己的格式） | 原样 `json.load`，**不校验** | 只有声明了这个 schema 的预设收（见 `ACCEPTS`） |
 
-不给 `--preset` 时是 **`default`**（生产默认，owner 2026-09-24）：只留主轨的叠加字幕。叠加预设写两份——
+不给 `--preset` 时：匹配产物里有匹配器的推荐（`provenance.recommend`，`flowocr.extensions.recommendation`）就用它（命令行 `--opt` 优先），
+否则是 **`default`**（生产默认，owner 2026-09-24）：只留主轨的叠加字幕。叠加预设写两份——
 可编辑的字幕稿（`*.script.ass`，阶段 3）和最终 ASS（阶段 4 `flowocr.typeset`）；三个的差别见
 `flowocr.output.presets._overlay` 和 script-fx 计划。
+
+匹配产物上画哪些由**显示协议**定：匹配器在产物里声明组和档位（`display`），内置预设都按 `--opt show=…` / `hide=…` 算可见集合
+（`matchedio.visible`、`script.matched_visible`）；`keep` 只留给 tracks 产物，`layers` 已去掉，对匹配产物传这两个都报错。
 
 预设可以声明 `ACCEPTS = ("flowocr-tracks/1", …)`：喂进来的产物不在里头就**当场报错**，
 而不是让它在预设内部以 `KeyError` 的形式炸（"失败不冒充成功"，计划）。不声明就是什么都收。
@@ -27,7 +31,7 @@ import argparse
 import json
 from pathlib import Path
 
-from flowocr import extensions
+from flowocr import extensions, paths, provenance
 from flowocr.artifacts import matchedio, tracksio
 
 
@@ -53,11 +57,19 @@ def check_accepts(preset, doc: dict, spec: str) -> None:
                          f"阶段 2 的哪份产物喂给哪个预设，见 flowocr.output.render 文件头")
 
 
+def recommended_path(p: str) -> Path:
+    """推荐里记的 .py（`extensions.recommendation` 记成 `portable()`）-> 本机路径。**不看 cwd**：`portable()` 的相对写法
+    就是相对数据根的，`~/…` 是用户目录；照 `provenance.local()` 那样先找 cwd 的话，cwd 下恰好有同名文件就会加载另一份（二次验收 2026-10-06）。"""
+    q = Path(p).expanduser()
+    return q if q.is_absolute() else paths.data_root() / q
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="跑一个输出预设")
     ap.add_argument("doc", metavar="产物", help="阶段 2 的产物：*-tracks.json 或 *-matched.json")
-    ap.add_argument("--preset", default="default",
-                    help="内置名（%s）/ 模块名 / .py 路径" % "、".join(extensions.builtin_names("preset")))
+    ap.add_argument("--preset", default=None,
+                    help="内置名（%s）/ 模块名 / .py 路径。不给时用匹配产物里匹配器推荐的（provenance.recommend，连同它的选项），"
+                         "没有推荐就是 default；显式给了就照用，推荐的选项不带上" % "、".join(extensions.builtin_names("preset")))
     ap.add_argument("--outdir", default="", help="默认写在产物旁边")
     ap.add_argument("--opt", action="append", default=[], metavar="K=V", help="给预设的选项，可多次")
     a = ap.parse_args(argv)
@@ -67,10 +79,23 @@ def main(argv: list[str] | None = None) -> int:
             ap.error(f"--opt 要 K=V：{kv}")
         k, v = kv.split("=", 1)
         opts[k] = v
-    preset = extensions.load(a.preset, "preset")
     src = Path(a.doc)
     doc = load_doc(src)
-    check_accepts(preset, doc, a.preset)
+    spec = a.preset
+    rec = (doc.get("provenance") or {}).get("recommend")
+    if spec is not None and rec and rec["preset"] != provenance.portable(spec):     # 推荐里记的是 portable() 写法
+        # 显式给的照用，只提示一句（owner 2026-10-06）
+        print(f"（匹配器 {rec.get('by')} 推荐的是预设 {rec['preset']}" + (f"，选项 {rec['opts']}" if rec.get("opts") else "") + "）")
+    if spec is None:
+        if rec:
+            spec, opts = rec["preset"], {**rec.get("opts", {}), **opts}      # 命令行的 --opt 优先
+            if spec.endswith(".py"):
+                spec = str(recommended_path(spec))
+            print(f"按匹配器 {rec.get('by')} 的推荐用预设 {spec}" + (f"（{rec['opts']}）" if rec.get("opts") else ""))
+        else:
+            spec = "default"
+    preset = extensions.load(spec, "preset")
+    check_accepts(preset, doc, spec)
     outdir = Path(a.outdir) if a.outdir else src.parent
     written = preset.render(doc, outdir, opts)
     for p in written:

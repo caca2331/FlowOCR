@@ -42,8 +42,10 @@ for L in C D E; do
   [ -n "${!v+set}" ] && ARMS+=("$L")
 done
 declare -A ARGS_OF=()
+# 开发一律 `--quality high`（owner 2026-10-05），放在臂的参数**前面**：argparse 取最后一个值，臂给的才盖得住它。
+# 加在这里（各臂参数串的源头），arm_check、ocr_complete --argv 和真正的调用用的是同一份——只加在调用上会按新默认误报撞臂
 for L in "${ARMS[@]}"; do
-  v="${L}_ARGS"; ARGS_OF[$L]="${!v:-}"
+  v="${L}_ARGS"; ARGS_OF[$L]="--quality high ${!v:-}"
 done
 # 臂撞没撞要比**解析之后的生效配置**，不是参数字面（2026-09-17 审计：默认值一翻，
 # `B_ARGS="--reuse-v2 --reuse-corr 0.8 --refresh-every 32"` 就和 A 的空参数完全相等了）

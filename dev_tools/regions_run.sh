@@ -21,7 +21,7 @@ echo "组：${NAMES[*]}"
 echo "=== 提取（各组同时跑）$(date '+%H:%M:%S') ==="
 # shellcheck disable=SC2086
 "$PY" -m flowocr.extract.run_groups "$VIDEO" --regions "$SPEC" --outdir "$OUT" --start "$S" --end "$E" \
-  ${SERIAL:+--serial} --progress-every 2000 ${OCR_ARGS:-}
+  ${SERIAL:+--serial} --progress-every 2000 --quality high ${OCR_ARGS:-}   # 开发一律 high，臂的参数在后面
 for g in "${NAMES[@]}"; do
   echo "=== 组 $g 建轨 ==="
   # shellcheck disable=SC2086

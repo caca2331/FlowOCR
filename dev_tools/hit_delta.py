@@ -33,6 +33,11 @@
 > 所以：可以说"重复认领涨了多少"，不能换算成"多了多少条确认的错"，
 > 也不能用它定位是哪一处错。
 
+**命中要有 OCR 文本支撑**（2026-10-05，09-26 审计）：量的是匹配器的输出，文本已换成剧本原文，游标对齐必然逐字命中；
+而参照匹配器会按上下文动量把剧本行填在没读到这句的 cue 上（yuka f5 发饰误读的 `大` / `米`）。所以一条剧本行要在认领它的
+输出 cue 时段里、喂给匹配器的那份 OCR（`tmp/match/ours{N}{SUFFIX}.srt`）有一条和它共有足够多的内容字（`script_align.FILL_SIM`），才进命中；
+其余的另记「填位」一列（`script_align.text_support`）。不分开的话，往主轨里灌垃圾 cue 的改动在这把尺上显得有收益。
+
 用法（**臂名以 `-` 开头，必须写成 `--b=-xxx`**，空格形式会被 argparse 当成选项）：
     python dev_tools/hit_delta.py 1 2 3 4 5 --b=-sr20mb
 """
@@ -62,14 +67,20 @@ def reset(script) -> None:
         e.matched, e.sim = -1, 0.0
 
 
-def hits(script, subs_path: Path, span, window: int, fuzzy: float) -> tuple[Counter, Counter]:
-    """跑一遍游标对齐，返回 (文本多重集, key 计数)。区间由参照字幕圈出，两臂共用。"""
+def hits(script, subs_path: Path, ocr_path: Path, span, window: int, fuzzy: float) -> tuple[Counter, Counter, Counter]:
+    """跑一遍游标对齐，返回**有 OCR 文本支撑的**命中 (文本多重集, key 计数)，和**填位**的文本多重集。区间由参照字幕圈出，两臂共用。
+
+    命中要 OCR 读到过这一行（`script_align.text_support`）：匹配器输出的文本已换成剧本原文，游标对齐必然逐字命中，
+    而匹配器会按上下文把剧本行填在没读到这句的 cue 上（2026-10-05 起分开记，见模块说明）。"""
     reset(script)
-    SA.align(script, SA.read_subs([subs_path]), window, fuzzy)
+    st = SA.align(script, SA.read_subs([subs_path]), window, fuzzy)
+    ok = SA.text_support(script, st["sub_hit"], SA.read_timed([subs_path]), SA.read_ocr([ocr_path]))
     lo, hi = span
-    got = [e for i, e in enumerate(script)
+    got = [(i, e) for i, e in enumerate(script)
            if SA.is_dialogue(e) and lo <= i <= hi and e.matched >= 0]
-    return Counter(e.text for e in got), Counter(e.key for e in got)
+    sup = [e for i, e in got if i in ok]
+    return (Counter(e.text for e in sup), Counter(e.key for e in sup),
+            Counter(e.text for i, e in got if i not in ok))
 
 
 def overclaim(subs, have: Counter) -> int:
@@ -116,11 +127,12 @@ def main() -> int:
     print(f"命中集合差（{a.by} 口径）：**{name_a} -> {name_b}**，分档口径同 evalkit.triviality")
     have = Counter(SA.norm(e.text) for e in script if SA.norm(e.text))
     print(f"{'片':<5}{'基准':>7}{'对比':>7}{'净':>6}{'新增':>6}{'丢失':>6}"
-          f"{P:>12}{T:>16}{C:>16}{'重复认领':>12}")
+          f"{P:>12}{T:>16}{C:>16}{'重复认领':>12}{'填位（有内容）':>16}")
     rows = []
     for n in a.films:
         pa, pb = md / f"ours{n}{a.a}_jp.ass", md / f"ours{n}{a.b}_jp.ass"
-        for p in (pa, pb):
+        oa_, ob_ = md / f"ours{n}{a.a}.srt", md / f"ours{n}{a.b}.srt"     # 喂给匹配器的那份（head2head.sh 抄进来的）
+        for p in (pa, pb, oa_, ob_):
             if not p.exists():
                 raise SystemExit(f"{p} 不在——那条臂还没跑过？")
         reset(script)
@@ -129,8 +141,8 @@ def main() -> int:
         evalkit.require_nonzero(len(got), f"input{n} 的参照字幕对上剧本的条目",
                                 "圈不出区间，两臂就没有共同分母")
         span = (min(got), max(got))
-        ta, ka = hits(script, pa, span, a.window, a.fuzzy)
-        tb, kb = hits(script, pb, span, a.window, a.fuzzy)
+        ta, ka, fa = hits(script, pa, oa_, span, a.window, a.fuzzy)
+        tb, kb, fb = hits(script, pb, ob_, span, a.window, a.fuzzy)
         ca, cb = (ta, tb) if a.by == "text" else (ka, kb)
         gained, lost = cb - ca, ca - cb
         g = classify(gained, None if a.by == "text" else text_of)
@@ -142,7 +154,8 @@ def main() -> int:
               f"{sum(gained.values()):>+6}{-sum(lost.values()):>+6}"
               + "".join(f"{g[c]-l[c]:>+12}" if c == P else f"{g[c]-l[c]:>+16}"
                         for c in evalkit.CLASSES)
-              + f"{f'{oa}->{ob}':>12}")
+              + f"{f'{oa}->{ob}':>12}"
+              + f"{f'{sum(fa.values())}({classify(fa, None)[C]})->{sum(fb.values())}({classify(fb, None)[C]})':>18}")
         rows.append((n, g[C] - l[C], net, ob - oa))
         if a.show:
             ex = [t if a.by == "text" else text_of[t]
@@ -150,6 +163,8 @@ def main() -> int:
                   if evalkit.triviality(t if a.by == "text" else text_of[t]) == C]
             if ex:
                 print(f"      丢失的『{C}』样例：" + " | ".join(x[:26] for x in ex[:a.show]))
+    print("命中 = 有 OCR 文本支撑的认领（认领它的输出 cue 时段里，原始 OCR 有一条和这一行共有的内容字过半，"
+          "或 ≥3 字且占那条 OCR 过半：`script_align.FILL_SIM`）；匹配器按上下文填在没读到这句的 cue 上的另记『填位』，不进命中（2026-10-05 起）。")
     print(f"\n**只有 `{C}` 这一档是『该抓到而没抓到』**（owner 2026-09-06）："
           + "  ".join(f"f{n} {d:+d}" for n, d, _, _ in rows))
     print("三档在这里**可以跨臂比**：命中是集合，集合差不经过 gap 的长/短分桶。"

@@ -115,6 +115,15 @@ def models_root() -> Path:
     return data_root() / "models"
 
 
+def trt_root() -> Path:
+    """TensorRT 后端的库和引擎缓存（`flowocr.trt`）的根：`FLOWOCR_TRT` > 数据根的 `trt/`（源码态是主 checkout 的 `trt/`，已 ignore；
+    安装态是用户数据目录）。下面按 TensorRT 版本分目录。"""
+    configured = os.environ.get("FLOWOCR_TRT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return data_root() / "trt"
+
+
 def gametext_root() -> Path:
     """游戏文本包（`gtd-bundle/1`，`flowocr.analyze.gtdbundle`）的默认位置：`FLOWOCR_GAMETEXT` > 数据根的 `gametext/`
     （源码态是主 checkout 的 `gametext/`，已 ignore；安装态是用户数据目录）。包是私下拿到的，放进来即可，不用解压。"""

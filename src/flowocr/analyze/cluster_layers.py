@@ -108,7 +108,7 @@ def load(tag: str, extra: list[str] | None = None, verbose: bool = True) -> Laye
         rows = [o for o in (json.loads(x) for x in f if x.strip()) if o["conf"] >= a["min_conf"]]
     W, H = meta.get("width"), meta.get("height")
     if not W:
-        W, H = bt.probe_size(meta["video"])
+        raise SystemExit(bt.OBS_NO_SIZE)
     frame_us = int(round(1e6 / meta["sample_fps"]))
     runs = bt.build_runs(rows, frame_us, a["iou"], a["sim"], a["gap_frames"],
                          grow_typewriter=not a["no_typewriter"], text_pick=a["text_pick"],
@@ -117,7 +117,7 @@ def load(tag: str, extra: list[str] | None = None, verbose: bool = True) -> Laye
                          grow_h_ratio=a["grow_h_ratio"], rejoin_split=a["rejoin_split"])
     _, wr = bt.cluster_windowed(runs, W, H, int(a["window_sec"] * 1e6), a["mutual_x"],
                                 a["region_time_gate"], a["region_h_ratio"])
-    L = Layers(tag, obs, meta["video"], W, H, frame_us, a, runs, wr, key)
+    L = Layers(tag, obs, str(local(meta["video"])), W, H, frame_us, a, runs, wr, key)   # obs 记的是 portable()，开文件要本机路径
     cache.parent.mkdir(parents=True, exist_ok=True)
     with open(cache, "wb") as f:
         pickle.dump({**{k: v for k, v in L.__dict__.items() if k != "key"}, "obs": str(obs)}, f,

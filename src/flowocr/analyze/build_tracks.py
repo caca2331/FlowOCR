@@ -18,7 +18,6 @@ import functools
 import hashlib
 import json
 import statistics
-import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -27,10 +26,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from flowocr.artifacts import evalkit          # noqa: E402
+from flowocr.artifacts import obsio            # noqa: E402
 from flowocr.artifacts import srtio            # noqa: E402
 from flowocr.artifacts import tracksio  # noqa: E402
 from flowocr.analyze import align  # noqa: E402
 from flowocr.analyze import uigate  # noqa: E402
+from flowocr import textfold  # noqa: E402
 from flowocr.output import run_srt  # noqa: E402   写 SRT / 清旧产物（阶段 C 第二刀搬过去的，这里只 re-export）
 from flowocr.provenance import DIRTY_PATHS, git_head, portable, version, code_fp as _code_fp  # noqa: E402,F401
 
@@ -68,6 +69,10 @@ def x_overlap_ratio(a: list[float], b: list[float], mutual: bool = False) -> flo
 
 # 时钟/日期长什么样：12:34、12:34:56、06/17、2026-09-03
 TIME_RE = re.compile(r"\d{1,2}\s*[:：]\s*\d{2}|\d{1,4}\s*[/\-年月]\s*\d{1,2}")
+
+
+SIM_THR = 0.55
+"""run 续接的文本相似度门（`--sim`）：一个观测和在场 run 的 `text_sim` 到这么多才算同一句（几何另有 `--iou`）。"""
 
 
 PREFIX_MIN_CHARS = 3
@@ -359,11 +364,13 @@ def typewriter_growth(prev_box: list[float], prev_text: str,
     判据两条，都不含时长/速度常数（owner：ms/char 不许钉死）：
       1. 短的那段文本是长的那段的**前缀**（允许 OCR 噪声；只有 1 个字时逐字相同）
       2. 两个框在**同一行**上，且是从同一侧长出去的
+
+    前缀比较之前两边先过 `textfold.fold`（NFKC + 小书写假名折大），字数的两道门仍按原文数：
+    zzz-s1 245.8 s 半截读成 `ビリー、行くよ!えっと…`、整句读成 `ビリー、行くょ！えつと…`，逐字比只有 0.75（`!`/`！`、`っ`/`つ`、`よ`/`ょ`
+    三处都是同一个字的读法差），链断成两条、整句那条没有段首证据，首字晚 40 帧（2026-10-05，followups 的 zzz-s1 那条）。
     """
     a, b = "".join(prev_text.split()), "".join(cur_text.split())
     if len(a) < max(1, min_chars) or len(b) <= len(a):
-        return False
-    if len(a) < 2 and not b.startswith(a):
         return False
     # 几何的几条先判、文本相似度最后算（全是"且"，先后不改结果；2026-09-24：整场 zzz 上这个函数 540 万次、70 s，大半花在 difflib 上）
     ah, bh = prev_box[3] - prev_box[1], cur_box[3] - cur_box[1]
@@ -378,7 +385,11 @@ def typewriter_growth(prev_box: list[float], prev_text: str,
                  and abs((cur_box[0] + cur_box[2]) - (prev_box[0] + prev_box[2])) <= 2 * tol)
     if not (grew_right or grew_both):
         return False
-    return len(a) < 2 or _ratio(a, b[:len(a)]) >= 0.8
+    fa, fb = textfold.fold(a), textfold.fold(b)
+    if len(a) < 2:
+        return fb.startswith(fa)
+    return _ratio(fa, fb[:len(fa)]) >= 0.8
+
 
 def _joined(pieces: list[dict]) -> str:
     """几块按从左到右拼成一行。两块之间的水平间隙 ≥ 0.3 个行高才隔一个空格（原文那里有空），否则直接拼——
@@ -1317,7 +1328,7 @@ def band_regions(report, main_i: int, max_dcy: float,
     audit-4 C1 的出路因此不是"让签名更严"（更严只是把"合错了"换成"没合上"），
     而是**让主轨可以由多个区域组成**。
 
-    判据相对**主轨自己的字高**归一化，无量纲（owner 指示 7）：
+    判据（`in_band`）相对**主轨自己的字高**归一化，无量纲（owner 指示 7）：
     中心 y 差 `max_dcy` 倍字高以内、字高比在 `[h_lo, h_hi]`。
     一个对话框的第二行大约差 1–3 倍字高。
 
@@ -1327,12 +1338,10 @@ def band_regions(report, main_i: int, max_dcy: float,
     所以这里只用几何，探针里那两列仍然打出来，好在别的素材上复查。
     """
     mf = next(f for ri, _, f in report if ri == main_i)
-    mh = max(mf["h"], 1e-6)
+    mg = geom.get(main_i) if (need_x and geom is not None and W) else None
     out = []
     for ri, lab, f in report:
         if ri == main_i:
-            continue
-        if not (abs(f["cy"] - mf["cy"]) / mh <= max_dcy and h_lo <= f["h"] / mh <= h_hi):
             continue
         # ① 和主轨的**接受判据**对齐（`--main-band-label`）。
         #    第一眼看它"太狠"（quick 六段里三段的并带大幅缩水），
@@ -1341,19 +1350,66 @@ def band_regions(report, main_i: int, max_dcy: float,
         #    是屏幕左下角的 UI 垃圾。**先摆文本，再算比例。**
         if need_label and lab not in MAIN_LABELS:
             continue
-        # ② 复用另外两层现成的 x 判据（`--main-band-x`；区间重叠 **或** 中心对齐），
-        #    不新写一条。三种对齐都盖得住：靠左/靠右走区间重叠
-        #    （短行整个落在长行里，分母取较窄的那个），居中走 cx 距离。
-        if need_x:
-            if geom is not None and W:
-                a, b = geom.get(main_i), geom.get(ri)
-                if a and b:
-                    ax0, ax1, acx = a[1], a[2], a[0]
-                    bx0, bx1, bcx = b[1], b[2], b[0]
-                    if (x_overlap_ratio([ax0, 0, ax1, 1], [bx0, 0, bx1, 1], mutual_x) < 0.30
-                            and abs(acx - bcx) > 0.08 * W):
-                        continue
-        out.append(ri)
+        if in_band(mf, f, mg, geom.get(ri) if mg else None, max_dcy, h_lo, h_hi, W, mutual_x):
+            out.append(ri)
+    return out
+
+
+def in_band(mf: dict, f: dict, mg: tuple | None, g: tuple | None, max_dcy: float,
+            h_lo: float, h_hi: float, W: int = 0, mutual_x: bool = False) -> bool:
+    """一块文字（一个区域，或 `band_windows` 的一个"区域 × 时间窗"）和主轨是不是同一条字幕带：
+    `f` / `mf` 给中位 `cy`、`h`（画面比例），`g` / `mg` 是 `region_geom` 的几何签名（`None` = 不看 x）。
+
+    y 和字高相对**主轨自己的字高**归一化，无量纲（owner 指示 7）。
+    x 复用另外两层现成的判据（`--main-band-x`；区间重叠 **或** 中心对齐），不新写一条：
+    靠左 / 靠右走区间重叠（短行整个落在长行里，分母取较窄的那个），居中走 cx 距离。"""
+    mh = max(mf["h"], 1e-6)
+    if not (abs(f["cy"] - mf["cy"]) / mh <= max_dcy and h_lo <= f["h"] / mh <= h_hi):
+        return False
+    if mg is not None and g is not None:
+        if (x_overlap_ratio([mg[1], 0, mg[2], 1], [g[1], 0, g[2], 1], mutual_x) < 0.30
+                and abs(mg[0] - g[0]) > 0.08 * W):
+            return False
+    return True
+
+
+def band_windows(runs: list[Run], region_ids: dict[int, list[int]], report, main_i: int,
+                 taken: set[int], window_us: int, max_dcy: float, h_lo: float, h_hi: float,
+                 need_label: bool, mg: tuple | None, W: int, H: int,
+                 mutual_x: bool = False) -> dict[int, list[int]]:
+    """`--main-band-unit window`：没整块并进来的区域，再**按时间窗拆开**逐块判一次（`in_band` 同一条判据）。
+    返回 `{区域: 并进主轨的 run 下标}`。
+
+    病根（followups「并带仍会被区域组成的小扰动带偏」）：跨窗缝合把某几个窗里的字幕带缝进了一个混合槽位，
+    整块区域的中位几何（cy / 字高）离主轨很远，按区域判就整块不并——可那几个窗里的 run 本身就在字幕带上。
+    三处实例都是这个形状：zzz 整场 6 句在 r06（区域 cy 0.43、字高 2.06 倍；那几条事件 cy 0.61–0.65、字高 1.0–1.1 倍），
+    f5 `median` 下 8 条在 r08（区域字高 1.61 倍；事件 1.19 倍），hsr 换行尾巴在 r49。
+    一个"区域 × 时间窗"大致就是缝合之前的那个窗区域：窗内聚类的产物，几何还没被别的窗带偏。
+
+    **块过了带，成员再逐条过一次同一个 `in_band`**（2026-10-06，验收 peer）：块判的是中位几何，过了就整块并进来的话，
+    块里单条明显不在带上的也跟着进来——gi1 的 `Lv.90`（cy 0.94、字高 0.6 倍）、hsr 整块对话记录面板、读物面板，
+    四场整场按窗并进的事件里四到六成单条过不了带。逐条判不等于逐条 run 单独判（10-05 量过的对照臂，hsr 对不上剧本 137 → 299，已删）：
+    没过块判的那些块里的零星 run 照样进不来。"""
+    mf = next(f for ri, _, f in report if ri == main_i)
+    lab_of = {ri: lab for ri, lab, _ in report}
+
+    def passes(sub: list[int]) -> bool:
+        rs = [runs[i] for i in sub]
+        f = {"cy": statistics.median(r.cy for r in rs) / H, "h": statistics.median(r.h for r in rs) / H}
+        return in_band(mf, f, mg, region_geom(runs, sub) if mg is not None else None, max_dcy, h_lo, h_hi, W, mutual_x)
+
+    out: dict[int, list[int]] = {}
+    for ri, ids in region_ids.items():
+        if ri in taken or (need_label and lab_of.get(ri) not in MAIN_LABELS):
+            continue
+        by_win: dict[int, list[int]] = {}
+        for i in ids:
+            by_win.setdefault(window_of(runs[i], window_us), []).append(i)
+        for w, sub in sorted(by_win.items()):
+            if passes(sub):
+                keep = [i for i in sub if passes([i])]
+                if keep:
+                    out.setdefault(ri, []).extend(keep)
     return out
 
 
@@ -1486,6 +1542,16 @@ srt_ts = srtio.fmt_ts_us
 （methodology-audit 报告）。"""
 
 
+def row_order(rs: list[Run]) -> list[Run]:
+    """段里 run 的导出行序：先分行（`tracksio.row_index`），行从上往下，行内按左沿从左往右。
+    同一行被破折号之类断成两个框时，按 `(cy, cx)` 排会让纵向中心略高的后半截排到前面
+    （2026-10-05 魔裁：「大魔女を——ユキを殺す【犯人】は、」排成两行、还颠倒）。
+    先按 `(cy, cx, t_start, text)` 定一个确定的初序：`segment_runs` 拿 id 列表判"内容没变"，同一组 run 每次都要排成一样。"""
+    rs = sorted(rs, key=lambda r: (r.cy, r.cx, r.t_start, r.text))
+    row = tracksio.row_index([r.box for r in rs])
+    return [r for _, _, _, r in sorted((row[i], r.box[0], i, r) for i, r in enumerate(rs))]
+
+
 def segment_runs(rs: list[Run]) -> list[tuple[int, int, list[Run]]]:
     """把一个区域内互相重叠的 run 切成不重叠的时间段，每段带当时在场的所有行。
 
@@ -1497,7 +1563,7 @@ def segment_runs(rs: list[Run]) -> list[tuple[int, int, list[Run]]]:
     for s, e in zip(bounds, bounds[1:]):
         active = [r for r in rs if r.t_start <= s and r.t_end >= e]
         if active:
-            active.sort(key=lambda r: (r.cy, r.cx))
+            active = row_order(active)
             if out and [id(x) for x in out[-1][2]] == [id(x) for x in active] and out[-1][1] == s:
                 out[-1] = (out[-1][0], e, active)      # 内容没变就接上，别切碎
             else:
@@ -1527,6 +1593,227 @@ def merge_growing_segments(segs: list[tuple[int, int, list[Run]]]
                 continue
         out.append((s, e, active))
     return out
+
+JOIN_HEAD_MISS = 0.15
+"""同句合并：前一段的一行 `a` 被后一段同一行"接着"时，`a` 和 `b[:len(a)]` 对不上的字最多占 `a` 的这么多、至少容 1 个
+（量的是 OCR 抖动：`飼育·展` 对 `飼育・展示…` 4 个字错 1 个，按相似度比是 0.75，一个字就够把短行挡在 0.85 的门外）。"""
+NAME_CHANGE_SIM = 0.5
+"""切点两侧的名牌相似度低于这个就当换了说话人、不并（只在两侧全部正文行都换了 run 时才比，见 `can_join`）。"""
+
+
+def _sq(t: str) -> str:
+    return "".join(t.split())
+
+
+SENTENCE_END = "。．.！!？?」』）)…‥"
+"""句末的标点：一行以它结尾就是说完了的一句，不是打字机的半截（`head_similar` 只认精确前缀）。"""
+
+
+def head_similar(a: str, b: str) -> bool:
+    """`a` 是 `b` 的开头：去空白后前缀相同，或者和 `b` 的同长开头对不上的字不超过 `JOIN_HEAD_MISS`（至少容 1 个）；
+    `a` 至少 `BODY_MIN_CHARS` 个内容字。不用 `text_sim_at_least`：它只认精确前缀，否则整串比、先过长度上界——
+    `飼育·展` 对 `飼育・展示…` 在长度门上就被拒。
+    `a` 以句末标点（`SENTENCE_END`）结尾、`b` 在它后面还有字时只认精确前缀：魔裁 `……どうして。` 是单独说的一句、上屏 2.6 秒，
+    下一句 `どうしてユキちゃんは、` 和它只差最后一个字，容 1 个字的门会把两句并成一条。`b` 后面没字了（同一句重读、
+    只有句末标点读得不一样：`販売中!` / `販売中！`）照容。"""
+    a, b = _sq(a), _sq(b)
+    if evalkit.content_len(a) < BODY_MIN_CHARS:
+        return False
+    if b.startswith(a):
+        return True
+    if a[-1] in SENTENCE_END and evalkit.content_len(b[len(a):]) > 0:
+        return False
+    same = sum(m.size for m in SequenceMatcher(None, a, b[:len(a)], autojunk=False).get_matching_blocks())
+    return same >= len(a) - max(1, int(JOIN_HEAD_MISS * len(a)))
+
+
+def x_overlapped(r: Run, q: Run) -> bool:
+    """横向重叠至少是较窄那个的一半：同一行上的"同一处字"（打字机从同一个左沿往右长、居中的往两边长都满足）；
+    同一高度、横向离得远的两处同样的字（两个头像下的 `Lv.90`）不满足。"""
+    ov = min(r.box[2], q.box[2]) - max(r.box[0], q.box[0])
+    return ov >= 0.5 * max(1e-9, min(r.box[2] - r.box[0], q.box[2] - q.box[0]))
+
+
+def continues(r: Run, q: Run, tol: int) -> bool:
+    """`q` 接着 `r`：同一条 run（跨过了切点），或者同一行、`q` 在 `r` 消失的那一刻（± `tol`）出现、文本是 `r` 的延续——
+    开头相似（`head_similar`），或者 `r` 是打字机首帧的 1–2 字碎片、正好是 `q` 的前缀（同 `body_segments.lead_of`）。
+    同句合并认"接上"、`seg_hide` 认半截行都用它（同一个容差）。"""
+    if q is r:
+        return True
+    if r.moving or q.moving or not tracksio.same_row(r.box, q.box) or not x_overlapped(r, q) or abs(q.t_start - r.t_end) > tol:
+        return False
+    a = _sq(r.text)
+    return head_similar(r.text, q.text) or (bool(a) and evalkit.content_len(a) < BODY_MIN_CHARS and _sq(q.text).startswith(a))
+
+
+FRAGMENT_COVER = 0.9
+"""`fragment_of`：碎片的框至少这么多落在另一行的框里（同 `script.FRAGMENT_COVER` 的意思：det 偶尔把一行静止的字多切出一块）。"""
+
+
+def fragment_of(r: Run, q: Run) -> bool:
+    """`r` 是 `q` 的碎片：同一行、`r` 的框 ≥ `FRAGMENT_COVER` 落在 `q` 的框里、文本是 `q` 的一段（det 偶尔在一两个采样点
+    把一行切出一块，星铁 `ずばり地脈共鳴！この` 是 `でもご心配なく、…ずばり地脈共鳴！この` 的后半截）。"""
+    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box):
+        return False
+    a, b = _sq(r.text), _sq(q.text)
+    if not a or len(a) >= len(b) or a not in b:
+        return False
+    ix = max(0.0, min(r.box[2], q.box[2]) - max(r.box[0], q.box[0])) * max(0.0, min(r.box[3], q.box[3]) - max(r.box[1], q.box[1]))
+    return ix >= FRAGMENT_COVER * max(1e-9, (r.box[2] - r.box[0]) * (r.box[3] - r.box[1]))
+
+
+def same_line_text(r: Run, q: Run, tol: int) -> bool:
+    """`r` 和 `q` 是同一处的同一行字（对称）：都不在动、同一行、横向重叠过半，而且文本是一回事——相同、一方是另一方的开头
+    （`head_similar`，OCR 抖动容 15%），或一方是打字机首帧的 1–2 字碎片、正好在另一方出现时消失（`continues`）。
+    `seg_hide` 在这样的两条里按同一个全序留一条（`seg_hide`），所以谁顶替谁和选代表不会打架。"""
+    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box) or not x_overlapped(r, q):
+        return False
+    a, b = _sq(r.text), _sq(q.text)
+    if a == b or head_similar(r.text, q.text) or head_similar(q.text, r.text):
+        return True
+    return continues(r, q, tol) or continues(q, r, tol)
+
+
+FLICKER_MAX_OBS = 2
+"""杂行至多读到过几次（`flicker`）：闪烁的 ▼、HUD 数字、名牌的抖动版只有 1–2 次观测（`body_segments.keep` 的注释）。"""
+
+
+def flicker(r: Run, s: int, e: int) -> bool:
+    """杂行：盖不住这段的一半、一共只读到过 ≤ `FLICKER_MAX_OBS` 次的行。不限字数——▼ 读成的 `un2ra` 有 5 个内容字。
+    按 run 自己的观测数判、不按它在这段里占多少判：一条早就在屏、正好在切点消失的长命行只有尾巴落在段里，
+    按"在段里的比例"判会把它当成杂行、不再要求后一段接着它（wuwa 的广告横幅换了一条，两条被并成一句）。
+    没合并过的段里每一行都盖满整段，永远不是杂行。"""
+    inside = min(r.t_end, e) - max(r.t_start, s)
+    return r.n_obs <= FLICKER_MAX_OBS and inside < 0.5 * (e - s)
+
+
+def is_name(r: Run) -> bool:
+    return bool(getattr(r, "nameplate", False))
+
+
+def body_rows(rs: list[Run], s: int, e: int) -> list[Run]:
+    """正文行：内容字 ≥ `BODY_MIN_CHARS`、没打名牌标、在 `[s, e]` 里不是杂行、不是同一批里另一行的碎片（`fragment_of`）。"""
+    return [r for r in rs if evalkit.content_len(r.text) >= BODY_MIN_CHARS and not is_name(r) and not flicker(r, s, e)
+            and not any(fragment_of(r, q) for q in rs)]
+
+
+def can_join(prev: tuple[int, int, list[Run]], cur: tuple[int, int, list[Run]], tol: int) -> bool:
+    """相邻两段是不是同一句（cue-shape 计划的 b）。杂行按合并后的整段判，不算数。
+
+    * 时间相接（± `tol`），后一段有正文行；
+    * 前一段在切点处还在的每条正文行，后一段里都有一条接着它（`continues`：同一条 run 挂过切点，或打字机的后续）；
+      前一段没有正文行时（打字机首帧、名牌先出），它在切点处的每一行都要被后一段的某一行接上（同一条 run 挂过切点也算：
+      原神的称号 `傭兵` 只有 2 个字、不算正文行，却一直在屏），而且至少有一行是被**另一条** run 接上的正文行（首帧真的打下去了）；
+    * 后一段另有新的正文行时，新行要和"打下去的"那几行（被另一条 run 接上的）**一起消失**（± `tol`，同 `group_cues` 的定式）；
+      没有打下去的（只是同一条 run 挂着、又多了一行），就和挂着的那几行比——常驻的 HUD 行（`矢を放つ`）一直挂着、
+      对话一出现就被当成"又多了一行"并进去，挡的是这个；
+    * 切点两侧的**全部**正文行都换了 run（翻页重画）时，再看名牌：两侧在屏的名牌没有共用的 run、相似度又低于
+      `NAME_CHANGE_SIM`，就是换了说话人，不并。"""
+    ps, pe, pr = prev
+    cs, ce, cr = cur
+    if cs - pe > tol:
+        return False
+    cb = body_rows(cr, ps, ce)
+    if not cb:
+        return False
+    at_cut = [r for r in pr if r.t_end >= pe - tol]
+    pb = body_rows(at_cut, ps, ce)
+    if pb:
+        match = {}
+        for r in pb:
+            q = next((q for q in cb if continues(r, q, tol)), None)
+            if q is None:
+                return False
+            match[id(r)] = q
+        held = list(match.values())
+    else:
+        rest = [r for r in at_cut if not is_name(r)]
+        if rest:
+            if not all(any(continues(r, q, tol) for q in cr) for r in rest):
+                return False
+        else:
+            names_p = [r for r in at_cut if is_name(r)]
+            return bool(names_p) and all(any(q is r or (tracksio.same_row(r.box, q.box) and text_sim(r.text, q.text) >= NAME_CHANGE_SIM)
+                                             for q in cr if is_name(q)) for r in names_p)
+        held = []
+    typed = [q for q in cb for r in at_cut if q is not r and continues(r, q, tol)]
+    if not pb and not typed:
+        return False
+    fresh = [q for q in cb if all(q is not t for t in typed) and all(q is not r for r in at_cut)]
+    ref = typed or held
+    if fresh and any(abs(q.t_end - t.t_end) > tol for q in fresh for t in ref):
+        return False
+    if pb and all(match[id(r)] is not r for r in pb):
+        names_p = [r for r in at_cut if is_name(r)]
+        names_c = [q for q in cr if is_name(q) and q.t_start <= cs + tol]
+        if names_p and names_c and not any(a is b for a in names_p for b in names_c) \
+                and max(text_sim(a.text, b.text) for a in names_p for b in names_c) < NAME_CHANGE_SIM:
+            return False
+    return True
+
+
+def join_same_sentence(segs: list[tuple[int, int, list[Run]]], tol: int) -> list[tuple[int, int, list[Run]]]:
+    """**同句合并**（`--cue-join on`，cue-shape 计划的 b）：`segment` 在每个 run 的首尾都切一刀，同一句被 ▼ 翻页提示的闪烁、
+    打字机半截（OCR 把 `·` / `・` 读得不一样、run 断了没续上）、名牌 OCR 抖动切成几条（2026-10-05 量：21 臂 695 条里冗余 84 条）。
+    相邻两段是同一句（`can_join`）就并成一段：起点取前一段的（首字出现），成员是并集（半截行、杂行留作成员，投影时由 `seg_hide` 藏）。"""
+    out: list[tuple[int, int, list[Run]]] = []
+    for seg in segs:
+        if out and can_join(out[-1], seg, tol):
+            ps, _, pr = out[-1]
+            seen = {id(r) for r in pr}
+            out[-1] = (ps, seg[1], row_order(pr + [r for r in seg[2] if id(r) not in seen]))
+        else:
+            out.append(seg)
+    return out
+
+
+_HIDE_CACHE: dict[tuple, tuple[tuple, tuple[set[int], set[int]]]] = {}
+"""`seg_hide` 按段缓存（判 UI、写 SRT、记 cue 各要一遍，每遍都是两两比较）。键是段的起止和成员的 `id`，值里一并存着成员本身、
+命中时核是不是同一批对象（守卫、工具在一个进程里反复调，旧 run 回收后 id 会被复用）；`main` 开头清空。"""
+
+
+def seg_hide(s: int, e: int, rs: list[Run], tol: int) -> tuple[set[int], set[int]]:
+    """一段里投影时不给的成员（`id(run)`），返回 `(全部要藏的, 其中的半截行)`。只从段本身算，各处调同一个函数。
+
+    **不变量：藏掉的半截行，同一行里一定留着一条看得见的、和它是同一处同一行字的代表**（peer 代码审两轮：只看"有没有顶替它的"会让
+    两条互相顶替、一起藏掉；谁顶替谁和选代表按两个不同的序会让两条都留、一行字写两遍）。所以只用一个全序：碎片放最后（它所在的整行先当代表），
+    其余按"消失得晚、再按活得久"——打字机的后续、OCR 抖动断开的后半段都比前面那条消失得晚。按这个序一条一条看，和已选的代表是
+    同一处同一行字（`same_line_text`），或是代表的碎片（`fragment_of`），就藏、记成半截行；否则自己当代表。被藏的半截行照旧给叠加贡献首字时刻（`row_leads`）。
+    * **半截行**：所有投影都不给（它是那一行的早先状态、碎片或重复读数）；
+    * **杂行**（`flicker`，在代表里判）：同一行还有看得见的非杂行，或者它只有 1–2 个内容字（▼ 读成的 `0`）才藏——
+      自成一行、晚打出来、只读到 1–2 次的真正文（绝区零 `無事で何よりよ、ビリー`）不藏。剔 UI 的导出不给，全部文字的视图照给、按 UI 标。
+    代表全被判成杂行时杂行不藏（半截行照藏）。"""
+    key = (s, e, tol, tuple(id(r) for r in rs))
+    hit = _HIDE_CACHE.get(key)
+    if hit is not None and all(a is b for a, b in zip(hit[0], rs)):
+        return hit[1]
+    row = dict(zip((id(r) for r in rs), tracksio.row_index([r.box for r in rs])))
+    frag = {id(r) for r in rs if not r.moving and any(fragment_of(r, q) for q in rs)}
+    rep: list[Run] = []
+    partial: set[int] = set()
+    for r in sorted(rs, key=lambda r: (id(r) in frag, -r.t_end, -(r.t_end - r.t_start), r.t_start, r.text)):
+        # 碎片的宿主自己被藏了（代表是抖动版、子串不成立）：同一处有看得见的代表就照样藏，不让半行露出来
+        if any(same_line_text(r, q, tol) or fragment_of(r, q)
+               or (id(r) in frag and tracksio.same_row(r.box, q.box) and x_overlapped(r, q)) for q in rep):
+            partial.add(id(r))
+        else:
+            rep.append(r)
+    flick = {id(r) for r in rep if flicker(r, s, e)
+             and (evalkit.content_len(r.text) < BODY_MIN_CHARS
+                  or any(q is not r and row[id(q)] == row[id(r)] and not flicker(q, s, e) for q in rep))}
+    hide = partial | flick
+    # 藏完一行都不剩时只撤掉杂行那部分（那就不是杂行，是一段只有短命行的 cue）；半截行照藏——代表总留着一条
+    out = (partial, partial) if len(hide) >= len(rs) else (hide, partial)
+    _HIDE_CACHE[key] = (tuple(rs), out)
+    return out
+
+
+def visible(segs: list[tuple[int, int, list[Run]]], tol: int | None) -> list[tuple[int, int, list[Run]]]:
+    """段里去掉 `seg_hide` 藏的成员（`tol` 是 None = 不合并、不藏，原样返回）：判常驻 UI、数面板、写 SRT 都只看会导出的行。"""
+    if tol is None:
+        return segs
+    return [(s, e, [r for r in a if id(r) not in seg_hide(s, e, a, tol)[0]]) for s, e, a in segs]
+
 
 def group_cues(rs: list[Run], end_tol_us: int, min_overlap: float = 0.5
                ) -> list[tuple[int, int, list[Run]]]:
@@ -1566,7 +1853,7 @@ def group_cues(rs: list[Run], end_tol_us: int, min_overlap: float = 0.5
             hit["end"] = max(hit["end"], r.t_end)
     out = []
     for c in sorted(cues, key=lambda c: (c["start"], c["end"])):
-        c["runs"].sort(key=lambda r: (r.cy, r.cx))
+        c["runs"] = row_order(c["runs"])
         out.append((c["start"], c["end"], c["runs"]))
     return out
 
@@ -1695,7 +1982,7 @@ def body_segments(rs: list[Run], end_tol_us: int = 500_000) -> list[tuple[int, i
     * 锚的起点往前放宽到"和它重叠、比它先出现的非锚行"的最早起点（打字机先出名牌 / 先出第一行，
       cue 起点仍是首字出现），但不越过同一区域里上一个锚的终点（同一个说话人连说两句时，名牌那条 run 横跨两句）；
     * 一个锚都不沾的非锚行（没有名牌的纯标点台词、孤立的 UI）用它自己的首尾切；
-    * 段里的行 = 在这段里出现过的全部 run（不要求盖满整段：闪烁的提示只盖住一部分），按 (cy, cx) 排；
+    * 段里的行 = 在这段里出现过的全部 run（不要求盖满整段：闪烁的提示只盖住一部分），按 `row_order` 排；
     * 相邻两段锚集合相同、或者前一段的锚是后一段的真子集（又打出来一行）就接上。
     """
     if not rs:
@@ -1842,17 +2129,17 @@ def body_segments(rs: list[Run], end_tol_us: int = 500_000) -> list[tuple[int, i
                 best[k] = r
         return list(best.values())
 
-    return [(s, e, sorted(dedupe([r for r in lines if keep(r, s, e)] or lines), key=lambda r: (r.cy, r.cx)))
+    return [(s, e, row_order(dedupe([r for r in lines if keep(r, s, e)] or lines)))
             for s, e, lines, _ in segs]
 
 
 def cue_segments(rs: list[Run], mode: str = "cue", min_seg_us: int = 150_000,
-                 end_tol_us: int = 500_000, min_overlap: float = 0.5
+                 end_tol_us: int = 500_000, min_overlap: float = 0.5, join: bool = False
                  ) -> list[tuple[int, int, list[Run]]]:
     """**切分**：一条轨上的 run 分成 cue。mode 四档：
 
     cue（按一起消失分条）/ segment（每个首尾边界都切，默认）/ body（只按正文行切，见 `body_segments`）/
-    raw（一条 run 一条）。
+    raw（一条 run 一条）。`join`（`--cue-join on`）只对 segment 生效：末尾再做一遍同句合并（`join_same_sentence`）。
 
     抽出来是因为切分的结果现在要**落进 JSON**（`docs/architecture/artifacts.md`）：
     导出器只投影、不重新切——切两遍就会有两份不一样的"条数"，而这个项目
@@ -1863,7 +2150,8 @@ def cue_segments(rs: list[Run], mode: str = "cue", min_seg_us: int = 150_000,
         return [(s, e, a) for s, e, a in group_cues(rs, end_tol_us, min_overlap)
                 if e - s >= min_seg_us]
     if mode == "segment":
-        return merge_growing_segments(drop_slivers(segment_runs(rs), min_seg_us))
+        segs = merge_growing_segments(drop_slivers(segment_runs(rs), min_seg_us))
+        return join_same_sentence(segs, end_tol_us) if join else segs
     if mode == "body":
         return drop_slivers(body_segments(rs, end_tol_us), min_seg_us)
     return [(r.t_start, r.t_end, [r]) for r in sorted(rs, key=lambda r: r.t_start)]
@@ -1992,19 +2280,42 @@ def panel_like(evs: list[dict], height: int) -> bool:
 
 def cues_from_segments(track_id: str, segs: list[tuple[int, int, list[Run]]],
                        eid_of: dict[int, int], events: list[dict] | None = None,
-                       height: int = 0) -> list[dict]:
+                       height: int = 0, tol: int | None = None) -> list[dict]:
     """把切分结果记成 cue 表。`events` 的顺序**就是**导出时的行序。
 
-    给了 `events`（全量事件表）和 `height`（画面高）时顺便打 `panel_like` 标（见上）。
+    给了 `events`（全量事件表）和 `height`（画面高）时顺便打 `panel_like` 标（见上，只数会导出的行）。
+    给了 `tol`（同句合并开着）时记 `seg_hide` 藏的成员：`hide`（投影时不给）和其中的 `partial`（半截行，全部文字的视图也不给）。
     """
     out = []
     for i, (s, e, a) in enumerate(segs):
         ids = [eid_of[id(r)] for r in a]
         cue = {"id": f"{track_id}c{i:05d}", "t_start": s, "t_end": e, "events": ids}
-        if events is not None and panel_like([events[j] for j in ids], height):
+        hide, partial = seg_hide(s, e, a, tol) if tol is not None else (set(), set())
+        if hide:
+            cue["hide"] = [eid_of[id(r)] for r in a if id(r) in hide]
+        if partial:
+            cue["partial"] = [eid_of[id(r)] for r in a if id(r) in partial]
+        if events is not None and panel_like([events[eid_of[id(r)]] for r in a if id(r) not in hide], height):
             cue["panel_like"] = True
         out.append(cue)
     return out
+
+
+def within_regions(segs: list[tuple[int, int, list[Run]]], placed: set[int]
+                   ) -> tuple[list[tuple[int, int, list[Run]]], int]:
+    """非区域轨（并带主轨、名牌轨）的段只留**区域轨里已有**的 run，空段丢掉；返回 `(段, 拿掉的行数)`。
+
+    非区域轨是区域轨的另一种投影（`tracksio.validate` 的子集不变量）。可切分本身会按上下文筛行：
+    `--srt-mode body` 的 `keep` / 去重、各模式的 `drop_slivers` 看的是**这一批 run 里**的锚和段，
+    同一条 run 在自己的区域里被筛掉、在并带后的另一批里却可能留下——没有这道闸，产物写到最后一步才被 schema 拦下
+    （2026-10-05：body 模式 12 臂里崩了 2 臂）。区域轨说了算：它筛掉的，投影里也不出现。"""
+    out, dropped = [], 0
+    for s, e, a in segs:
+        keep = [r for r in a if id(r) in placed]
+        dropped += len(a) - len(keep)
+        if keep:
+            out.append((s, e, keep))
+    return out, dropped
 
 
 def text_ui_lines(segs, args, ui_kw: dict) -> set[str]:
@@ -2056,20 +2367,21 @@ def ui_footprints(runs: list[Run], frame_us: int, args, observable=None) -> set[
              if m["share"] >= 0.02 and m["clen"] >= uigate.BODY_CLEN and m["dig"] < 0.3]
     bands = uigate.bands(cands)
     out: set[int] = set()
+    # ⚠ **名牌标是唯一的事实来源**：这里的带是全片算的，而名牌标是**按时间窗**挑的（`pick_nameplates`），
+    # 两边各判一次就会打架——实测 wuwa-s2 上 UI 门咬掉了 11 条打了名牌标的 run（`ヴェリーナ` 这种）。所以直接认那个标、不重判；
+    # 但**只保护名牌标所在的那几个窗**（`uigate.np_window`，和挑名牌同一种分窗；`t_lo` 和 `pick_nameplates` 的 `lo` 都是全部 run 的最早起点；按 run 的起点归窗，名牌 run 跨进下一个窗时，那个窗里同一框位没打标的 run 不受保护——和挑名牌的归窗约定一致）：同一个位置在别的时段可以是 UI。原来"框位里有一条名牌 run 就整个放行"，
+    # 一条误标就豁免一整个位置——gi1 左上角「オート再生」4 条误标放走 165 条、gi2「再生中」3 条放走 114 条（审计七 §3.8）。
+    win_us = max(1, int(args.nameplate_window * 1e6))
     for f, m in ms:
         m.update(uigate.relate(f.box, m["clen"], bands))
-        # ⚠ **名牌标是唯一的事实来源**：这里的带是全片算的，而名牌标是**按 120 秒窗**挑的，
-        # 两边各判一次就会打架——实测 wuwa-s2 上 UI 门咬掉了 11 条打了名牌标的 run
-        # （`ヴェリーナ` 这种）。所以直接认那个标，不在这里重判。
-        if any(getattr(runs[it.key], "nameplate", False) for it in f.items):
-            continue
+        np_wins = {uigate.np_window(it.t0, t_lo, win_us) for it in f.items if getattr(runs[it.key], "nameplate", False)}
         if (m["share"] < args.ui_fp_share or m["wvar"] > args.ui_fp_wvar
                 or uigate.is_nameplate(m) or m.get("in_band")):
             continue
         static_ui = m["churn"] <= args.ui_fp_churn and m["clen"] <= args.ui_fp_clen
         dyn_hud = m["dig"] >= 0.3 and m["clen"] <= 6
         if static_ui or dyn_hud:
-            out |= {it.key for it in f.items}
+            out |= {it.key for it in f.items if uigate.np_window(it.t0, t_lo, win_us) not in np_wins}
     return out
 
 
@@ -2078,7 +2390,8 @@ RUBY_H = (0.3, 0.75)
 
 
 def ruby_runs(runs: list[Run]) -> set[int]:
-    """⚠ 观察项（09-26 审计定级：中度过拟合嫌疑，defaults.md 1.30）：判据有两条是按单个误标补的，常数没扫，调参和评估同一批素材。
+    """⚠ 观察项（09-26 审计定级：中度过拟合嫌疑，defaults.md 1.30）：判据有两条是按单个误标补的，常数没扫。
+    10-05 在没参与调参的原神两场上摆帧核过（defaults.md 1.30 的留出检验）：标出的 143 条里 140 条是真注音；第 4 条因此改过。
 
     **振り仮名**：紧贴在一条含汉字的正文行上方、字高约一半、全是假名的短 run，返回下标（followups「振り仮名当成行」）。
 
@@ -2087,7 +2400,9 @@ def ruby_runs(runs: list[Run]) -> set[int]:
       1. 文本全是假名（去掉空白和 `ー・`），2–16 字（单个假名多是读残的碎片：wuwa-s2 面板里的 `を`、gi-s1 的 `ヤ`）；
       2. 同时在场（时间重叠 ≥ 自己时长的一半）的某条正文 run 含汉字，字高比在 `RUBY_H` 里；
       3. 注音的下沿落在正文上沿上下（上方 0.8 个注音字高到下方 0.5 个之间），横向整个落在正文的 x 范围里（两侧各留一个注音字高）；
-      4. 中心**不**和正文行的中心对齐（差不到半个注音字高）：那是居中压在对话上方的名牌（zzz-s1 `リン`），注音压在具体的汉字上；
+      4. 中心和一条**正文长度**的行（内容字 ≥ `uigate.BODY_CLEN`，名牌判据里"正文"的同一个门）对齐（差不到半个注音字高）的不标：
+         那是居中压在对话上方的名牌（zzz-s1 `リン`）。正文是短标签时居中正是常态——地图地名的注音整词居中
+         （「せいかきょうぎじょう」/「聖火競技場」），原来不分长短一律不标，留出的原神两场漏了 54 条真注音（defaults.md 1.30）；
       5. 注音横向覆盖的正文字符（按正文框等宽估）里汉字过半：真注音横跨的就是它注的那几个汉字（「けんてんかまえ」下是「懸天の構」），
          片假名的名字 / 称号 / 任务列表项恰好落在一行含汉字的正文上方时，底下多半是假名（gi2-w1 名牌「バーテンダー」下是「すまない、」，
          hsr `スターゲイザー`；peer 审查 edb5cc4 第 1 条）。
@@ -2124,7 +2439,7 @@ def ruby_runs(runs: list[Run]) -> set[int]:
                     continue
                 if r.box[0] < b.box[0] - r.h or r.box[2] > b.box[2] + r.h:
                     continue
-                if abs(r.cx - b.cx) < 0.5 * r.h:
+                if abs(r.cx - b.cx) < 0.5 * r.h and evalkit.content_len(b.text) >= uigate.BODY_CLEN:
                     continue
                 # 注音压在汉字上：按正文框等宽估出注音横向覆盖的是正文的哪几个字，其中汉字要过半
                 n = len(b.text)
@@ -2164,9 +2479,9 @@ def defaults_fingerprint(ap: argparse.ArgumentParser) -> tuple[str, str]:
 # `DIRTY_PATHS` / `git_head` / 指纹的实现 2026-09-21 搬进了 `flowocr.provenance`（文件头讲了为什么并成一份）；
 # 这里只留带默认表的入口，`gamescript` / `scriptmatch` / `refine_boundaries` 仍借 `bt.code_fp` / `bt.git_head` 用。
 
-CODE_FP_FILES = ("src/flowocr/analyze/build_tracks.py", "src/flowocr/artifacts/evalkit.py", "src/flowocr/artifacts/srtio.py", "src/flowocr/artifacts/tracksio.py",
+CODE_FP_FILES = ("src/flowocr/analyze/build_tracks.py", "src/flowocr/artifacts/evalkit.py", "src/flowocr/artifacts/obsio.py", "src/flowocr/artifacts/srtio.py", "src/flowocr/artifacts/tracksio.py",
                  "src/flowocr/analyze/uigate.py", "src/flowocr/analyze/align.py", "src/flowocr/output/run_srt.py",
-                 "src/flowocr/provenance.py",
+                 "src/flowocr/provenance.py", "src/flowocr/textfold.py",
                  # ⚠ 下面三个是**函数里懒 import** 的（自选范围的切点 / 可观察时长；`--cluster learned` / `lines`），同样决定产物——
                  # 2026-09-23 审计前守卫只认顶格 import，两个都漏了。`flowocr.extensions` 是加载器，用户匹配器的身份记在 provenance 的 `matcher`
                  "src/flowocr/extract/regions.py", "src/flowocr/analyze/slot_learned.py", "src/flowocr/analyze/slot_lines.py",
@@ -2240,13 +2555,8 @@ def provenance(args, meta: dict, main_srt: str = "", main_track: str = "",
             "args": {k: portable(v) if isinstance(v, str) else v for k, v in sorted(vars(args).items())}}
 
 
-def probe_size(video: str) -> tuple[int, int]:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0", video],
-        capture_output=True, text=True, check=True).stdout.strip()
-    w, h = out.split(",")[:2]
-    return int(w), int(h)
+OBS_NO_SIZE = "obs 缺 width / height（2026-10-06 删了按视频补探尺寸的回退）：这是很早的 obs，复用判据本来也拒，重跑 run_ocr2"
+"""obs 头里没有画面尺寸时的报错（`build_tracks`、`cluster_layers` 共用）。"""
 
 
 def effective_tag(args) -> str:
@@ -2310,7 +2620,7 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--matcher-ctx", action="append", default=[], metavar="K=V",
                     help="给匹配器 `cluster_patch` 的上下文，可多次；`tag` 自动带上（内置 gametext 按它认游戏）")
     ap.add_argument("--iou", type=float, default=0.35)
-    ap.add_argument("--sim", type=float, default=0.55)
+    ap.add_argument("--sim", type=float, default=SIM_THR)
     # 半帧余量是给 `round()` 出来的标称间隔留的抖动余地（build_runs 里那段 1 µs 的账），不是给丢帧留的。
     # 代价实测（gamestream-first-look 报告）：wuwa-s1 过场里字幕掉单帧、run 断成两条，主轨逐字重复 15%；
     # `--gap-frames 3`（容忍 2 帧）降到 3%。改默认要五部头对头
@@ -2424,6 +2734,12 @@ def make_parser() -> argparse.ArgumentParser:
     # 2026-09-26 进默认（defaults.md 1.30）：只看 y 的并带会把画面两侧同高度的 UI / 图标误读并进主轨
     ap.add_argument("--main-band-x", action=argparse.BooleanOptionalAction, default=True,
                     help="并带时再看 x：区间重叠 <0.30 且中心差 >0.08 画宽的区域不并（复用缝合层的 x 判据；默认开）")
+    # 实验开关（followups「并带仍会被区域组成的小扰动带偏」）：区域整块不在带上时，按"区域 × 时间窗"再判一次
+    ap.add_argument("--main-band-unit", choices=("region", "window"), default="region",
+                    help="并带按什么单位判（默认 region = 整个区域）。window：整块没并进来的区域再按时间窗拆开逐块判、"
+                         "块过了带的成员再逐条判一次，跨窗缝合缝进混合区域的那几个窗的字幕带也并进主轨。"
+                         "改的是主轨（`<tag>-main.srt`、tracks 里 kind=main 的轨和事件的 band_merged 标），"
+                         "经 `tracksio.in_main` 也影响选项 / 主轨外两层叠加和阶段 3 的主轨标")
     # 菜单 / 片头那种片段实测最高分只有 0.2；门槛多少合适没有数据支撑，留给调用方按用途定（methodology-audit-4 报告 C3）
     ap.add_argument("--main-min-score", type=float, default=0.0,
                     help="主轨分要高过这个才算数（默认 0 = 只要求 > 0）。宁可没有主轨也不要一条垃圾轨时调高")
@@ -2470,6 +2786,9 @@ def make_parser() -> argparse.ArgumentParser:
                     help="常驻 UI 判定的绝对条数下限：那一行至少要出现这么多次")
     ap.add_argument("--cue-min-overlap", type=float, default=0.5,
                     help="并进同一条 cue 的行，重叠时长要占**较长**那条的多大比例")
+    ap.add_argument("--cue-join", choices=("on", "off"), default="on",
+                    help="segment 切分末尾做同句合并（cue-shape 计划的 b）：同一句被 ▼ 闪烁、打字机半截、名牌抖动切开的几条并回一条，"
+                         "半截行 / 杂行留作成员、投影时藏。off = 不合并、不藏（2026-10-05 之前的切分）")
     ap.add_argument("--cue-end-tol-frames", type=float, default=1.0,
                     help="判定『一起消失』的容差，单位是采样间隔——不是固定毫秒")
     # text-motion 计划第 2 步
@@ -2521,16 +2840,13 @@ def main() -> int:
         return 0
     args = apply_matcher_patch(ap)
 
-    lines = Path(args.obs).read_text(encoding="utf-8").splitlines()
-    meta = json.loads(lines[0])["_meta"]
-    obs = [json.loads(x) for x in lines[1:] if x.strip()]
-    obs = [o for o in obs if o["conf"] >= args.min_conf]
+    meta, obs = obsio.read_obs(args.obs, args.min_conf)     # 逐行读、只留建 run 要的字段（resource 计划第 2 步）
     if not obs:
         raise SystemExit("没有满足置信度的观测")
 
     W, H = meta.get("width"), meta.get("height")
     if not W:
-        W, H = probe_size(meta["video"])
+        raise SystemExit(OBS_NO_SIZE)
     frame_us = int(round(1e6 / meta["sample_fps"]))
     t0_us = min(o["t_us"] for o in obs)
     dur_us = max(o["t_us"] for o in obs) + frame_us
@@ -2552,6 +2868,8 @@ def main() -> int:
                       typewriter_min_chars=args.typewriter_min_chars, grow_h_ratio=args.grow_h_ratio,
                       rejoin_split=args.rejoin_split,
                       cuts=cuts)
+    n_obs = len(obs)
+    del obs                                  # 之后只要条数，观测字典别留到结尾
     # 去噪：**默认不开**。整片上量过取舍（noise 报告），
     # 这两条砍掉的"多出条目"里既有 OCR 垃圾也有基线漏掉的真台词，
     # 只有"误伤了多少条对得上基线的"是能确证的代价，所以交给调用方决定。
@@ -2608,12 +2926,8 @@ def main() -> int:
             # 行级 track（`tracks`）照旧用窗内聚类的——下游拿它给事件挂 track 号；**只换"哪些 run 是一个区域"**
             n_slots = len(groups)
             slot_of_run = {i: k for k, (ids, _, _) in enumerate(groups) for i in ids}
-            if args.cluster == "learned":
-                from flowocr.analyze import slot_learned
-                new = slot_learned.groups_for_pipeline(runs, W, H, effective_tag(args), fallback=slot_of_run)
-            else:
-                from flowocr.analyze import slot_lines
-                new = slot_lines.groups_for_pipeline(runs, W, H, fallback=slot_of_run)
+            from flowocr.analyze import slot_learned       # 聚类的尺量的是同一个函数（`slot_pairs.pipeline_assign`）
+            new = slot_learned.cluster_groups(args.cluster, runs, W, H, slot_of_run, effective_tag(args))
             groups = []
             for run_ids in new:
                 wins = covered_windows(runs, run_ids, window_us)
@@ -2662,8 +2976,12 @@ def main() -> int:
     eid_of: dict[int, int] = {}                    # id(Run) -> 事件 id
     region_runs: dict[int, list[Run]] = {}
     region_ids: dict[int, list[int]] = {}
+    placed: set[int] = set()                       # 进了某条区域轨 cue 的 run（`within_regions`）
     seg_kw = dict(mode=args.srt_mode, end_tol_us=int(args.cue_end_tol_frames * frame_us),
-                  min_overlap=args.cue_min_overlap)
+                  min_overlap=args.cue_min_overlap, join=args.cue_join == "on")
+    # 同句合并开着时，半截行 / 杂行留作 cue 成员、投影时藏（`seg_hide`）；判 UI、数面板、写 SRT 都只看会导出的行（`visible`）
+    tol = seg_kw["end_tol_us"] if seg_kw["join"] and args.srt_mode == "segment" else None
+    _HIDE_CACHE.clear()
     ui_kw = dict(min_support=args.ui_min_support,
                  min_onshare=args.ui_min_onshare, film_us=dur_us)
     # **名牌标**：在出事件之前全片挑一次（**按时间分窗**，判据在 `flowocr.analyze.uigate`）。
@@ -2725,7 +3043,8 @@ def main() -> int:
         # 而默认 `--feed nonoise` 喂给匹配器的正是区域轨（peer 审查 6b47a0c 第 1 条：gi-s1 r13 15/17 条、zzz-s1 r06 最多早 168 s）。
         # 它们的事件照旧留在这条轨里、各自成 cue，用途 1 的叠加照样按轨标 UI；文本那条 UI 判据只数正文的段
         segs, body_segs = split_hidden(rs, seg_apart, run_idx, seg_kw)
-        ui = text_ui_lines(body_segs, args, ui_kw)
+        placed.update(id(r) for _, _, a in segs for r in a)
+        ui = text_ui_lines(visible(body_segs, tol), args, ui_kw)
         for r in rs:
             # `ui_filtered` **逐轨**（文本那条判据）、`ui_footprint` **全局**（框位那条）——
             # 混成一个 flag 的话，导出器按 flag 投影时会把"区域轨里判的 UI"带进主轨，
@@ -2737,11 +3056,11 @@ def main() -> int:
             if run_idx[id(r)] in ruby:
                 events[eid_of[id(r)]]["flags"].append("ruby")
         srt_name = f"{tag}-region{ri:02d}-{lab}.srt"
-        write_srt_segments(outdir / srt_name, segs, ui, export_drop, run_idx)
+        write_srt_segments(outdir / srt_name, visible(segs, tol), ui, export_drop, run_idx)
         tid = f"r{ri:02d}"
         doc["tracks"].append({"id": tid, "kind": "region", "region": ri, "label": lab,
                               "srt": srt_name, "ui_lines": sorted(ui),
-                              "cues": cues_from_segments(tid, segs, eid_of, events, H)})
+                              "cues": cues_from_segments(tid, segs, eid_of, events, H, tol)})
         doc["regions"].append({
             "index": ri, "label": lab, "n_windows_present": n_win,
             "lang": f["lang"], "primary_score": f["primary_score"], "features": f})
@@ -2762,11 +3081,20 @@ def main() -> int:
                             need_label=args.main_band_label,
                             need_x=args.main_band_x, geom=geom, W=W,
                             mutual_x=args.slot_mutual_x)
-        if band:
+        part: dict[int, list[int]] = {}
+        if args.main_band_unit == "window":
+            part = band_windows(runs, region_ids, report, main[0], {main[0], *band}, window_us,
+                                args.main_band, *args.main_band_h, args.main_band_label,
+                                geom[main[0]] if args.main_band_x else None, W, H, args.slot_mutual_x)
+            if part:
+                print(f"  按窗并带（--main-band-unit window）：{len(part)} 个区域补进 "
+                      f"{sum(len(v) for v in part.values())} 条 run（这些区域整块的几何不在带上）")
+        if band or part:
             # **并成一份新产物，不动逐区域 SRT**：用途 1 要的是分开的块
             # （名牌/正文/称号是屏幕上三个位置），
             # 合并只是给匹配器用的主轨。
             merged = [r for i in [main[0], *band] for r in region_runs.get(i, [])]
+            merged += [runs[j] for ri in sorted(part) for j in part[ri]]
             # **框位门标了的常驻 UI、振り仮名在切分之前拿掉**（`--seg-skip-footprint`，默认开）：投影时反正要剔，
             # 留着切分的话，只含水印的空段会并进下一条 cue、把 cue 起点提前（wuwa-s2 8 条、最多早 3.7 s）。
             # 标是全局按框位 / 几何定的，切分前已知。主轨不给它们单独成 cue（主轨的叠加本来就不画 UI）
@@ -2777,23 +3105,29 @@ def main() -> int:
             main_srt = f"{tag}-main.srt"
             main_track = "main"
             in_main = {id(r) for r in merged}
-            for i in band:
+            for i in [*band, *sorted(part)]:
                 for r in region_runs.get(i, []):
-                    if id(r) in in_main:                # 被拿掉的 UI / 注音不在任何主轨 cue 里，不打"并进了主轨"
+                    if id(r) in in_main:                # 被拿掉的 UI / 注音、按窗没并进来的不在任何主轨 cue 里，不打"并进了主轨"
                         events[eid_of[id(r)]]["flags"].append("band_merged")
-            segs = cue_segments(merged, **seg_kw)
+            segs, n_out = within_regions(cue_segments(merged, **seg_kw), placed)
+            if n_out:
+                print(f"  主轨：{n_out} 行在自己的区域轨里被切分筛掉了，投影里也不给")
             # 并带后的常驻 UI 是**重新判**的：分母换成了合并后的 cue 数，
             # 同一行在区域轨里够比例、在主轨里不一定够。所以权威清单逐轨存
             # （tracksio 的 `tracks[].ui_lines`），不是事件上那个方便标记。
-            ui = text_ui_lines(segs, args, ui_kw)
+            ui = text_ui_lines(visible(segs, tol), args, ui_kw)
             # ⚠ **框位门在这里也要生效**：那次翻车（`Auto` 污染 293/595 条主轨 cue）
             # 就发生在这条并带主轨上。只接区域循环等于没接——主轨是另写的一份。
-            n = write_srt_segments(outdir / main_srt, segs, ui, export_drop, run_idx)
+            n = write_srt_segments(outdir / main_srt, visible(segs, tol), ui, export_drop, run_idx)
+            # `regions` 只列**整块**并进来的区域：下游（`scriptmatch.choice_items`、阶段 3 的 `main` 标）按"事件的区域在不在这里"
+            # 判它在不在主轨上，列上只并了几个窗的区域会把那块区域里其余的事件也算成主轨（选项层 hsr 整场 112 → 73，2026-10-05 量过）。
+            # 按窗补进来的事件看 `band_merged` 标
             doc["tracks"].append({"id": "main", "kind": "main", "regions": [main[0], *band],
                                   "label": main[1], "srt": main_srt, "ui_lines": sorted(ui),
-                                  "cues": cues_from_segments("main", segs, eid_of, events, H)})
+                                  "cues": cues_from_segments("main", segs, eid_of, events, H, tol)})
             print(f"主轨并带（--main-band {args.main_band:g}）：region{main[0]:02d} + "
                   + "、".join(f"r{i:02d}" for i in band)
+                  + (f"（按窗另补 {'、'.join(f'r{i:02d}' for i in sorted(part))}）" if part else "")
                   + f" -> {main_srt}，{len(merged)} 条 run、**{n} 条 cue**"
                   + (f"（切分前拿掉框位 UI / 振り仮名 {n_fp} 条 run）" if n_fp else ""))
     prov = provenance(args, meta, main_srt, main_track,
@@ -2817,13 +3151,15 @@ def main() -> int:
     if n_np_orphan:
         print(f"  注：{n_np_orphan} 条名牌 run 所在的区域被 --min-persistence "
               f"{args.min_persistence} 丢掉了，不进名牌轨")
-    if np_runs:
-        np_segs = cue_segments(sorted(np_runs, key=lambda r: r.t_start), **seg_kw)
+    np_segs, n_out = within_regions(cue_segments(sorted(np_runs, key=lambda r: r.t_start), **seg_kw), placed)
+    if n_out:
+        print(f"  名牌轨：{n_out} 行在自己的区域轨里被切分筛掉了，投影里也不给")
+    if np_segs:
         np_name = f"{tag}-nameplate.srt"
-        write_srt_segments(outdir / np_name, np_segs, set())
+        write_srt_segments(outdir / np_name, visible(np_segs, tol), set())
         doc["tracks"].append({"id": "np", "kind": "nameplate", "region": -1,
                               "label": "nameplate", "srt": np_name, "ui_lines": [],
-                              "cues": cues_from_segments("np", np_segs, eid_of, events, H)})
+                              "cues": cues_from_segments("np", np_segs, eid_of, events, H, tol)})
         print(f"名牌轨：{len(np_segs)} 条 cue -> {np_name}")
 
     doc["provenance"] = prov
@@ -2840,7 +3176,7 @@ def main() -> int:
 
     win_note = f"窗 {args.window_sec:g}s × {n_windows}" if args.window_sec > 0 else "不分窗"
     ci = _ratio.cache_info()
-    print(f"{tag}: {len(obs)} obs -> {len(runs)} runs -> {len(tracks)} tracks -> {len(report)} regions"
+    print(f"{tag}: {n_obs} obs -> {len(runs)} runs -> {len(tracks)} tracks -> {len(report)} regions"
           f"  ({W}x{H}, {dur_us / 1e6:.0f}s, 采样 {meta['sample_fps']:.1f}fps, {win_note})"
           f"；文本相似度缓存命中 {ci.hits}/{ci.hits + ci.misses}（满 {ci.currsize}/{ci.maxsize}）")
     cols = ("#", "label", "lang", "主轨分", "trk", "run", "pers", "fillA", "domi",

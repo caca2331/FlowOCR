@@ -43,6 +43,20 @@ ORT 的 CUDA EP **每次形状变化就重新规划**：同宽连打 4.6 ms，8 
 要减形状数去砍**批维**梯子（批维不影响读数：547 条差 0~1 条），别动宽度。"""
 
 
+BATCH_AREA = 20480
+"""一批的 **批 × 张量宽** 封顶（2026-10-05，resource 计划，defaults.md 1.42）：宽批的显存几乎全是识别头的输出 `[批, 宽/8, 18710]`
+那几份 fp32 张量，16 × 2560 这一个形状就要多 2.9 GB 显存（探针）（宽 1280 以下的 16 批不到 100 MB）。按 20480 封顶 = 宽 ≤ 1280 照旧 16 批、
+1600–2560 最多 8、2880 / 3200 最多 4（都是 2 的幂，补齐不越界）。quick 六段一批都碰不到；zzz 整片里约 20–24 批会被拆开
+（按 `_meta.rec_pool.shape_hist` 里批大小超过上限的数，五份整片 obs 20–24，异步池每趟拼法不同；同一张量宽、只是批小了）。"""
+
+
+def batch_cap(tw: int, max_batch: int = MAX_BATCH, area: int = BATCH_AREA) -> int:
+    """张量宽 `tw` 这一档一批最多几个：`max_batch` 和 `area // tw` 取小，再向下取到 2 的幂——默认的批梯子（2 的幂）补齐后不越过它；
+    给了非默认的 `--ort-batch-ladder` 时补齐可能越过（梯子档位不是 2 的幂）。"""
+    k = max(1, min(max_batch, area // max(1, tw)))
+    return 1 << (k.bit_length() - 1)
+
+
 def warm_shapes(max_batch: int = MAX_BATCH, grid: int = GRID, max_w: int = 2560) -> list[tuple[int, int]]:
     """ORT 服务起动后后台预热的 `(批, 宽)` 表（`ort_server --warm`，2026-09-24）：宽是分桶网格（`grid` 的倍数）、批是 2 的幂（`_pad_batch`），
     按 quick 六段实测的 `shape_hist` 取常见的——窄的（≤ 2 格）批能到 `max_batch`，3 格到 4，更宽的只有 1 / 2。
@@ -130,8 +144,9 @@ class OrtRec:
         for i, tw in enumerate(widths):
             groups.setdefault(tw, []).append(i)
         for tw, idx in groups.items():
-            for s in range(0, len(idx), self.max_batch):
-                part = idx[s:s + self.max_batch]
+            cap = batch_cap(tw, self.max_batch)           # 宽批按 批 × 宽 封顶（BATCH_AREA）：显存
+            for s in range(0, len(idx), cap):
+                part = idx[s:s + cap]
                 k = self._pad_batch(len(part), self.ladder)      # 补零行，回来只取前几条
                 if self.pre_on_server:
                     cls, prob = self.cli.run_crops("rec", [crops[i] for i in part], self.grid, k)

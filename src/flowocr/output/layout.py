@@ -7,8 +7,11 @@ from __future__ import annotations
 
 from flowocr.output import export
 
-OVERLAY_PAD = 6
-"""底板比 OCR 框外扩的像素：盖住原字笔画的边缘。也是字离画面边的最小距离。"""
+OVERLAY_PAD = 14
+"""底板比 OCR 框（和正文）外扩的像素：盖住原字笔画的边缘、字周围留点边。
+2026-10-05 owner 看对比图后从 6 加到 14：6 时字贴着底板边、显挤；要更松的边距该是底板往外扩，不是把字缩小。"""
+EDGE_PAD = 6
+"""字离画面边的最小距离（锚轴往里推、扩出的行不出画面、译文字号的宽度上限）。和底板外扩分开：边距加大不该把贴满整屏的长译文字号压小一档。"""
 
 PLATE_MODES = ("box", "rows", "text")
 """底板怎么画（owner 2026-09-12 要三种比观感）：
@@ -51,19 +54,37 @@ def anchor_axis(rows: list[list[float]], align: str, common: bool) -> list[float
     return [a] * len(rows)
 
 
+def row_span(r: list[float], text_h: float) -> tuple[float, float]:
+    """一行竖直方向要盖到哪：原文框和正文（高 `text_h`、以这一行的中心为准）取并。"""
+    c = (r[1] + r[3]) / 2
+    return min(r[1], c - text_h / 2), max(r[3], c + text_h / 2)
+
+
 def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str,
-                align: str = "center") -> list[list[float]]:
+                align: str = "center", text_h: float | list[float] = 0.0) -> list[list[float]]:
     """每行一个底板矩形 [x0, y0, x1, y1]（`box` 模式一整块）。`axis` 是锚轴（一个数 = 各行共用，或逐行一个）；
-    译文区间按锚点算（`text_span`）。上下相邻的两行外扩后会叠一条，半透明时叠的地方更黑，所以从中间劈开。"""
+    译文区间按锚点算（`text_span`）。上下相邻的两行外扩后会叠一条，半透明时叠的地方更黑，所以从中间劈开。
+    **字不出底板**：`text_h` 是正文画出来的高（以这一行的中心为准），比原文框高时底板跟着长；`box` 也把译文的左右范围并进来
+    （2026-10-05 owner 截图：两行原文框隔得远、字号按两框合起来的高定成 90 号，字形 67 px 高而底板只有 46 px）。
+    `text_h` 可以逐行给（原文逐行字号时各行字形高不同，矮行的底板不该被撑到大字那行的高）。"""
     p = OVERLAY_PAD
-    if mode == "box":
-        return [[min(r[0] for r in rows) - p, rows[0][1] - p, max(r[2] for r in rows) + p, rows[-1][3] + p]]
     axes = axis if isinstance(axis, list) else [axis] * len(rows)
+    ths = text_h if isinstance(text_h, list) else [text_h] * len(rows)
+    th_of = {id(r): h for r, h in zip(rows, ths)}
+
+    def tall(r):
+        return row_span(r, th_of.get(id(r), max(ths, default=0.0)))
+    if mode == "box":
+        spans = [text_span(a, w, align) for w, a in zip(text_w, axes)] if text_w and axis is not None else []
+        x0 = min([r[0] for r in rows] + [s[0] for s in spans])
+        x1 = max([r[2] for r in rows] + [s[1] for s in spans])
+        return [[x0 - p, tall(rows[0])[0] - p, x1 + p, tall(rows[-1])[1] + p]]
     out = []
     for r, w, a in zip(rows, text_w, axes):
         tx0, tx1 = text_span(a, w, align)
         x0, x1 = (tx0, tx1) if mode == "text" else (min(r[0], tx0), max(r[2], tx1))
-        out.append([x0 - p, r[1] - p, x1 + p, r[3] + p])
+        y0, y1 = tall(r)
+        out.append([x0 - p, y0 - p, x1 + p, y1 + p])
     for a, b in zip(out, out[1:]):
         if b[1] < a[3]:
             a[3] = b[1] = (a[3] + b[1]) / 2
@@ -101,7 +122,7 @@ def fit_line(rows: list[list[float]], lines: list[str], font: str, widths: dict,
     by_h = (box[3] - box[1]) / max(1, n) * export.h_ratio(font)
     w1 = max((line_width(font, ln, widths) for ln in lines), default=0.0)
     size = max(size, int(OVERLAY_MIN_SCALE * by_h))
-    return min(size, int((W - 4 * OVERLAY_PAD) / w1)) if w1 > 0 else size
+    return min(size, int((W - 4 * EDGE_PAD) / w1)) if w1 > 0 else size
 
 
 def expand_rows(rows: list[list[float]], k: int, H: int) -> list[list[float]]:
@@ -114,7 +135,7 @@ def expand_rows(rows: list[list[float]], k: int, H: int) -> list[list[float]]:
     pitch = (rows[-1][1] - rows[0][1]) / (len(rows) - 1) if len(rows) > 1 else h
     x0, x1 = min(r[0] for r in rows), max(r[2] for r in rows)
     below = [[x0, rows[-1][1] + j * pitch, x1, rows[-1][1] + j * pitch + h] for j in range(1, k + 1)]
-    if below[-1][3] <= H - OVERLAY_PAD:
+    if below[-1][3] <= H - EDGE_PAD:
         return rows + below
     return [[x0, rows[0][1] - j * pitch, x1, rows[0][1] - j * pitch + h] for j in range(k, 0, -1)] + rows
 
@@ -143,7 +164,7 @@ def axes_in_screen(rows: list[list[float]], text_w: list[float], align: str, com
     axes = anchor_axis(rows, align, common)
     spans = [text_span(a, w, align) for a, w in zip(axes, text_w)]
     lo, hi = min(s for s, _ in spans), max(z for _, z in spans)
-    pad = OVERLAY_PAD
+    pad = EDGE_PAD
     shift = pad - lo if lo < pad else (W - pad) - hi if hi > W - pad else 0
     return [a + shift for a in axes]
 

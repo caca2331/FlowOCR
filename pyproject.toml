@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowocr"
-version = "0.1.0"
+version = "0.2.0"
 description = "从视频里抽全部屏幕文字、带起止时间、按区域聚类，导出 SRT / ASS"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -80,6 +80,7 @@ flowocr-render = "flowocr.output.render:main"
 flowocr-typeset = "flowocr.typeset.__main__:main"     # 阶段 4：字幕稿 -> 最终叠加 ASS
 flowocr-paths = "flowocr.paths:main"
 flowocr-models = "flowocr.models:main"      # 取官方 ONNX 模型（缺了管线也会自己取；离线机器先在联网处取好）
+flowocr-trt = "flowocr.trt:main"            # 装 / 查 / 删 TensorRT 后端的库和引擎缓存（可选后端，不进依赖）
 
 [dependency-groups]
 # 开发：守卫、评测、探针要的。不进发行包。
@@ -94,6 +95,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 # 实验性聚类 `--cluster learned` 的模型随代码走（slot_learned.MODEL_PATH）
 "flowocr.analyze" = ["models/*.json"]
+# TensorRT 后端启动自检的输入图（trt_engine.CHECK）
+"flowocr.extract" = ["trt_check.npz"]
 
 [tool.uv]
 package = true

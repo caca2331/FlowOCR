@@ -63,10 +63,16 @@ def by_arm(films: dict[str, dict]) -> dict[str, dict[str, dict]]:
 
 
 def row(r: dict) -> tuple[int, float, int, float]:
-    """(命中, 命中率, 疑似真漏, 真漏率)。**分母是"该上屏的对话类"，不是全剧本。**"""
+    """(命中, 命中率, 疑似真漏, 真漏率)。**分母是"该上屏的对话类"，不是全剧本。**
+    命中取**有 OCR 文本支撑的**（`dialogue_hit_text`，`script_align --fill-ocr`，2026-10-05 起）：匹配器按上下文填位的不算；
+    旧 JSON 没有这个字段就退回 `dialogue_hit`（`hit_of`）。"""
     dial = r["dialogue_entries"]
-    return r["dialogue_hit"], r["dialogue_hit"] / dial, r["gap_short_entries"], \
+    return hit_of(r), hit_of(r) / dial, r["gap_short_entries"], \
         r["gap_short_entries"] / dial
+
+
+def hit_of(r: dict) -> int:
+    return r.get("dialogue_hit_text", r["dialogue_hit"])
 
 
 def check_provenance(d: Path, films: dict) -> None:
@@ -153,6 +159,9 @@ def report_arm(d: Path, films: dict[str, dict]) -> None:
         db, do = s["base"]["dialogue_entries"], s["ours"]["dialogue_entries"]
         if db != do:
             evalkit.warn_pair_shift(db, do, "分母（对话类剧本条目）")
+        if ("dialogue_hit_text" in s["base"]) != ("dialogue_hit_text" in s["ours"]):
+            raise SystemExit(f"{film}：基线和我们这侧一边有 dialogue_hit_text、一边没有——两边命中口径不同，"
+                             f"重跑 head2head.sh（它给两侧都传 --fill-ocr）")
         hb, rb, mb, fb = row(s["base"])
         ho, ro, mo, fo = row(s["ours"])
         deltas_hit.append((ro - rb) * 100)

@@ -20,7 +20,7 @@
 提取侧的名字这里 re-export，老调用方的 `rb.make_job` / `rb.measure` 不变。
 
 2 fps 采样意味着边界天然有 ±0.25 s 的量化误差，而真正缺的信息只在**每条 run 首尾那一段**里：
-单向顺序解码一遍视频（seek 比顺序读贵 34 倍，boundary-refinement 报告），窗内的帧 retrieve、窗外只 grab。
+单向顺序解码一遍视频（局部 seek 比顺序读贵：1080p60 上 HEVC 约 35 倍、VP9 约 64 倍，随编码和 GOP 变，boundary-refinement 报告），窗内的帧 retrieve、窗外只 grab。
 
 obs 里没有在线证据（旧 obs、`--no-refine-fused`、非默认的解码器 / 复用设置）时，建轨停在采样级并提示；
 要帧级时刻就用默认设置重跑阶段 1（`run_ocr2` 默认在线量证据）。
@@ -112,8 +112,13 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
                         j.setdefault("ev_on", []).append((t, ov, ev["on"]))
             off = ev.get("off")
             # 被回补作废的结尾证据（`salvage_stale_end`）：回补改写的是那一段的**文本**，结尾窗量的是框里像素什么时候变、
-            # 模板是末次观测那一帧——按"末次观测时刻 + 框"认领到 run 上（下面 by_last + overlap_match），这两样回补不改，证据仍然量的是它
-            salvage = bool(salvage_stale_end and off and off.get("stale") and not off.get("short"))
+            # 模板是末次观测那一帧——按"末次观测时刻 + 框"认领到 run 上（下面 by_last + overlap_match），这两样回补不改，证据仍然量的是它。
+            # **只救回挂着它的那一行仍是同一句的**（证据量的文本和行上最终的文本过 run 续接的门 `bt.SIM_THR`）：换句那条路
+            # （`edge_refine._batch` 里 `_end(key, prev[0], …)`）上回补若把这一行也改成了下一句，模板帧上已经是下一句，
+            # 量出来的是下一句什么时候消失，恰有一条框重叠的 run 在这一行结束时会拿到错的结尾（09-26 审计）。
+            # 不要求逐字相同：回补常把同一句重读出一个形近字（yuka-f1 1679.5 s `桜羽エマ` → `桜羽工マ`），那条证据是对的
+            salvage = bool(salvage_stale_end and off and off.get("stale") and not off.get("short")
+                           and bt.text_sim(off.get("text", ""), o["text"]) >= bt.SIM_THR)
             if off is not None and (edge_refine.usable(off) or salvage):
                 n_off += 1
                 n_salvage += salvage

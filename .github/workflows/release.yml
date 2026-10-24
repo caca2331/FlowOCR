@@ -1,7 +1,7 @@
 # 发版：手动派发，只有一个输入 target。做法与先后在维护者的 release skill 里；这里只说 workflow 自己保证什么。
-#   dry-run   gh workflow run release.yml --ref main -f target=dry-run       构建 + 全部验证，什么都不发
-#   testpypi  gh workflow run release.yml --ref main -f target=testpypi      版本改成 <版本>.dev<run_number> 传 TestPyPI，再从那里装回来跑冒烟
-#   release   gh workflow run release.yml --ref v<版本> -f target=release    GitHub Release 在前、PyPI 最后，传完从 PyPI 装回来跑冒烟
+#   dry-run   gh workflow run release.yml --repo caca2331/FlowOCR --ref main -f target=dry-run       构建 + 全部验证，什么都不发
+#   testpypi  gh workflow run release.yml --repo caca2331/FlowOCR --ref main -f target=testpypi      版本改成 <版本>.dev<run_number> 传 TestPyPI，再从那里装回来跑冒烟
+#   release   gh workflow run release.yml --repo caca2331/FlowOCR --ref v<版本> -f target=release    GitHub Release 在前、PyPI 最后，传完从 PyPI 装回来跑冒烟
 # workflow 定义和检出的代码都取自 --ref 指的那个提交。PyPI 的版本号传过一次就永久占用，所以 PyPI 永远是最后一个 job，
 # 之前的核对（版本三处一致、这个提交的 CI 是绿的、PyPI 上还没有这个版本）都过了才走到它。
 # 输入一律经 env: 传进脚本，不在 run: 里直接写 ${{ }}。多条命令的 pwsh 步骤开头设 $PSNativeCommandUseErrorActionPreference，
@@ -264,7 +264,9 @@ jobs:
           python3 - <<'EOF'
           import hashlib, json, os, pathlib, sys, time, urllib.request
           ver = os.environ["VERSION"]
-          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          # 上传工具会生成 .publish.attestation；只核对 build 已验证过的两份发行包。
+          names = (f"flowocr-{ver}-py3-none-any.whl", f"flowocr-{ver}.tar.gz")
+          local = {n: hashlib.sha256(pathlib.Path("dist", n).read_bytes()).hexdigest() for n in names}
           for _ in range(20):
               try:
                   urls = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/flowocr/{ver}/json"))["urls"]

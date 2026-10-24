@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# project-conventions tools, updated 2026-09-25. Copies in a project's dev_tools/ compare against this date.
+# project-conventions tools, updated 2026-10-13. Copies in a project's dev_tools/ compare against this date.
 """Publish the development branch's tree to the public branch, minus private paths.
 
 Model (see git.md, "发布脚本"):
@@ -49,7 +49,7 @@ DEFAULT_PRIVATE = [
     "docs/archive/",
     "docs/reports/",
     "explore/",
-    "CLAUDE.local.md",
+    "AGENTS.local.md",
     ".claude/",
     ".agents/",
     ".workbuddy/",
@@ -187,7 +187,7 @@ def build_tree(git: Git, cfg: Config, source: str) -> str:
 
 # The one private file the conventions tell the public AGENTS.md to name
 # (agent-files.md, "私有补充"): naming it is by design, not a dangling pointer.
-NAMED_BY_CONVENTION = {"CLAUDE.local.md"}
+NAMED_BY_CONVENTION = {"AGENTS.local.md"}
 
 # Characters that end a path mention. Fullwidth punctuation included: otherwise
 # `docs/x.md）。…` swallows the Chinese that follows into the path.
@@ -370,16 +370,57 @@ def _sync_with_remote(git: Git, cfg: Config, remote: str) -> None:
         raise PublishError(f"local {cfg.target} and {remote}/{cfg.target} have diverged")
 
 
-def _wait_for_ci(git: Git, cfg: Config, sha: str) -> None:
+def normalize_url(url: str) -> str:
+    """One spelling per GitHub repository: https, no `.git`, no trailing slash.
+
+    The hook's `norm` does the same in shell; keep them in step. Other URLs (a
+    local bare path in tests) only lose the trailing slash and `.git`.
+    """
+    u = url.strip().rstrip("/").removesuffix(".git")
+    for prefix in ("git@github.com:", "ssh://git@github.com/"):
+        if u.startswith(prefix):
+            return "https://github.com/" + u[len(prefix):]
+    return u
+
+
+def github_repo(url: str) -> str:
+    """`owner/repo` for gh's --repo. Without it gh picks a remote by itself --
+    with a private `origin` beside the public remote, the private one."""
+    u = normalize_url(url)
+    prefix = "https://github.com/"
+    if u.startswith(prefix) and u[len(prefix):].count("/") == 1:
+        return u[len(prefix):]
+    raise PublishError(f"{url} is not a GitHub repository URL; gh cannot read its CI "
+                       "(set ci_check in .publish.toml instead)")
+
+
+def check_public_url(git: Git, remote: str) -> str:
+    """The remote's URL, refused unless it is the one install-hook recorded.
+
+    `git remote rename` leaves publish.remote naming a remote that may now be
+    another repository; the recorded URL is what notices.
+    """
+    recorded = git.run("config", "--get", "publish.url", check=False).strip()
+    if not recorded:
+        raise PublishError("no publish.url recorded; rerun: publish.py install-hook --remote <public remote>")
+    url = git.run("remote", "get-url", remote, check=False).strip()
+    if normalize_url(url) != normalize_url(recorded):
+        raise PublishError(f"remote {remote} points at {url or '(nothing)'}, but install-hook recorded "
+                           f"{recorded}; rerun install-hook with the public remote's name")
+    return url
+
+
+def _wait_for_ci(git: Git, cfg: Config, sha: str, url: str) -> None:
     if cfg.ci_check:
         cmd = [part.replace("{sha}", sha) for part in cfg.ci_check]
         if subprocess.run(cmd, cwd=git.cwd).returncode != 0:
             raise PublishError(f"CI check failed for {sha[:12]}; {cfg.target} not moved")
         return
+    repo = github_repo(url)
     deadline = time.monotonic() + cfg.ci_timeout_minutes * 60
     while time.monotonic() < deadline:
         out = subprocess.run(
-            ["gh", "run", "list", "--commit", sha, "--json", "name,status,conclusion"],
+            ["gh", "run", "list", "--repo", repo, "--commit", sha, "--json", "name,status,conclusion"],
             cwd=git.cwd, capture_output=True, text=True)
         runs = json.loads(out.stdout or "[]") if out.returncode == 0 else []
         by_name = {r["name"]: r for r in runs}
@@ -396,6 +437,9 @@ def publish(git: Git, cfg: Config, message: str, remote: str | None = None,
             push: bool = False, warn_only: bool = False, dry_run: bool = False) -> str | None:
     if push and not remote:
         raise PublishError("--push needs a public remote: git config publish.remote <name>")
+    url = check_public_url(git, remote) if push else ""
+    if push and cfg.ci_gate and not cfg.ci_check:
+        github_repo(url)  # refuse before the gate branch is pushed, not after
     if push:
         _sync_with_remote(git, cfg, remote)
     source = git.rev(cfg.source)
@@ -440,7 +484,7 @@ def publish(git: Git, cfg: Config, message: str, remote: str | None = None,
         print("public tree unchanged; nothing new to commit")
 
     if push:
-        _push(git, cfg, remote, commit)
+        _push(git, cfg, remote, commit, url)
     if created:
         if not git.ok("update-ref", f"refs/heads/{cfg.target}", commit, target or ZERO):
             raise PublishError(f"{cfg.target} moved during publish; rerun")
@@ -450,7 +494,7 @@ def publish(git: Git, cfg: Config, message: str, remote: str | None = None,
     return commit
 
 
-def _push(git: Git, cfg: Config, remote: str, commit: str) -> None:
+def _push(git: Git, cfg: Config, remote: str, commit: str, url: str) -> None:
     """Bring the public remote's target to `commit`, through the CI gate if configured.
 
     Decided on its own, not by whether this run made a commit: a publish made
@@ -466,7 +510,7 @@ def _push(git: Git, cfg: Config, remote: str, commit: str) -> None:
         raise PublishError(f"refusing to push commits not made by publish.py: {', '.join(stray)}")
     if cfg.ci_gate:
         git.run("push", "--quiet", remote, f"+{commit}:refs/heads/{cfg.ci_gate}")
-        _wait_for_ci(git, cfg, commit)
+        _wait_for_ci(git, cfg, commit, url)
     git.run("push", "--quiet", remote, f"{commit}:refs/heads/{cfg.target}")
     if cfg.ci_gate:
         git.run("push", "--quiet", remote, f":refs/heads/{cfg.ci_gate}", check=False)
@@ -474,22 +518,41 @@ def _push(git: Git, cfg: Config, remote: str, commit: str) -> None:
     print(f"pushed {commit[:12]} to {remote}/{cfg.target}")
 
 
+HOOK_MARKER = "# Installed by publish.py."
 HOOK = """#!/bin/sh
 # Installed by publish.py. On a public remote, only the published branch, the CI
 # gate branch and tags on published commits may be pushed. Uses nothing but git
 # and shell builtins, and refuses the push whenever a check cannot run.
+# The public remote is known by the name in publish.remote, by that remote's
+# URL, or by the URL install-hook recorded in publish.url -- the last survives
+# a `git remote rename`.
 remote_name="$1"
 remote_url="$2"
+norm() {  # keep in step with normalize_url() in publish.py
+  u=${1%/}; u=${u%.git}
+  case "$u" in
+    git@github.com:*) u="https://github.com/${u#git@github.com:}" ;;
+    ssh://git@github.com/*) u="https://github.com/${u#ssh://git@github.com/}" ;;
+  esac
+  printf '%s' "$u"
+}
 remotes=$(git config --get-all publish.remote)
 rc=$?
 if [ $rc -gt 1 ]; then
   echo "pre-push: cannot read publish.remote (git config exit $rc); refusing" >&2; exit 1
 fi
+recorded=$(git config --get publish.url)
+rc=$?
+if [ $rc -gt 1 ]; then
+  echo "pre-push: cannot read publish.url (git config exit $rc); refusing" >&2; exit 1
+fi
+pushing=$(norm "$remote_url")
 public=0
+if [ -n "$recorded" ] && [ "$(norm "$recorded")" = "$pushing" ]; then public=1; fi
 for r in $remotes; do
   if [ "$r" = "$remote_name" ]; then public=1; fi
   url=$(git remote get-url "$r" 2>/dev/null) || url=
-  if [ -n "$url" ] && [ "$url" = "$remote_url" ]; then public=1; fi
+  if [ -n "$url" ] && [ "$(norm "$url")" = "$pushing" ]; then public=1; fi
 done
 if [ $public -eq 0 ]; then exit 0; fi
 target=$(git config --get publish.target) || target=main
@@ -524,16 +587,28 @@ def hooks_dir(git: Git) -> Path:
 
 
 def install_hook(git: Git, cfg: Config, remote: str) -> Path:
+    url = git.run("remote", "get-url", remote, check=False).strip()
+    if not url:
+        raise PublishError(f"no remote named {remote}")
     path = hooks_dir(git) / "pre-push"
-    if path.exists() and path.read_text(encoding="utf-8", errors="replace") != HOOK:
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else None
+    # An older version of this hook (the marker sits under the shebang) is ours to replace.
+    if existing is not None and not any(line.startswith(HOOK_MARKER) for line in existing.splitlines()[:3]):
         raise PublishError(
             f"{path} already exists and is not this script's hook; not overwriting it. "
             "Both hooks read the pushed refs from stdin, so combine them by hand "
             "(save stdin to a file, feed it to each) or remove the existing one first.")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if existing is not None and existing != HOOK:
+        # Kept, not discarded: a hand-merged hook that starts with our header
+        # would otherwise lose the project's own checks without a word.
+        backup = path.with_name("pre-push.bak")
+        backup.write_text(existing, encoding="utf-8", newline="\n")
+        print(f"replaced an older pre-push hook; the previous one is at {backup}")
     path.write_text(HOOK, encoding="utf-8", newline="\n")
     path.chmod(0o755)
     git.run("config", "publish.remote", remote)
+    git.run("config", "publish.url", url)
     git.run("config", "publish.target", cfg.target)
     if cfg.ci_gate:
         git.run("config", "publish.gate", cfg.ci_gate)

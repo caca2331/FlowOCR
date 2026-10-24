@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from flowocr import provenance  # noqa: E402
 from flowocr.analyze import build_tracks as bt  # noqa: E402
 
 PTS_RE = re.compile(r"n:\s*(\d+).*?pts_time:\s*(-?[\d.]+)")
@@ -160,7 +161,7 @@ def main() -> int:
     open_: dict[int, dict[int, list]] = {}      # f1 -> {j: [首帧裁剪, 上一帧裁剪, step_mad, step_ncc]}
     seen_frames = 0
     last = max(by_end) if by_end else -1
-    for fid, frame, (W, H) in decode(meta["video"], meta.get("start_sec") or 0.0, meta.get("end_sec") or 0.0,
+    for fid, frame, (W, H) in decode(str(provenance.local(meta["video"])), meta.get("start_sec") or 0.0, meta.get("end_sec") or 0.0,
                                      scale, rate):
         seen_frames += 1
         sx, sy = frame.shape[1] / W, frame.shape[0] / H

@@ -16,7 +16,7 @@
 批回来校验，罕见回滚）。A 这一列顺带把**真实的翻转次数**数出来（同一条链前后两次 `digit` 不同），
 不再拿 0.5% 那个估计值。
 
-usage: python dev_tools/rec_window_replay.py <trace.jsonl…> [--windows 4,8,16] [--ratios 0,0.05]
+usage: python dev_tools/rec_window_replay.py <trace.jsonl…> [--windows 4,8,16]
 """
 from __future__ import annotations
 
@@ -37,11 +37,10 @@ from flowocr.extract import recpack  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("traces", nargs="+")
 ap.add_argument("--windows", default="4,8,16")
-ap.add_argument("--ratios", default="0,0.05")
 ap.add_argument("--cap", type=int, default=32)
 a = ap.parse_args()
 
-# 实测的宽 × 批代价曲面（Paddle，ms/裁剪；`rec_batch_curve.py` / `rec_near_curve.py`）
+# 实测的宽 × 批代价曲面（Paddle，ms/裁剪；`rec_batch_curve.py`）
 SURF = {320: {1: 8.702, 2: 5.397, 4: 3.430, 8: 2.502, 16: 2.351, 32: 2.132},
         400: {1: 9.477, 2: 6.157, 4: 4.054, 8: 2.978, 16: 2.679, 32: 2.658},
         480: {1: 9.367, 2: 6.031, 4: 4.095, 8: 3.211, 16: 3.076, 32: 3.064},
@@ -74,15 +73,15 @@ def load(p: str):
 
 
 class Batches:
-    """结算一次 = 把排队的裁剪按（近）宽分桶送一批批。"""
+    """结算一次 = 把排队的裁剪按宽分桶送一批批。"""
 
-    def __init__(self, ratio: float) -> None:
-        self.ratio, self.ms, self.crops, self.buckets, self.settles = ratio, 0.0, 0, 0, 0
+    def __init__(self) -> None:
+        self.ms, self.crops, self.buckets, self.settles = 0.0, 0, 0, 0
 
     def settle(self, q: list[int]) -> None:
         if not q:
             return
-        for g in recpack.group_near(q, self.ratio, a.cap):
+        for g in recpack.group_width(q, a.cap):
             w = max(q[i] for i in g)
             self.ms += len(g) * cost(w, len(g))
             self.crops += len(g)
@@ -94,7 +93,7 @@ class Batches:
         return self.ms / max(1, self.crops)
 
 
-print(f"{'段':<16}{'窗口':>5}{'策略':>6}{'近宽':>6}{'结算':>6}{'平均窗长':>9}{'平均批':>8}"
+print(f"{'段':<16}{'窗口':>5}{'策略':>6}{'结算':>6}{'平均窗长':>9}{'平均批':>8}"
       f"{'等效 ms/裁剪':>13}{'对逐帧':>9}{'屏障/回滚':>11}")
 for tp in a.traces:
     meta, frames = load(tp)
@@ -102,7 +101,7 @@ for tp in a.traces:
     lo = meta.get("reuse_corr") or 0.8
     hi = meta.get("reuse_corr_digit") or 0.98
     # 基准：今天的逐帧分桶（回补那几次也是逐次单框，所以各算一次）
-    base = Batches(0.0)
+    base = Batches()
     for _s, rows in frames:
         q = [r["tw"] for r in rows if r["read"] and r["gate"] != "recover"]
         base.settle(q)
@@ -111,7 +110,7 @@ for tp in a.traces:
                 for _ in range(r.get("n_reads", 1)):
                     base.settle([r["tw"]])
     b_eq = base.eq()
-    print(f"{name:<16}{1:>5}{'逐帧':>6}{'0%':>6}{base.settles:>6}{1.0:>9.2f}"
+    print(f"{name:<16}{1:>5}{'逐帧':>6}{base.settles:>6}{1.0:>9.2f}"
           f"{base.crops / max(1, base.buckets):>8.2f}{b_eq:>13.2f}{'—':>9}{'—':>11}")
     # 真实的数字性翻转次数（A 那条路要回滚的就是这些）
     last_digit: dict[int, bool] = {}
@@ -125,44 +124,43 @@ for tp in a.traces:
                 flips += 1
             last_digit[c] = r["digit"]
     for W in [int(x) for x in a.windows.split(",")]:
-        for ratio in [float(x) for x in a.ratios.split(",")]:
-            for mode in ("A'", "A", "B"):
-                bt = Batches(ratio)
-                q: list[int] = []
-                pending: set = set()      # 这一窗里被读过、文本还没回来的链 uid
-                wlen = wsum = barrier = extra = 0
-                for _s, rows in frames:
-                    for r in rows:
-                        c = r.get("chain")
-                        # **判决依赖不依赖待定的文本**：只有相关系数落在两门之间才依赖（见文件头）
-                        amb = (c in pending and r.get("corr") is not None and lo <= r["corr"] < hi)
-                        if mode == "A'" and amb:
-                            barrier += 1
-                            bt.settle(q)
-                            pending.clear()
-                            wsum += wlen
-                            wlen = 0
-                        read = r["read"]
-                        if mode == "B" and amb and not read:
-                            # **B：文本待定时一律按严格门（0.98）判**——判决不再依赖未知文本，
-                            # 于是不用屏障也不用回滚；代价是这个框改成真读（**产物会变，方向是"更新"**）
-                            read, extra = True, extra + 1
-                        if read:
-                            for _ in range(r.get("n_reads", 1) if r["gate"] == "recover" else 1):
-                                q.append(r["tw"])
-                            if c is not None and r["gate"] != "recover":
-                                pending.add(c)
-                    wlen += 1
-                    if wlen >= W:
+        for mode in ("A'", "A", "B"):
+            bt = Batches()
+            q: list[int] = []
+            pending: set = set()      # 这一窗里被读过、文本还没回来的链 uid
+            wlen = wsum = barrier = extra = 0
+            for _s, rows in frames:
+                for r in rows:
+                    c = r.get("chain")
+                    # **判决依赖不依赖待定的文本**：只有相关系数落在两门之间才依赖（见文件头）
+                    amb = (c in pending and r.get("corr") is not None and lo <= r["corr"] < hi)
+                    if mode == "A'" and amb:
+                        barrier += 1
                         bt.settle(q)
                         pending.clear()
                         wsum += wlen
                         wlen = 0
-                bt.settle(q)
-                note = (f"屏障 {barrier}" if mode == "A'" else
-                        f"回滚 ≤{flips}" if mode == "A" else f"多读 {extra}")
-                print(f"{name:<16}{W:>5}{mode:>6}{f'{ratio:.0%}':>6}{bt.settles:>6}"
-                      f"{wsum / max(1, bt.settles):>9.2f}{bt.crops / max(1, bt.buckets):>8.2f}"
-                      f"{bt.eq():>13.2f}{f'{bt.eq() / b_eq - 1:+.1%}':>9}{note:>11}")
+                    read = r["read"]
+                    if mode == "B" and amb and not read:
+                        # **B：文本待定时一律按严格门（0.98）判**——判决不再依赖未知文本，
+                        # 于是不用屏障也不用回滚；代价是这个框改成真读（**产物会变，方向是"更新"**）
+                        read, extra = True, extra + 1
+                    if read:
+                        for _ in range(r.get("n_reads", 1) if r["gate"] == "recover" else 1):
+                            q.append(r["tw"])
+                        if c is not None and r["gate"] != "recover":
+                            pending.add(c)
+                wlen += 1
+                if wlen >= W:
+                    bt.settle(q)
+                    pending.clear()
+                    wsum += wlen
+                    wlen = 0
+            bt.settle(q)
+            note = (f"屏障 {barrier}" if mode == "A'" else
+                    f"回滚 ≤{flips}" if mode == "A" else f"多读 {extra}")
+            print(f"{name:<16}{W:>5}{mode:>6}{bt.settles:>6}"
+                  f"{wsum / max(1, bt.settles):>9.2f}{bt.crops / max(1, bt.buckets):>8.2f}"
+                  f"{bt.eq():>13.2f}{f'{bt.eq() / b_eq - 1:+.1%}':>9}{note:>11}")
 print("\n和 `rec_window_sim.py`（拿 obs 近似的那份）比：链身份用 uid、屏障只在「真的依赖待定文本」时才竖、"
       "回补的读也进批。**这一份才是可引用的**。")

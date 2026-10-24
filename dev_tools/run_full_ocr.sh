@@ -47,7 +47,7 @@ for n in $FILMS; do
   out="out/yuka/i${n}-full${ARM}.jsonl"
   # 这一趟要跑的 run_ocr2 参数——**复用判据和真正的调用用同一份**。
   # 判据按解析后的生效值比（flowocr.extract.ocr_args）：换了旋钮、或者默认值翻了，都会重跑。
-  args=("$ARCHIVE/yuka/input${n}.mp4" --out "$out" $OCR_ARGS --progress-every 2000)
+  args=("$ARCHIVE/yuka/input${n}.mp4" --out "$out" --quality high $OCR_ARGS --progress-every 2000)   # 开发一律 high，臂的参数在后面才盖得住
   # ⚠ 这里必须是 `$CODE`：cwd 已经切到**产物根**，写相对路径会去跑主 checkout 那份
   # ——那份可能还没有 CLI（`python -m flowocr.extract.ocr_complete x` 直接成功退出），
   # 于是**没跑完、甚至不存在的产物都会被当成"已完成"跳过**。

@@ -132,7 +132,7 @@ print(s['video'], s['start_s'], s['end_s'])" "$id" "$MANIFEST" | tr -d '\r')
   # 只看文件在不在会把换了窗口或换了旋钮的旧产物静默拿来用（audit-4 C7 的同一形状）。
   # 判据只有一份，在共享层（audit-4 C8）；窗口和旋钮都在**解析后的生效值**里比
   if why=$("$PY" -m flowocr.extract.ocr_complete "$OBS" \
-             --argv "$VIDEO" --out "$OBS" --start "$S" --end "$E" $OCR_ARGS \
+             --argv "$VIDEO" --out "$OBS" --start "$S" --end "$E" --quality high $OCR_ARGS \
                     --progress-every 2000); then
     echo "[skip] $id$ARM 的观测已在（同一窗口、同一组生效参数、已跑完）"
     # 可复用但有话说（**代码指纹不同**：旋钮一样、代码变了）——别把它吞掉，
@@ -142,7 +142,7 @@ print(s['video'], s['start_s'], s['end_s'])" "$id" "$MANIFEST" | tr -d '\r')
     [ -s "$OBS" ] && echo "[redo] $OBS 在，但不能复用：$why"
     echo "=== $id$ARM OCR $(date '+%H:%M:%S') ==="
     "$PY" -m flowocr.extract.run_ocr2 \
-      "$VIDEO" --out "$OBS" --start "$S" --end "$E" $OCR_ARGS --progress-every 2000 \
+      "$VIDEO" --out "$OBS" --start "$S" --end "$E" --quality high $OCR_ARGS --progress-every 2000 \
       2>&1 | grep -v --line-buffered "Warning\|warn\|INFO\|ccache\|Model files\|WARNING"
     [ "${PIPESTATUS[0]}" = 0 ] || { echo "**[fail] $id$ARM OCR**"; FAILED=$((FAILED+1)); continue; }
   fi

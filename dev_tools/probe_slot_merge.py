@@ -117,7 +117,7 @@ def main() -> int:
     evalkit.require_nonzero(len(obs), "满足置信度的观测")
     W, H = meta.get("width"), meta.get("height")
     if not W:
-        W, H = bt.probe_size(meta["video"])
+        raise SystemExit(bt.OBS_NO_SIZE)
     frame_us = int(round(1e6 / meta["sample_fps"]))
 
     runs = bt.build_runs(obs, frame_us, a.iou, a.sim, a.gap_frames)

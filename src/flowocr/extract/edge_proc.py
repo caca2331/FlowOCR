@@ -73,6 +73,16 @@ def serve() -> int:
                                 width=edge.Ws, height=edge.Hs, sink=edge.ring, pts_q=pts_q,
                                 src_fps=cfg["src_fps"]).start()
     edge.on_done = lambda seq: send(("done", seq))
+    progress_last = [time.monotonic()]
+
+    def progress():
+        # 只由实际完成的工作触发，不用存活心跳掩盖死锁。每秒最多一条。
+        now = time.monotonic()
+        if now - progress_last[0] >= 1.0:
+            progress_last[0] = now
+            send(("progress",))
+
+    edge.on_progress = progress
     edge.on_error = lambda exc: send(("err", "".join(traceback.format_exception(exc))))   # 带 traceback：回抠进程里的错管线进程那边要看得见在哪
     # **pts 的第二个入口**（`--decode-shards`）：ffmpeg 跑在解码进程里时，stderr 也在那边读——让它直接连过来送 pts，
     # 不绕管线进程转一道。消息同主连接的 "p" / "pe"
@@ -151,7 +161,7 @@ class EdgeProxy:
 
     STALL_SEC = 60.0
     """回抠进程多久没前进算卡住：**看进度、不看总等待**，和解码分片（`decode_shards` 的 `STALL_SEC`）同一个判据。
-    它落后管线很多批时一直在做（CPU 上、或收尾时积压一大截），等得再久也不算卡；做完的批号这么久不动才算。
+    它落后管线很多批时一直在做（CPU 上、或收尾时积压一大截），等得再久也不算卡；批号和窗内工作进度都这么久不动才算。
     原来是"这一批总共等了 300 s"，积压够长的正常收尾也会被判卡住，真卡住又要白等 5 分钟。"""
 
     def __init__(self, *, edge_kwargs: dict, start_idx: int, end_idx: int, src_fps: float, width: int, height: int,
@@ -179,6 +189,7 @@ class EdgeProxy:
         self.stall_sec = stall_sec
         self.rows: dict[int, tuple[dict, int]] = {}     # 行号 -> (行, 最近一次发出去时的批号)
         self.done_seq = -1
+        self.work_progress = 0
         self.cv = threading.Condition()
         self.error: str | None = None
         self.stats: dict | None = None
@@ -239,6 +250,10 @@ class EdgeProxy:
                     with self.cv:
                         self.done_seq = msg[1]
                         self.cv.notify_all()
+                elif tag == "progress":
+                    with self.cv:
+                        self.work_progress += 1
+                        self.cv.notify_all()
                 elif tag == "err":
                     self.error = f"回抠进程出错：{msg[1]}"
                 elif tag == "fin":
@@ -266,16 +281,26 @@ class EdgeProxy:
         return seq + MAX_OPEN_SAMPLES + 1
 
     def _wait(self, done, what: str) -> None:
-        """等到 `done()`；做完的批号 `stall_sec` 秒没动就记成出错（见 `STALL_SEC`）。出错 / 断开时 `_recv` 会叫醒这里。"""
-        last, t_last = self.done_seq, time.perf_counter()
+        """等到 `done()`；批号和窗内工作都 `stall_sec` 秒没推进才出错。出错 / 断开时 `_recv` 会叫醒这里。"""
+        def position():
+            return self.done_seq, self.work_progress
+        last, t_last = position(), time.perf_counter()
         with self.cv:
             while not done() and self.error is None:
                 self.cv.wait(0.5)
+                # 完成/失败可能正是这次唤醒的原因；先认领结果，再判超时。
+                # 特别是 fin 不改 done_seq，不能在成功到达后覆盖成超时错误。
+                if done() or self.error is not None:
+                    break
                 now = time.perf_counter()
-                if self.done_seq != last:
-                    last, t_last = self.done_seq, now
+                if position() != last:
+                    last, t_last = position(), now
                 elif now - t_last > self.stall_sec:
                     self.error = f"{what}：回抠进程 {self.stall_sec:.0f} s 没前进（停在第 {self.done_seq} 批）"
+
+    def ready(self, seq: int) -> bool:
+        """同 `EdgeRefiner.ready`。"""
+        return self.done_seq >= seq or self.stats is not None or self.error is not None
 
     def wait_batch(self, seq: int) -> None:
         t0 = time.perf_counter()
@@ -285,7 +310,7 @@ class EdgeProxy:
         self._check()
 
     FINISH_SEC = 300.0
-    """批号追到头之后回抠进程还要算结尾窗、汇总统计——这段**没有进度信号**，按 `STALL_SEC` 判会误伤（CPU 上尤其），给固定宽限（原来的 300 s）。"""
+    """批号追到头之后还要算结尾窗、汇总统计；汇总不保证持续发进度，仍给固定收尾宽限。"""
 
     def finish(self, last_idx: int) -> dict:
         self._send(("f", last_idx))

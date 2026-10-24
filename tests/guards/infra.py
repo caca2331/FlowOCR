@@ -80,6 +80,7 @@ def t_tools_exit_nonzero() -> None:
             check(f"{tool} 空参照非零退出", r.returncode != 0, f"退出码 {r.returncode}")
 
 
+@high_quality_default
 def t_added_knobs() -> None:
     """**新加的空操作旋钮不该让现成 obs 全部重建**（`ocr_args.config_differs` / `ADDED_NOOP`）。
 
@@ -234,10 +235,13 @@ def t_added_knobs() -> None:
     check("真开了新旋钮 -> 报差异",
           ocr_args.config_differs(_old_ort, ocr_args.config_of(base + back + ["--pregate"])) == ["pregate"])
     check("新旋钮给了非默认值 -> 报差异",
-          ocr_args.config_differs(_old_ort, ocr_args.config_of(base + back + ["--rec-near", "0.05"]))
-          == ["rec_near"])
+          ocr_args.config_differs(_old_ort, ocr_args.config_of(base + back + ["--ort-batch-ladder", "1,4,16"]))
+          == ["ort_batch_ladder"])
     check("老键值不同 -> 照样报差异",
-          ocr_args.config_differs({**want, "det_batch": 8}, want) == ["det_batch"])
+          ocr_args.config_differs({**want, "rec_bucket": 8}, want) == ["rec_bucket"])
+    check("det_batch 是噪音级（owner 2026-10-04）：4 / auto / 1 / 2 之间都不报差异，默认翻成 auto 不重建",
+          all(ocr_args.config_differs({**want, "det_batch": a}, {**want, "det_batch": b}) == []
+              for a, b in ((4, "auto"), (1, 4), (2, "auto"))))
     # 反面：产物**有**这个键但值不同（不是"缺键"），不许被兜底放过
     got = {**want, "rec_engine": "paddle"}
     check("产物里有键但值不同 -> 不许被兜底放过",
@@ -342,8 +346,13 @@ def t_provenance() -> None:
             m_ = importlib.import_module(mod)
             local = local_files(Path(m_.__file__).resolve())
             lazy = lazy_files(Path(m_.__file__).resolve())
-            # 懒 import 的模块自己顶格 import 的本地模块也算（slot_lines -> slot_modes，2026-09-26 审计补进表）
-            lazy |= {f for lf in list(lazy) if (ROOT / lf).exists() for f in local_files(ROOT / lf)}
+            # 懒 import 的模块自己顶格 import 的本地模块也算，**一路传递下去**（slot_learned -> slot_lines -> slot_modes；
+            # 2026-09-26 审计补进表，10-05 build_tracks 改成只经 slot_learned.cluster_groups 进聚类路径后要传递两层）
+            while True:
+                more = {f for lf in lazy if (ROOT / lf).exists() for f in local_files(ROOT / lf)} - lazy
+                if not more:
+                    break
+                lazy |= more
             check(f"{mod.rsplit('.', 1)[1]} 的指纹文件表 = 它自己 + 它 import 的本地模块（仓库相对路径；多出来的只许是函数里懒 import 的，及其顶格 import）",
                   local <= set(m_.CODE_FP_FILES) and set(m_.CODE_FP_FILES) - local <= lazy,
                   f"import 出来的是 {sorted(local)}，懒 import {sorted(lazy)}，表里是 {sorted(m_.CODE_FP_FILES)}")
@@ -453,14 +462,15 @@ def t_pipeline_wiring() -> None:
             called.add(f.id if isinstance(f, ast.Name) else getattr(f, "attr", ""))
     for name, why in (("commit_stage1", "窗口模式的 stage1"),
                       ("commit_stage2", "窗口结算"),
-                      ("drain", "异步路径的固定滞后结算"),
+                      ("drain", "异步路径领先上限的阻塞结算与收尾"),
+                      ("settle_ready", "异步路径每帧判决前的回来就结算"),
                       ("settle_window", "同步窗口的结算"),
                       ("submit", "把裁剪交给后台消费者"),
                       ("new_ids", "请求号")):
         check(f"主循环里还调着 `{name}`（{why}）", name in called, sorted(called)[:0] or name)
     # 旋钮真的被读到（删掉分支时 args.rec_window 会一个引用都不剩）
     attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    for knob in ("rec_window", "rec_async", "rec_knee", "rec_near"):
+    for knob in ("rec_window", "rec_async", "rec_knee"):
         check(f"`args.{knob}` 在 run_ocr2 里真的被读到", knob in attrs, knob)
 
 
@@ -795,7 +805,7 @@ def t_portable_paths() -> None:
 
 def t_runtime_backend() -> None:
     """推理后端装对了没有（2026-10-02，drop-paddle 计划第 7 步）：装成包时 `[nvidia]` / `[cpu]` 的互斥进不了元数据，
-    `ffcheck.require_runtime` 起跑时查——一个都没有、两个都在都退出并说怎么修；非 Windows 只警告、照跑（owner 2026-10-02）。"""
+    `ffcheck.require_runtime` 起跑时查——一个都没有、两个都在都退出并说怎么修；非 Windows 只打一行说明、照跑（owner 2026-10-02）。"""
     print("推理后端检查")
     import contextlib
     import io
@@ -811,7 +821,9 @@ def t_runtime_backend() -> None:
             raise md.PackageNotFoundError(d)
         out = io.StringIO()
         with mock.patch.object(ffcheck.importlib.metadata, "version", version), \
-             mock.patch.object(ffcheck.sys, "platform", plat), contextlib.redirect_stdout(out):
+             mock.patch.object(ffcheck.sys, "platform", plat), contextlib.redirect_stdout(out), \
+             mock.patch.object(ffcheck.platform, "system", lambda: {"win32": "Windows", "linux": "Linux"}.get(plat, "Darwin")):
+            # platform.system 也要换：假的 sys.platform 下真去算，`platform` 会把错的系统信息缓存下来（onnxruntime 随后 import 时读到就挂）
             try:
                 ffcheck.require_runtime()
                 return "ok", out.getvalue()
@@ -823,9 +835,17 @@ def t_runtime_backend() -> None:
     gpu, _ = run(("onnxruntime-gpu",))
     cpu, _ = run(("onnxruntime",))
     linux, warn = run(("onnxruntime",), "linux")
+    mac, mwarn = run(("onnxruntime",), "darwin")
     check("没装 onnxruntime -> 退出并说选哪个 extra；两个都装 -> 退出并说只留一个；只装一个 -> 照跑",
           "flowocr[nvidia]" in none and "flowocr[cpu]" in none and "只留一个" in both and gpu == cpu == "ok", (none, both, gpu, cpu))
-    check("非 Windows：打一行警告、照跑（不报错）", linux == "ok" and "只在 Windows 上验证过" in warn, (linux, warn))
+    check("非 Windows：打一行说明、照跑（不报错）；Linux 说只在 WSL2 上验证过，别的系统说没验证过",
+          linux == mac == "ok" and "WSL2" in warn and "⚠" not in warn and "⚠" in mwarn and "没验证过" not in warn, (linux, warn, mac, mwarn))
+    lines = {"ffmpeg version 6.1.1-3ubuntu5 Copyright": True, "ffmpeg version n7.1.2-1-gabc Copyright": True,
+             "ffmpeg version 8.0.1-full_build-www.gyan.dev Copyright": False, "ffmpeg version n8.1.3-18-g46d899d7a0": False,
+             "ffmpeg version N-121234-g5a1b2c3 Copyright": False, "ffmpeg version 2025-10-01-git-0123abcd": False, "": False}
+    got = {ln: bool(ffcheck.version_warning(ln)) for ln in lines}
+    check("ffmpeg 低于 8 只警告（owner 2026-10-17）：6.1 / 7.x 警告；8.x、读不出版本号的快照构建不警告",
+          got == lines and "6.1.1-3ubuntu5" in ffcheck.version_warning("ffmpeg version 6.1.1-3ubuntu5 Copyright"), got)
 
 
 def t_models_offline_pack() -> None:
@@ -868,3 +888,223 @@ def t_models_offline_pack() -> None:
                   "sha256 对不上" in bad_sha and not (det.dir / "inference.yml").exists()
                   and "不认识的文件" in unknown and len(ok) == 1 and (td / "models" / "LICENSES" / "NOTICE.md").is_file(),
                   (bad_sha, unknown, ok))
+
+
+def t_ort_initializer_lifetime() -> None:
+    """共享显存路径上借出权重的 DLPack 元数据寿命（`ort_server._borrowed_float32_ortvalue`，78fe8b1 的修复）：
+    用例在 `tests/test_ort_initializer_lifetime.py`（真实 CPU ORT + CUDA 故障注入，不占 GPU、约 1 s），这里接进守卫，免得没人跑。"""
+    print("ORT 借出权重的寿命")
+    import io
+    import unittest
+    import test_ort_initializer_lifetime as lt
+    res = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(unittest.defaultTestLoader.loadTestsFromModule(lt))
+    check(f"DLPack 元数据：分配失败不建 capsule、Python 侧放手后 session 仍持有、失败只释放一次、解释器收尾前不释放、CUDA 部分失败只放未发布的（{res.testsRun} 例）",
+          res.wasSuccessful() and res.testsRun >= 5, [str(t) for t, _ in res.failures + res.errors])
+
+
+def t_trt_libs() -> None:
+    """TensorRT 后端的库（TRT 后端计划第 3 步，`flowocr.trt`）：按算力挑成员、范围读 wheel、sha256 对不上不留文件、
+    `remove` 只删自己那两个子目录、引擎缓存名跟着精度 / profile 变。全离线（造一个小 zip 冒充 wheel）。"""
+    print("TensorRT 库")
+    import hashlib
+    import io
+    import os
+    import zipfile
+    from unittest import mock
+
+    import re
+    import time
+
+    from flowocr import trt as T
+    from flowocr.extract import trt_engine as E
+
+    res = lambda arch: T.LIB + T._RES_NAME.format(arch)
+    check("建引擎资源按算力挑：有专属文件的取专属，8.7 / 12.1 这类取 PTX，低于 7.5 直接拒绝",
+          T.resource_for((12, 0)) == res("sm120") and T.resource_for((8, 6)) == res("sm86")
+          and T.resource_for((8, 7)) == res("ptx") and T.resource_for((12, 1)) == res("ptx")
+          and raises(lambda: T.resource_for((6, 1)), RuntimeError)
+          and set(T.members_for((12, 0))) == {*T.COMMON, T.resource_for((12, 0)), T.LICENSE}
+          and res("ptx") in T.members_for((12, 0), ptx=True)
+          and all(m in T.MEMBERS for m in T.members_for((8, 9), ptx=True)))
+    tables = {plat: {T.LICENSE, *(T.LIB + lib.format(n) for n in ("nvinfer", "nvinfer_plugin", "nvonnxparser")),
+                     *(T.LIB + rn.format(a) for a in (*T.ARCHS.values(), "ptx"))} for plat, (lib, rn) in T.NAMES.items()}
+    check("每个平台（Windows、Linux）都钉了 wheel 和全部成员（三个库、各算力和 PTX 的建引擎资源、许可证），sha256 是 64 位十六进制",
+          set(T.WHEELS) == set(T.NAMES) == set(T.MEMBERS_BY) and all(set(T.MEMBERS_BY[p]) == tables[p] for p in tables)
+          and all(re.fullmatch(r"[0-9a-f]{64}", h) and n > 0 for ms in T.MEMBERS_BY.values() for h, n in ms.values()),
+          {p: sorted(set(T.MEMBERS_BY[p]) ^ tables[p]) for p in tables})
+    # 造一个"wheel"：两个成员，一个 sha256 钉对、一个钉错
+    good, bad = b"g" * 300_000, b"b" * 1000
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(T.LIB + "good.dll", good)
+        z.writestr(T.LIB + "bad.dll", bad)
+    data = buf.getvalue()
+    calls = []
+
+    def fetch(a, b):
+        calls.append((a, b))
+        return data[a:b + 1]
+    rf = T.RangeFile(fetch, len(data), chunk=64 << 10)
+    members = {T.LIB + "good.dll": (hashlib.sha256(good).hexdigest(), len(good)), T.LIB + "bad.dll": ("0" * 64, len(bad))}
+    with tempfile.TemporaryDirectory() as td, mock.patch.dict(T.MEMBERS, members), \
+            mock.patch.dict(os.environ, {"FLOWOCR_TRT": str(Path(td) / "trtroot")}):
+        T.lib_dir().mkdir(parents=True)
+        with zipfile.ZipFile(rf) as zf:
+            T.extract(zf, T.LIB + "good.dll", T.lib_dir(), log=lambda *_: None)
+            bad_err = ""
+            try:
+                T.extract(zf, T.LIB + "bad.dll", T.lib_dir(), log=lambda *_: None)
+            except RuntimeError as exc:
+                bad_err = str(exc)
+        check("范围读 wheel：标准库 zipfile 经 RangeFile 读成员，按块缓存（请求数远少于读次数）；sha256 对上才落盘",
+              (T.lib_dir() / "good.dll").read_bytes() == good and T.have(T.LIB + "good.dll", deep=True)
+              and 0 < rf.requests <= len(data) // (64 << 10) + 4, rf.requests)
+        check("sha256 对不上：报错、不留成品也不留 .part",
+              "sha256" in bad_err and not (T.lib_dir() / "bad.dll").exists() and not list(T.lib_dir().glob("*.part")), bad_err)
+        keep = Path(td) / "trtroot" / "other.txt"
+        keep.write_text("x")
+        (T.engine_dir()).mkdir(parents=True)
+        (T.engine_dir() / "a.engine").write_bytes(b"e")
+        oldv = Path(td) / "trtroot" / "10.0.0.1" / "engines"
+        oldv.mkdir(parents=True)
+        (oldv / "x.ref.npz").write_bytes(b"r")
+        foreign = Path(td) / "trtroot" / "proj" / "lib"            # 名字不是版本号
+        foreign.mkdir(parents=True)
+        (foreign / "a.dll").write_bytes(b"x")
+        mixed = Path(td) / "trtroot" / "9.9" / "lib"                # 名字像版本号，但 lib/ 里有不认识的文件
+        mixed.mkdir(parents=True)
+        (mixed / "nvinfer_9.dll").write_bytes(b"x")
+        (mixed / "mine.txt").write_bytes(b"x")
+        for ms in T.MEMBERS_BY.values():                  # 两个平台的库名 remove 都认得（.dll / .so.10 / .so.10.16.1）
+            for m in list(ms)[1:3]:
+                (T.lib_dir() / Path(m).name).write_bytes(b"x")
+        T.remove(log=lambda *_: None)
+        check("remove 删各版本目录下的 lib/ 和 engines/（含旧版本，版本目录空了顺带删），trt 根下别的东西不碰；"
+              "名字不是版本号的目录、里面有不认识文件的 lib/ 都不删（FLOWOCR_TRT 指错时）",
+              not T.root().exists() and not oldv.parent.exists() and keep.is_file()
+              and (foreign / "a.dll").is_file() and (mixed / "mine.txt").is_file() and (mixed / "nvinfer_9.dll").is_file())
+    check("RangeFile 边界：一次读跨过缓冲尾、seek 到文件尾之后读到空、服务器回少了抛 OSError",
+          (lambda f: (f.seek(60_000), f.read(10_000))[1] == data[60_000:70_000] and (f.seek(0, io.SEEK_END), f.read(5))[1] == b"")
+          (T.RangeFile(fetch, len(data), chunk=64 << 10))
+          and raises(lambda: T.RangeFile(lambda a, b: b"x", len(data), chunk=1 << 10).read(100), OSError))
+    with tempfile.TemporaryDirectory() as td:
+        m = Path(td) / "m.onnx"
+        m.write_bytes(b"model")
+        cp = lambda prec="fp32", cap=(12, 0): E.cache_prefix("rec", m, prec, cap, T.TRT_VERSION)
+        p32, p16 = cp(), cp("fp16")
+        with mock.patch.dict(E.PROFILES, {"rec": ("x:1x3x48x320", "x:4x3x48x320", "x:8x3x48x3200")}):
+            p_prof = cp()
+        with mock.patch.dict(E.WORKSPACE, {"rec": 2 << 30}):
+            p_ws = cp()
+        m.write_bytes(b"model2")
+        p_w = cp()
+        check("引擎缓存名：精度、profile、workspace（会改引擎的 EP 选项都进）、模型内容（换权重不换结构也算）、算力任一变了名字就变；只用字母数字下划线",
+              len({p32, p16, p_prof, p_ws, p_w, cp(cap=(8, 6))}) == 6 and all(c.isalnum() or c == "_" for c in p32), (p32, p16))
+        # 建引擎：假的 make 往临时目录写 .profile 和 .engine
+        eng = Path(td) / "engines"
+        moved = []
+        real_replace = os.replace
+
+        def spy_replace(a, b):
+            moved.append(Path(b).suffix)
+            real_replace(a, b)
+
+        class FakeSess:
+            def __init__(self, bad=False):
+                self.bad = bad
+
+            def get_inputs(self):
+                return [type("I", (), {"name": "x"})()]
+
+            def run(self, _o, feed):
+                import numpy as np
+                x = feed["x"]
+                return [np.full(x.shape[:1], np.nan if self.bad else 0.0, np.float32)]
+
+        def fake_make(bad=False, fail=False):
+            def make(kind, model, prec, prefix, cache, device):
+                if fail:
+                    raise ValueError("no implementation")
+                (cache / f"{prefix}_x.profile").write_bytes(b"p")
+                (cache / f"{prefix}_x.engine").write_bytes(b"e")
+                return FakeSess(bad)
+            return make
+        quiet = lambda *_: None
+        with mock.patch.object(os, "replace", spy_replace):
+            pre = E.build("rec", m, "fp32", eng, (12, 0), T.TRT_VERSION, log=quiet, make=fake_make())
+        again = E.build("rec", m, "fp32", eng, (12, 0), T.TRT_VERSION, log=quiet, make=fake_make(fail=True))
+        check("build：.profile 先进 engines/、.engine 最后放；临时目录清掉；缓存在了就不再建（第二次给个会失败的 make 也照样返回）",
+              moved == [".profile", ".engine"] and E.engine_ready(eng, pre) and again == pre
+              and not list(eng.glob(".build-*")), moved)
+        # 长度要和上一版不同：哈希按（路径, 大小, mtime）记在进程里，Linux 的 mtime 刻度粗，等长的两次改写会撞上同一个 mtime
+        m.write_bytes(b"model-3")
+        smoke_err = build_err = None
+        try:
+            E.build("rec", m, "fp32", eng, (12, 0), T.TRT_VERSION, log=quiet, make=fake_make(bad=True))
+        except E.BuildError as e:
+            smoke_err = "BuildError"
+        except RuntimeError as e:
+            smoke_err = str(e)
+        try:
+            E.build("rec", m, "fp32", eng, (12, 0), T.TRT_VERSION, log=quiet, make=fake_make(fail=True))
+        except E.BuildError as e:
+            build_err = str(e)
+        check("build：冒烟出 NaN 抛普通错（不是 BuildError）、建 session 失败才是 BuildError；两种都不在 engines/ 里留引擎文件、留临时目录",
+              smoke_err not in (None, "BuildError") and "NaN" in smoke_err and build_err and "no implementation" in build_err
+              and len(list(eng.glob("*.engine"))) == 1 and not list(eng.glob(".build-*")),
+              (smoke_err, build_err))
+        # 锁：操作系统的文件锁。拿着的时候别人等到超时（锁着多久、拿着的一方在不在跑 Python 都一样）；
+        # 拿着锁的进程被硬杀，系统放锁，别人马上拿到；锁文件是旧的、空的都不影响
+        lk = eng / "x.lock"
+        lk.write_bytes(b"")
+        old = time.time() - 3600
+        os.utime(lk, (old, old))
+        with E.Lock(lk, timeout=5, poll=0.05):
+            t0 = time.monotonic()
+            timed_out = raises(lambda: E.Lock(lk, timeout=0.5, poll=0.05).__enter__(), TimeoutError)
+            waited = time.monotonic() - t0
+        with E.Lock(lk, timeout=1, poll=0.05):
+            again = True
+        holder = subprocess.Popen([sys.executable, "-c",
+                                   "import importlib.util, sys, time\n"
+                                   "s = importlib.util.spec_from_file_location('te', sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+                                   "m.Lock(__import__('pathlib').Path(sys.argv[2])).__enter__(); print('held', flush=True); time.sleep(60)",
+                                   E.__file__, str(lk)], stdout=subprocess.PIPE, text=True)
+        try:
+            held = holder.stdout.readline().strip() == "held"
+            busy = raises(lambda: E.Lock(lk, timeout=0.3, poll=0.05).__enter__(), TimeoutError)
+        finally:
+            holder.kill()
+            holder.wait()
+        t0 = time.monotonic()
+        with E.Lock(lk, timeout=5, poll=0.05):
+            freed = time.monotonic() - t0 < 2
+        check("建引擎锁：拿着时别人（同进程另一个句柄、别的进程）等到超时；放了再拿得到；拿着锁的进程被硬杀后系统放锁、马上拿得到；旧的空锁文件不碍事",
+              timed_out and waited >= 0.45 and again and held and busy and freed, (timed_out, waited, held, busy, freed))
+        lk.unlink()
+    # install：只有 BuildError 且可能是缺资源时才补取 PTX
+    log = []
+
+    def run_install(cap, err):
+        got = []
+        calls = {"n": 0}
+
+        def build():
+            calls["n"] += 1
+            if calls["n"] == 1 and err:
+                raise err
+        T.install(cap, ["fp32"], None, build=build, fetch=lambda ms: got.append(list(ms)) or [], log=log.append)
+        return got, calls["n"]
+    g1, n1 = run_install((12, 0), E.BuildError("rec fp32 引擎建不出来：x"))
+    g2 = raises(lambda: run_install((12, 1), E.BuildError("x")), E.BuildError)
+    g3 = raises(lambda: run_install((12, 0), E.BuildError("CUDA out of memory")), E.BuildError)
+    g4 = raises(lambda: run_install((12, 0), RuntimeError("smoke NaN")), RuntimeError)
+    check("install：建引擎失败（BuildError）才补取 PTX 再建一次；本机本来就用 PTX、显存不够、冒烟失败都直接抛",
+          len(g1) == 2 and T.LIB + T._RES_NAME.format("ptx") in g1[1] and n1 == 2 and g2 and g3 and g4, g1)
+    lo, opt, hi = E.PROFILES["rec"]
+    check("rec 只一个 profile（ORT 1.29 的 TRT EP 只用第一个），上限盖住宽 3200、批 16",
+          "," not in lo + opt + hi and E.profile_shapes(hi) == [(16, 3, 48, 3200)]
+          and E.profile_shapes(E.PROFILES["det"][2]) == [(4, 3, 960, 960)])
+    src = (ROOT / "src/flowocr/extract/trt_engine.py").read_text(encoding="utf-8")
+    check("trt_engine 不 import flowocr（推理服务可能跑在别的解释器里、按文件路径载入它）",
+          not re.search(r"^\s*(import flowocr|from flowocr)", src, re.M))

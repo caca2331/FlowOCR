@@ -91,11 +91,10 @@ def main() -> int:
     win_of = {i: wi for wi, w in enumerate(win_regions) for i in w["runs"]}
 
     def placement(d: dict):
-        """这份产物里，每条 run 落进了哪个区域 / 那个区域进没进主轨。"""
-        mt = tracksio.main_track(d)
-        mr = set(mt.get("regions") or [mt.get("region")])
-        k1 = {(e["t_start"], e["text"], tuple(e["box"])): e["region"] for e in d["events"]}
-        k2 = {(e["t_start"], e["text"]): e["region"] for e in d["events"]}
+        """这份产物里，每条 run 落进了哪个事件；在不在主轨按事件判（`tracksio.in_main`：区域整块并进来，或事件带 `band_merged`）。"""
+        mr = tracksio.main_regions(d)
+        k1 = {(e["t_start"], e["text"], tuple(e["box"])): e for e in d["events"]}
+        k2 = {(e["t_start"], e["text"]): e for e in d["events"]}
         return mr, k1, k2
 
     main_regions, by_key, by_key2 = placement(doc)
@@ -121,14 +120,14 @@ def main() -> int:
     rows = Counter()
     eaters = Counter()
     for i in target:
-        where = ("对不回" if final[i] is None else "主轨内" if final[i] in main_regions else "主轨外")
+        where = ("对不回" if final[i] is None else "主轨内" if tracksio.in_main(final[i], main_regions) else "主轨外")
         rows[(where, "窗区域干净" if dirty(win_of[i]) == 0 else "窗区域混了带外 run")] += 1
         if where == "主轨外":
-            eaters[final[i]] += 1
+            eaters[final[i]["region"]] += 1
     print(f"主轨区域 {sorted(main_regions)}\n目标 run 按（最终落点 × 它所在的窗区域干不干净）：")
     for (w, c), v in sorted(rows.items()):
         print(f"  {w:<6} {c:<16} {v:>6}")
-    out = [dirty(win_of[i]) for i in target if final[i] is not None and final[i] not in main_regions]
+    out = [dirty(win_of[i]) for i in target if final[i] is not None and not tracksio.in_main(final[i], main_regions)]
     if out:
         print(f"  主轨外的那些，所在窗区域里带外 run 占比：中位 {st.median(out):.2f}，"
               f"干净（=0）的 {sum(1 for x in out if x == 0)}/{len(out)}")
@@ -148,9 +147,9 @@ def main() -> int:
         omr, ok1, ok2 = placement(other)
 
         def where_of(i, mr, k1, k2):
-            r = k1.get((runs[i].t_start, runs[i].text, tuple(runs[i].box)),
+            e = k1.get((runs[i].t_start, runs[i].text, tuple(runs[i].box)),
                        k2.get((runs[i].t_start, runs[i].text)))
-            return "对不回" if r is None else "主轨内" if r in mr else "主轨外"
+            return "对不回" if e is None else "主轨内" if tracksio.in_main(e, mr) else "主轨外"
 
         move = Counter((where_of(i, omr, ok1, ok2), where_of(i, main_regions, by_key, by_key2))
                        for i in target)

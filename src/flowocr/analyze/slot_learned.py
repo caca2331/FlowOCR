@@ -2,7 +2,7 @@
 
 **结论先说**（cluster-ruler 计划）：公平的抽样框下（照 `median` 抽 240 对 + 照它自己抽 186 对）74.2%，
 比默认的 `median`（70.2%）好约 4 个点；它自己的决定里约 36% 是错的、以误合并为主；在一条标注都没见过的鸣潮上没有优势（60.6% = `median`）。
-⚠ 不用学的 `slot_lines` 在同样的样本上读数是 73.7% / 鸣潮 80.3%，但**它没当过抽样基准**——那是现有样本上的读数，公平排名待照它自己抽样验证。训练过的游戏的产物上有用：长窗的重复认领降一半到三分之二、覆盖不少。
+不用学的 `--cluster lines` 按管线的分组量（2026-10-05，只量 dev）：训练过的游戏三框合计 learned 76.8%、`median` 73.8%、lines 69.5%（配对上分不出：lines 对 `median` 53 : 66、p ≈ 0.27）；同时在场的上下相邻两行（尺的 S5 层）lines 拆开 15 / 38、learned 12 / 38、`median` 0 / 38——一句多行台词被拆进几个区域就是这个。训练过的游戏的产物上有用：长窗的重复认领降一半到三分之二、覆盖不少。
 所以留作开关和对照臂，不进默认。
 
 来历：逐通道消融（`pair_model.py`）说文本形态和"同屏伙伴"两条通道各自带着几何之外的独立信息（单独用 AUC ≈0.8），
@@ -197,15 +197,16 @@ def assign(L, model, thr: float = THR, verbose: bool = False, leftover: set | No
 
 
 def groups_for_pipeline(runs: list, W: int, H: int, tag: str = "",
-                        fallback: dict[int, int] | None = None) -> list[list[int]]:
-    """给 `build_tracks --cluster learned` 用：run 列表 -> 每个区域的 run 下标（用随代码走的模型）。
+                        fallback: dict[int, int] | None = None, model=None) -> list[list[int]]:
+    """给 `build_tracks --cluster learned` 用：run 列表 -> 每个区域的 run 下标。`model` 缺省 = 随代码走的模型；
+    聚类的尺传留一部片子训的模型进来（`slot_pairs.pipeline_assign`），分组的其余步骤和管线同一份代码。
 
     `fallback` = run 下标 -> 现行缝合给它的槽位号。**既没进行位、也没挂上去的散 run**（单字残片、只出现过一次的字）
     按它归堆，而不是各自成一个区域：第一版不归堆，hsr 40 分钟窗上区域数 216 -> 712、其中 624 个是单 cue 的 `noise`
     ——剧本口径下不少认领（`probe_noise_fp`），但逐区域产物里多出几百个文件，而且被打成 noise 的真文字会从 `nonoise` 喂入里消失。"""
     from types import SimpleNamespace
     leftover: set[int] = set()
-    asg = assign(SimpleNamespace(runs=runs, W=W, H=H, tag=tag), load_model(), verbose=True, leftover=leftover)
+    asg = assign(SimpleNamespace(runs=runs, W=W, H=H, tag=tag), model if model is not None else load_model(), verbose=True, leftover=leftover)
     by: dict = {}
     for i, k in asg.items():
         key = ("fb", fallback[i]) if fallback is not None and i in leftover and i in fallback else ("c", k)
@@ -215,9 +216,23 @@ def groups_for_pipeline(runs: list, W: int, H: int, tag: str = "",
     return [sorted(v) for v in by.values()]
 
 
+def cluster_groups(kind: str, runs: list, W: int, H: int, fallback: dict[int, int], tag: str = "",
+                   model=None) -> list[list[int]]:
+    """`build_tracks --cluster learned|lines` 的区域分组：缝合之后**换掉**"哪些 run 是一个区域"的那一步。
+    管线和聚类的尺（`slot_pairs.pipeline_assign`）都调这里，尺量的就是管线真正产出的分组。
+    `fallback` = run 下标 -> 现行缝合给它的槽位号（散 run 回落用）；`model` 只对 learned 有意义。"""
+    if kind == "learned":
+        return groups_for_pipeline(runs, W, H, tag, fallback=fallback, model=model)
+    if kind == "lines":
+        return slot_lines.groups_for_pipeline(runs, W, H, fallback=fallback)
+    raise ValueError(f"未知的 --cluster {kind!r}")
+
+
 FP_FILES = {"learned": ("slot_learned.py", "slot_lines.py", "slot_modes.py", "pair_features.py", "models/slot_pair.json"),
             "lines": ("slot_lines.py", "slot_modes.py")}
-"""`--cluster learned` / `lines` 各自依赖的代码（+ 模型）。lines 不碰模型：重训模型不该让 lines 的产物失效。"""
+"""`--cluster learned` / `lines` 各自依赖的代码（+ 模型）。lines 不碰模型：重训模型不该让 lines 的产物失效。
+lines 也不列本文件：lines 经 `cluster_groups` 分派进来，但本文件绝大部分是 learned 的代码，列进来的话改 learned 就让 lines 的产物全失效；
+分派那几行改了要靠 build_tracks 自己的 `code_fp`（本文件在它的 `CODE_FP_FILES` 里）兜住。"""
 
 
 def fingerprint(kind: str = "learned") -> str:
@@ -238,7 +253,7 @@ def main() -> int:
     ap.add_argument("--train", default="seed1,seed2")
     ap.add_argument("--test", default="seed3")
     ap.add_argument("--lofo", action="store_true", help="留一部片子：测哪部，训练里就去掉哪部的标注")
-    ap.add_argument("--thr", type=float, default=THR)
+    ap.add_argument("--split", default="dev", help="只量这个 split 的真值文件（acceptance 集留给真要翻默认时只看一次）；空 = 全部")
     ap.add_argument("--only", default="", help="只量这些 tag（逗号分隔）——分开报『训练过的游戏』和『没见过的游戏』")
     ap.add_argument("--save", action="store_true", help="用 --train 指的全部标注训一个模型、存到 src/flowocr/analyze/models/ 后退出")
     ap.add_argument("--relabel", default="", help="复核标签文件（items: id / label）：只覆盖**测试集**的标签，训练集不动（cluster-ruler）")
@@ -263,21 +278,22 @@ def main() -> int:
     n_lost = 0
     for p in sorted(glob.glob(str(paths.data_root() / "data/gt/slotpairs-*.json"))):
         doc = json.loads(Path(p).read_text(encoding="utf-8"))
-        if f"seed{doc['seed']}" not in a.test.split(",") or (a.only and doc["tag"] not in a.only.split(",")):
+        if (f"seed{doc['seed']}" not in a.test.split(",") or (a.only and doc["tag"] not in a.only.split(","))
+                or (a.split and doc.get("split") != a.split)):
             continue
         tag = doc["tag"]
         for it in doc["items"]:
             it["label"] = relabel.get(it["id"], it["label"])
         model = fit(Xtr[tags_tr != tag], ytr[tags_tr != tag]) if a.lofo else model_all
-        extra = {"learned": lambda L, m=model: assign(L, m, a.thr, verbose=True),
-                 "lines": slot_lines.assign}
+        extra = {"learned": lambda L, m=model: SP.pipeline_assign(L, "learned", m),     # 管线的最终分组（散 run 回落到缝合）
+                 "lines": lambda L: SP.pipeline_assign(L, "lines")}
         arms = {k: v for k, v in SP.ARMS.items() if k in ("pooled", "median")}
         for name, c in SP.score_doc(doc, arms, extra).items():
             tot.setdefault(name, Counter()).update(c)
         asg = SP._ASSIGN[tag]
         for it in doc["items"]:
             if it["label"] in ("same", "different"):
-                v = SP.verdicts(asg, it)
+                v = SP.verdicts(asg, it, SP._RUNS.get(tag))     # 和 score_doc 一样先重新锚定
                 if v is None:
                     n_lost += 1
                 else:

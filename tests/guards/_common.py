@@ -18,6 +18,25 @@ from flowocr.artifacts import srtio  # noqa: E402
 FAILED: list[str] = []
 
 
+def high_quality_default(fn):
+    """装饰守卫：执行期间不给 `--quality` 按 `high` 解析。这些守卫造的假产物是辅助流 60 fps 的旧默认产物（精度档位之前），
+    测的是复用判据的**别的维度**（参数、窗口、采样网格、范围）；2026-10-05 默认翻成 `default` 档（辅助流 30）之后，
+    不钉的话它们全部因为辅助流网格对不上而判重建，测不到原来要测的东西。档位本身的复用口径在 `t_quality_tiers`。
+    只对同一进程内的解析有效：守卫里起的子进程不受它影响，照样按 `default` 档。"""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        from flowocr.extract import ocr_args
+        old = ocr_args.DEFAULT_QUALITY
+        ocr_args.DEFAULT_QUALITY = "high"
+        try:
+            return fn(*a, **k)
+        finally:
+            ocr_args.DEFAULT_QUALITY = old
+    return run
+
+
 def raises(fn, exc: type[BaseException] = Exception) -> bool:
     """`fn()` 抛不抛。**"守卫真的会响"和"正常路径没坏"是两件事**，两边都要测。"""
     try:
@@ -47,7 +66,7 @@ def fake_widths(pairs, known=None):
 def render_overlay(path: Path, items, doc: dict, look: str = "dev", typewriter: bool = True, fade: bool = True,
                    quiet: bool = True, **look_changes):
     """叠加两步走一遍：阶段 3 写字幕稿（`path` 旁边的 `.script.ass`），阶段 4 生成 `path`。返回阶段 3 的计数。
-    `look_changes` 覆盖阶段 4 预设的字段（比如 `label=False`）。字宽用 `fake_widths`。"""
+    `look_changes` 覆盖阶段 4 预设的字段（比如 `label=False`）；底板取色默认关（要读视频）。字宽用 `fake_widths`。"""
     from dataclasses import replace
     from unittest.mock import patch
 
@@ -57,7 +76,7 @@ def render_overlay(path: Path, items, doc: dict, look: str = "dev", typewriter: 
     draft = path.with_name(path.stem + ".script.ass")
     with patch.object(export, "ink_widths", fake_widths):
         n, _widths = script.export_script(draft, items, doc, typewriter, fade)
-        ts = core.Typesetter(replace(core.LOOKS[look], **look_changes))
+        ts = core.Typesetter(replace(core.LOOKS[look], **{"plate_color": "off", **look_changes}))   # 底板取色要视频，另有守卫
         d = assfile.loads(draft.read_text(encoding="utf-8"))
         ts.run(d)
     path.write_text(d.dumps(), encoding="utf-8")
@@ -90,13 +109,15 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         missing: set = set()
         eaten: set = set()
         aux_cut: dict = {}          # 块起点 -> 辅助流推到哪一帧为止（模拟半路断）
+        fail_at: dict = {}          # 块起点 -> 交到这一帧时抛的异常（模拟块内硬解失败）
+        cancel_fails = False        # 失败块的 cancel 自己也出错（模拟清理超时）
         delay = 0.0
         probe_fails = False
 
         def __init__(self, video, **kw):
             self.kw, self.grid_off, self.grid_skipped = kw, {}, 0
             self.stopped_early, self.stderr_tail, self.preroll_ticks = False, [], 0
-            self.aux = NS(join=lambda t=None: None, th=NS(is_alive=lambda: False), misaligned="") if kw["aux"] else None
+            self.aux = NS(join=lambda t=None: None, th=NS(is_alive=lambda: False), misaligned="", refused="") if kw["aux"] else None
 
         def __iter__(self):
             lo, hi, st = self.kw["start_idx"], self.kw["end_idx"], self.kw["grid"].step
@@ -111,6 +132,8 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
                     continue
                 if sink is not None and i < cut:
                     sink.push(i, np.zeros(4, np.uint8))
+                if i - lo == 30 and lo in Fake.fail_at:
+                    raise Fake.fail_at[lo]
                 if i in got:
                     if Fake.delay:
                         time.sleep(Fake.delay)
@@ -120,6 +143,10 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
 
         def close(self):
             pass
+
+        def cancel(self):
+            if Fake.cancel_fails:
+                raise RuntimeError("假的：辅助流取消后读线程未退出")
 
     class Sock:
         def __init__(self, fail_after=None):
@@ -143,7 +170,7 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         """跑一遍，返回 (交出的帧号, pts 表, 源, 抛的异常, 卡没卡住)。"""
         pts: list = []
         bl = blocks if blocks is not None else [(k * 60, (k + 1) * 60, None if k == 0 else k + 0.0005) for k in range(nblocks)]
-        remote = NS(url="tcp://127.0.0.1:1", pts_put=pts.append) if aux else None
+        remote = NS(url="tcp://127.0.0.1:1", pts_put=pts.append, abort=lambda: None) if aux else None
         s = dsh.ShardedSource("v", lanes=list(lanes), blocks=bl, start_idx=0, end_idx=nblocks * 60, grid=_every(30), src_fps=60.0,
                               width=4, height=4, hwaccel="cuda", aux_remote=remote, budget_mb=budget_mb)
         out, err = [], []
@@ -155,8 +182,23 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
             except BaseException as exc:          # noqa: BLE001
                 err.append(exc)
 
-        cc = (mock.patch.object(dsh.socket, "create_connection", side_effect=conn_err) if conn_err is not None
-              else mock.patch.object(dsh.socket, "create_connection", return_value=sock or Sock()))
+        class Writer:
+            def __init__(self, remote):
+                self.remote = remote
+                self.sock = sock or Sock()
+            def open(self):
+                if conn_err is not None:
+                    raise conn_err
+                return self
+            def send(self, frame, n, t):
+                self.sock.sendall(frame)
+                self.remote.pts_put((n, t))
+            def close(self):
+                self.remote.pts_put(dsh.framesource.QUEUE_SENTINEL)
+                self.sock.close()
+            def abort(self):
+                self.sock.close()
+        cc = mock.patch.object(dsh, "TcpAux", Writer)
         with mock.patch.object(dsh.framesource, "FfmpegSource", Fake), cc, \
                 mock.patch.object(dsh.framesource, "probe_source_frames",
                                   side_effect=lambda v, idxs, fps: (None if Fake.probe_fails
@@ -171,6 +213,7 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
 
     def reset():
         Fake.missing, Fake.eaten, Fake.aux_cut, Fake.delay, Fake.probe_fails = set(), set(), {}, 0.0, False
+        Fake.fail_at, Fake.cancel_fails = {}, False
 
     reset()
     out, pts, s, e, stuck = run()
@@ -225,9 +268,9 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         check(f"ShardedSource：辅助流转发**连不上**（{nb} 块、3 路）-> 及时抛，不静默少辅助流、不卡住（Codex 审计 P1）",
               not stuck and isinstance(e, RuntimeError) and "连不上" in str(e), (nb, stuck, e))
         out, pts, s, e, stuck = run(nblocks=nb, sock=Sock(fail_after=70))
-        check(f"ShardedSource：辅助流**写到一半断了**（{nb} 块）-> 抛 RuntimeError、结束标记照发",
+        check(f"ShardedSource：辅助流**写到一半断了**（{nb} 块）-> 抛 RuntimeError、不伪造正常结束标记",
               not stuck and isinstance(e, RuntimeError) and "转发失败" in str(e)
-              and pts and pts[-1] is dsh.framesource.QUEUE_SENTINEL, (nb, stuck, e))
+              and dsh.framesource.QUEUE_SENTINEL not in pts, (nb, stuck, e))
 
     reset()
     Fake.aux_cut = {60: 80}
@@ -250,7 +293,13 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
 
     def try_admit(last_main):
         b0.last_main = last_main
-        th = _th.Thread(target=lambda: (s0._cv.acquire(), s0._admit(b0, 5), s0._cv.release()), daemon=True)
+        def admit():
+            with s0._cv:
+                try:
+                    s0._admit(b0, 5)
+                except RuntimeError:
+                    assert s0._closed
+        th = _th.Thread(target=admit, daemon=True)
         th.start()
         th.join(1.0)
         blocked = th.is_alive()
@@ -263,6 +312,76 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         return blocked
     check("ShardedSource._admit：主流还没到块尾时按预算挡；主流交到块的最后一个格之后放行（块尾辅助帧不是预取）",
           try_admit(0) and not try_admit(30))
+
+    # 预取块失败 / 辅助读端被取消时，被预算挡着的辅助写入要当场退出（否则 cancel 的 join 超时，清理错误盖掉硬解失败）
+    def parked_exits(kill):
+        b1 = dsh._Block(s0, 1, "hw", 60)
+        b1.last_main = 0
+        s0._buffered = 10
+        res = []
+        def admit():
+            with s0._cv:
+                try:
+                    s0._admit(b1, 5, aux=True)
+                    res.append("admitted")
+                except RuntimeError:
+                    res.append("refused")
+        th = _th.Thread(target=admit, daemon=True)
+        th.start()
+        th.join(0.3)
+        parked = th.is_alive()
+        kill(b1)
+        th.join(1.0)
+        return parked and not th.is_alive() and res == ["refused"]
+
+    def fail_block(b1):
+        with s0._cv:
+            b1.err = RuntimeError("假的：块失败")
+            s0._cv.notify_all()
+    check("ShardedSource._admit：被预算挡着的辅助帧在块失败或辅助读端取消时当场退出，不等预算",
+          parked_exits(fail_block) and parked_exits(lambda b1: b1.close()))
+
+    # 契约（效率分支复审）：**真实的** `FfmpegSource.cancel -> AuxReader.abort -> _Block.close` 叫得醒被预算挡在 `_admit` 里的辅助读线程。
+    # 替身只有 ffmpeg 那一头（本机 socket 往 AuxReader 写像素）和 FfmpegSource 的进程状态，不用 GPU、不起 ffmpeg
+    import socket as _so
+    from flowocr.extract import framesource as _fsr
+    b2 = dsh._Block(s0, 2, "hw", 60)
+    b2.last_main = 0
+    s0._buffered = 10
+    rd = _fsr.AuxReader(start_idx=0, n_frames=8, step=1, width=4, height=4, sink=b2).start()
+    feed = _so.create_connection(("127.0.0.1", int(rd.url.rsplit(":", 1)[1])))
+    feed.sendall(bytes(16 * 8))
+    t_park = time.monotonic()
+    while not b2.throttled and time.monotonic() - t_park < 3:
+        time.sleep(0.01)
+    parked2 = b2.throttled and rd.th.is_alive()
+    src_ = NS(_proc_lock=_th.Lock(), _cancelled=False, proc=None, aux=rd, close=lambda: None)
+    t_cancel = time.monotonic()
+    try:
+        _fsr.FfmpegSource.cancel(src_)
+        cancel_err = None
+    except RuntimeError as exc:
+        cancel_err = exc
+    dt_cancel = time.monotonic() - t_cancel
+    feed.close()
+    check("契约：真实 FfmpegSource.cancel -> AuxReader.abort -> _Block.close 在 5 s 内叫醒被预算挡在 _admit 里的辅助读线程；"
+          "拒收记进 `refused`、不记成 pts 对不上",
+          parked2 and cancel_err is None and not rd.th.is_alive() and dt_cancel < 5
+          and rd.refused and not rd.misaligned and rd.sent == 0,
+          (parked2, cancel_err, rd.th.is_alive(), round(dt_cancel, 2), rd.refused, rd.misaligned, rd.sent))
+
+    reset()
+    Fake.fail_at = {120: dsh.framesource.HwaccelMismatch("假的：第 2 块中途硬解交付错")}
+    Fake.cancel_fails = True
+    out, pts, s, e, stuck = run()
+    try:
+        s.close()
+        later = None
+    except RuntimeError as exc:
+        later = exc
+    check("ShardedSource：预取块硬解失败且清理也出错 -> 消费者仍按块序拿到 HwaccelMismatch（才会走软解重跑），清理错误由之后的 close() 报",
+          not stuck and isinstance(e, dsh.framesource.HwaccelMismatch) and out == list(range(0, 120, 30))
+          and later is not None and "清理失败" in str(later), (stuck, e, out, later))
 
     reset()
 
@@ -380,4 +499,4 @@ def _zip_bundle(src: Path, dst: Path, game: str = "genshin", tamper: str | None 
     return dst
 
 
-__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', '_every', 'check', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']
+__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', '_every', 'check', 'high_quality_default', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']

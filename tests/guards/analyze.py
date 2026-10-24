@@ -70,6 +70,17 @@ def t_panel_like() -> None:
           f"{len(kept)} -> {len(dropped)}")
     check("drop 之后剩下的是正文那条", len(dropped) == 1 and dropped[0].lines == ("正文",))
     check("evs_of 和 cue 一一对应（叠加层要拿框）", len(evs_of) == len(cues))
+    # cue 的文字按可见的行拼：同一行被切成三段、事件序按框上沿排是乱的（hsr「船の行き先は…」，2026-10-05）
+    row = _copy0.deepcopy(doc)
+    row["events"] = [{"text": "姫子", "box": [914, 794, 1004, 846]},
+                     {"text": "と呼ばれる場所よ。", "box": [1176, 854, 1400, 890]},
+                     {"text": "「渡画泉隠」", "box": [1032, 858, 1184, 887]},
+                     {"text": "船の行き先は境界", "box": [500, 860, 974, 887]}]
+    row["tracks"][1]["cues"] = [{"id": "c0", "t_start": 0, "t_end": 1_000_000, "events": [0, 1, 2, 3]}]
+    rc, revs, _ = SM.feed_from_doc(row, "nonoise")
+    check("feed 的 cue 文字按行从上往下、行内从左往右拼（同一行的几段连成一行）",
+          rc[0].lines == ("姫子", "船の行き先は境界「渡画泉隠」と呼ばれる場所よ。") and len(revs[0]) == 4,
+          (rc[0].lines, len(revs[0])))
 
     # **喂入是白名单，不是黑名单**（2026-09-20，owner 和复审同时指出的真回归）：
     # `kind="nameplate"` 轨和区域轨**装的是同一批 run**（build_tracks 有意让它重叠），
@@ -513,6 +524,82 @@ def t_typewriter_fuse() -> None:
             bad += 1
     check("**`signals` 的向量化和逐帧 `ncc` 逐个对得上**（40 组、相关系数横跨 EMPTY_THR）", bad == 0, bad)
 
+    # 2026-10-16：uint8 上的中位数 / 95 分位走直方图、结尾窗 ncc 模板侧预算——都要和 numpy 原式逐位相同（升级 numpy 时这条先报）
+    rng = np.random.default_rng(7)
+    bad = []
+    for tr in range(600):
+        shp = (int(rng.integers(1, 30)), int(rng.integers(1, 120)))
+        img = (rng.integers(0, 256, shp) if tr % 3 == 0 else rng.choice(rng.integers(0, 256, 3), shp) if tr % 3 == 1
+               else np.clip(rng.normal(rng.integers(0, 256), 25, shp), 0, 255)).astype(np.uint8)
+        dev = img.astype(np.int16) - int(np.median(img))
+        b, d = dev[dev > 0], -dev[dev < 0]
+        if TF.polarity(img) != bool((np.percentile(b, 95) if b.size else 0) >= (np.percentile(d, 95) if d.size else 0)):
+            bad.append(("polarity", tr))
+        if TF._u8_median_int(img) != int(np.median(img)):
+            bad.append(("median_int", tr))
+        m1, m2 = TF._u8_median_f32(img), np.median(img.astype(np.float32))
+        if type(m1) is not type(m2) or m1 != m2:
+            bad.append(("median_f32", tr))
+        r1, r2 = TF._u8_rowmedian_f32(img), np.median(img.astype(np.float32), axis=1)
+        if r1.dtype != r2.dtype or not np.array_equal(r1, r2):
+            bad.append(("rowmedian", tr))
+        other = rng.integers(0, 256, shp).astype(np.uint8)
+        if TF.ncc_to(img)(other) != TF.ncc(other, img):
+            bad.append(("ncc_to", tr))
+    check("**直方图版中位数 / 95 分位、`ncc_to` 和 numpy 原式逐位相同**（600 组随机 / 三值 / 偏态 uint8）", not bad, bad[:5])
+
+    # 2026-10-16：`signals` 里"整叠不像首帧"改走整数矩、字形一致率 / 逐字格改成只碰字形像素的计数——都要和原式逐位相同
+    def glyph_ref(frames, tpl):
+        mask = TF.glyph_mask(tpl)
+        if mask.sum() < 20:
+            return np.full(len(frames), np.nan)
+        return (np.abs(frames.astype(np.int16) - tpl.astype(np.int16))[:, mask] <= TF.GLYPH_TOL).mean(axis=1)
+
+    def cell_ref(frames, ts, x0, x1, n_chars):
+        k = len(frames) - 1
+        mask = TF.glyph_mask(frames[k], TF.polarity(frames[k]))
+        close = np.abs(frames.astype(np.int16) - frames[k].astype(np.int16)) <= TF.GLYPH_TOL
+        cw = (x1 - x0) / n_chars
+        xs, ys = [], []
+        for c in range(n_chars):
+            a, b = int(round(x0 + c * cw)), int(round(x0 + (c + 1) * cw))
+            m = mask[:, a:b]
+            if m.sum() < TF.CELL_MIN_PX:
+                continue
+            o = TF.last_onset(close[:, :, a:b][:, m].mean(axis=1) >= TF.GLYPH_THR)
+            if o is not None:
+                xs.append(c)
+                ys.append(ts[o])
+        fit = TF.theil_sen(xs, ys)
+        return None if fit is None else (fit[0], fit[0] + fit[1] * (n_chars - 1))
+    bad = []
+    for tr in range(300):
+        T, h, w = int(rng.integers(3, 30)), int(rng.integers(6, 40)), int(rng.integers(10, 300))
+        if tr % 3 == 0:
+            st = rng.integers(0, 256, (T, h, w)).astype(np.uint8)
+        else:                                            # 逐字长出来的亮字 / 暗字，加一点噪声
+            st = np.repeat(rng.integers(30, 90, (1, h, w)), T, 0)
+            n = max(2, w // h)
+            for t in range(T):
+                for j in range(min(n, int(n * t / (0.7 * T)))):
+                    st[t, h // 4: 3 * h // 4, j * h + 1: (j + 1) * h - 1] = 220 if tr % 3 == 1 else 5
+            st = np.clip(st + rng.integers(-3, 4, st.shape), 0, 255).astype(np.uint8)
+        near = st.copy()                                 # 和首帧的相关系数贴着门限
+        near[1:] = st[0]
+        j = int(rng.integers(0, h * w))
+        near[1:].reshape(T - 1, -1)[:, :j] = rng.integers(0, 256, j)
+        for x in (st, near):
+            if TF._first_unlike(x) != TF._first_unlike_ref(x):
+                bad.append(("first_unlike", tr))
+        g1, g2 = TF.glyph_score(st, st[-1]), glyph_ref(st, st[-1])
+        if g1.dtype != g2.dtype or not np.array_equal(g1, g2, equal_nan=True):
+            bad.append(("glyph_score", tr))
+        ts = list(range(0, T * 16_667, 16_667))
+        n = int(rng.integers(2, 20))
+        if TF.cell_fit(st, ts, 1, w - 1, n) != cell_ref(st, ts, 1, w - 1, n):
+            bad.append(("cell_fit", tr))
+    check("**整数矩版\"不像首帧\"、计数版字形一致率 / 逐字格和原式逐位相同**（300 组随机 / 逐字长出 + 贴门限的叠）", not bad, bad[:5])
+
 
 def t_edge_refine() -> None:
     """两遍合一遍（tools/edge_refine.py，reuse-budget 计划 §7.6）：合成一段打字机，帧环 + 链事件 -> `edge` 证据，
@@ -657,7 +744,8 @@ def t_edge_refine() -> None:
     # 原来只能查 run_ocr2 源码里有没有那几个参数名（run_ocr2 顶层 import 推理库），函数挪进 edge_refine 之后按行为测
     from types import SimpleNamespace as _NS
     from flowocr.extract import decode_proc as _DP
-    base = dict(prefetch=4, det_batch=4, det_prefetch=2, det_lookahead=1, rec_window=4, decode_shards=0)
+    base = dict(prefetch=4, det_batch=4, det_prefetch=2, det_lookahead=1, rec_window=4, decode_shards=0,
+                recover_async=False, rec_async=True)
     n0 = ER.ring_in_flight(_NS(**base))
     grows = {k: ER.ring_in_flight(_NS(**{**base, k: base[k] + 1})) > n0
              for k in ("prefetch", "det_batch", "det_prefetch", "det_lookahead", "rec_window")}
@@ -667,6 +755,9 @@ def t_edge_refine() -> None:
           and ER.ring_in_flight(_NS(**{**base, "decode_shards": 2})) == n0 + _DP.slots_for(4, 2)
           and ER.ring_in_flight(_NS(**{**base, "det_batch": 1})) == 4 + 1 * (1 + 2) + 4,
           (n0, grows))
+    check("回补异步时扣着等回补的回抠批次也压着帧环：在途加 RECOVER_HOLD；同步 rec 池用不上它、不加",
+          ER.ring_in_flight(_NS(**{**base, "recover_async": True})) == n0 + ER.RECOVER_HOLD
+          and ER.ring_in_flight(_NS(**{**base, "recover_async": True, "rec_async": False})) == n0)
     check("帧环按辅助流的帧数给容量：每帧都进环时同源帧数；120 fps 片子隔帧取（步长 2）约减半；不等距时两个网格的上界相加",
           ER.ring_capacity(30, 3, 12, aux=AG.AuxGrid(AG.TimeGrid.every(1), AG.TimeGrid.every(30))) == 173
           and ER.ring_capacity(60, 6, 24, aux=AG.AuxGrid(AG.TimeGrid.every(2), AG.TimeGrid.every(60)))
@@ -934,6 +1025,181 @@ def t_nameplate_track() -> None:
           not uigate.pick_nameplates(body + plate, win_us=10_000_000))
 
 
+def t_within_regions() -> None:
+    """非区域轨只装区域轨已有的 run（2026-10-05：`--srt-mode body` 的筛行按上下文定，
+    同一条 run 在区域轨里被筛、在并带主轨 / 名牌轨里留下，写到最后被 schema 拦下，12 臂崩 2 臂）。"""
+    print("非区域轨的段：只留区域轨里已有的 run")
+    from types import SimpleNamespace
+
+    from flowocr.analyze import build_tracks as bt
+
+    a, b, c = (SimpleNamespace(text=t) for t in ("甲", "乙", "丙"))
+    segs = [(0, 10, [a, b]), (10, 20, [c]), (20, 30, [b])]
+    got, dropped = bt.within_regions(segs, {id(a), id(b)})
+    check("区域轨筛掉的行拿掉、拿空的段整段丢、其余原样",
+          [(s, e, [r.text for r in rs]) for s, e, rs in got] == [(0, 10, ["甲", "乙"]), (20, 30, ["乙"])] and dropped == 1,
+          (got, dropped))
+    src = (ROOT / "src" / "flowocr" / "analyze" / "build_tracks.py").read_text(encoding="utf-8")
+    check("并带主轨和名牌轨的段都过这道闸", src.count("within_regions(cue_segments(") == 2)
+
+
+def t_row_order() -> None:
+    """cue 里的行序：先分行、行从上往下、行内从左往右（cue-shape 计划的 c）。"""
+    print("行序：分行之后行内从左到右")
+    from types import SimpleNamespace
+
+    from flowocr.analyze import build_tracks as bt
+    from flowocr.artifacts import tracksio
+
+    def run(t, box):
+        return SimpleNamespace(text=t, box=box, t_start=0, cy=(box[1] + box[3]) / 2, cx=(box[0] + box[2]) / 2)
+    top = run("君は私の凶器。", [400, 860, 700, 905])
+    left = run("大魔女を", [400, 921, 560, 966])          # 破折号断开的同一行：左半截纵向中心略低
+    right = run("ユキを殺す【犯人】は、", [640, 918, 1000, 964])
+    last = run("私の役割だ。", [400, 980, 640, 1025])
+    got = [r.text for r in bt.row_order([last, right, top, left])]
+    check("破折号断开的同一行按左沿排、行从上往下", got == ["君は私の凶器。", "大魔女を", "ユキを殺す【犯人】は、", "私の役割だ。"], got)
+    check("输入顺序不影响结果（segment_runs 拿 id 列表判内容没变）",
+          [r.text for r in bt.row_order([left, top, last, right])] == got)
+    tall = [400, 860, 900, 966]                          # 一个框装着两行
+    check("高框不和旁边的单行框串成一行（字高比 > 1.7）",
+          not tracksio.same_row(tall, [950, 860, 1200, 905]))
+    chain = [[0, 0, 100, 40], [110, 25, 210, 85], [220, 70, 320, 110]]   # 中间一个略高的框同时压着上下两行
+    check("三个框链式重叠（首尾不重叠）：不做传递闭包、不把上下两行串成一行",
+          tracksio.row_index(chain)[0] != tracksio.row_index(chain)[2], tracksio.row_index(chain))
+
+
+def t_cue_join() -> None:
+    """同句合并（`--cue-join on`，cue-shape 计划的 b）：并哪些、不并哪些、藏哪些成员。"""
+    print("同句合并：并 / 不并 / 藏")
+    from flowocr.analyze import build_tracks as bt
+    from flowocr.artifacts import tracksio
+
+    S = 1_000_000
+    TOL = S // 2
+
+    def run(text, t0, t1, y=900, x0=400, n=None, name=False):
+        r = bt.Run([x0, y, x0 + 40 * max(1, len(text)), y + 40], text, int(t0 * S), int(t1 * S), n if n is not None else max(1, int(2 * (t1 - t0))), 0.9)
+        r.nameplate = name
+        return r
+
+    def segs_of(rs, join=True):
+        return bt.cue_segments(rs, "segment", end_tol_us=TOL, join=join)
+
+    def texts(segs):
+        return [[r.text for r in a] for _, _, a in segs]
+
+    # 打字机半截：OCR 把 · / ・ 读得不一样、run 断了
+    l1 = run("そして館長は言い、", 0, 10, y=900)
+    half = run("飼育·展", 1.5, 3, y=960)             # 读到 3 次：不是杂行，得按"被接上"藏
+    full = run("飼育・展示することを決めたのです", 3, 10, y=960)
+    got = segs_of([l1, half, full])
+    check("半截行续上：并成一条，半截行留作成员", len(got) == 1 and {r.text for r in got[0][2]} == {l1.text, half.text, full.text}, texts(got))
+    check("半截行投影时藏（partial）", bt.seg_hide(*got[0], TOL)[1] == {id(half)}, bt.seg_hide(*got[0], TOL))
+    check("开头相似：短行错 1 个字照认，错 2 个不认", bt.head_similar("飼育·展", "飼育・展示することを")
+          and not bt.head_similar("飼育·展", "飼料が展示"))
+    check("以句末标点结尾的一行只认精确前缀（魔裁 `……どうして。` 和下一句 `どうしてユキちゃんは、`）",
+          not bt.head_similar("……どうして。", "どうしてユキちゃんは、") and bt.head_similar("君は私の凶器。", "君は私の凶器。大魔女を"))
+    check("句末标点读得不一样、后面没字了：照认（同一句重读）", bt.head_similar("Amazonにて販売中!", "Amazonにて販売中！"))
+    title, name = run("傭兵", 0, 20, y=860, n=40), run("シュラム", 0, 20, y=820, n=40)
+    lead2, line = run("がのオレ", 3, 4, n=2), run("がのオレでも、人間とフェイの関係が", 4, 19)
+    check("首帧碎片 + 一直在屏的短称号：并（称号同一条 run 接上就算）", any(lead2 in a and line in a for _, _, a in segs_of([title, name, lead2, line])))
+    a, b = run("……どうして。", 0, 2.6), run("どうしてユキちゃんは、", 2.6, 8)
+    check("说完的一句和下一句只差一个字：不并", len(segs_of([a, b])) == 2)
+    check("--cue-join off 等于原来的切分", texts(segs_of([l1, half, full], join=False))
+          == texts(bt.merge_growing_segments(bt.drop_slivers(bt.segment_runs([l1, half, full]), 150_000))))
+    # ▼ 一闪一灭（1 字、5 字的误读都算杂行）
+    for tri, y, hidden in (("0", 1000, True), ("un2ra", 900, True), ("un2ra", 1000, False)):
+        body = run("ありがとう、助かったよ。", 0, 8)
+        tip = run(tri, 3, 4, y=y, x0=1000, n=2)
+        got = segs_of([body, tip])
+        where = "和正文同一行" if y == 900 else "自成一行"
+        check(f"▼ 读成 `{tri}`（{where}）一闪：不切开；" + ("藏成杂行" if hidden else "≥ 3 字、自成一行的不藏（可能是晚打出来的真正文）"),
+              len(got) == 1 and (id(tip) in bt.seg_hide(*got[0], TOL)[0]) == hidden, texts(got))
+    # 名牌抖动、正文是同一条 run
+    body = run("それじゃあ、また明日ね。", 0, 8)
+    n1, n2 = run("ビリー", 0, 4, y=840, name=True), run("• ビU— •", 4, 8, y=840, name=True)
+    check("名牌抖动、正文同一条 run：并", len(segs_of([body, n1, n2])) == 1)
+    # 打字机首帧的 1–2 字碎片
+    lead = run("は", 0, 0.5, n=1)
+    rest = run("はじめまして、よろしくね。", 0.5, 6)
+    check("首帧碎片是后一行的前缀、正好在它出现时消失：并", len(segs_of([lead, rest])) == 1)
+    # 不并
+    a, b = run("今日はいい天気ですね。", 0, 5), run("明日は雨が降るそうです。", 5, 10)
+    check("两句不同：不并", len(segs_of([a, b])) == 2)
+    a, b = run("今日はいい天気ですね。", 0, 5), run("今日はいい天気ですね。", 6, 10)
+    check("同一句、中间空了超过容差：不并", len(segs_of([a, b])) == 2)
+    a, b = run("ありがとう！", 0, 5), run("ありがとう！", 5, 10)
+    na, nb = run("リン", 0, 5, y=840, name=True), run("ニコ", 5, 10, y=840, name=True)
+    check("换了说话人的同一句（正文换了 run、名牌不同）：不并", len(segs_of([a, b, na, nb])) == 2)
+    hud = run("矢を放つ", 0, 60, y=200, n=120)
+    dlg = run("ここから先は気をつけて進もう。", 10, 15)
+    check("常驻 HUD 行一直挂着、对话出现：不并进 HUD 那条（新行要和被接上的行一起消失）",
+          not any(len(a) == 2 and a[0].t_start == 0 for _, _, a in segs_of([hud, dlg]) if a[0] is hud and dlg in a and _ == 0), texts(segs_of([hud, dlg])))
+    old = run("REJECPREJEC", 0, 10, n=21)
+    sup = run("SUPPORTER", 9.5, 20, y=960, n=21)
+    new = run("REJECT", 10, 20, n=20)
+    check("长命行只有尾巴落在段里、正好在切点消失：不当杂行，换成别的字不并（wuwa 广告横幅）",
+          not any({old.text, new.text} <= {r.text for r in a} for _, _, a in segs_of([old, sup, new])), texts(segs_of([old, sup, new])))
+    big = run("でもご心配なく、ずばり地脈共鳴！この", 0, 20, x0=100)
+    frag = bt.Run([100 + 40 * 8, 900, 100 + 40 * 18, 940], "ずばり地脈共鳴！この", int(1 * S), int(2.5 * S), 3, 0.9)
+    frag.nameplate = False
+    got = segs_of([big, frag])
+    check("det 多切出来的碎片（框在另一行里、文本是它的一段）消失：不切开，藏成半截",
+          len(got) == 1 and id(frag) in bt.seg_hide(*got[0], TOL)[1], texts(got))
+    # 不变量：藏掉的半截行，同一行里留着一条看得见的顶替它的 run（peer 代码审 B1）
+    other = run("次の行のテキスト", 0, 7, y=960, n=14)
+    a1, a2 = run("同じ言葉です。", 0, 5, n=10), run("同じ言葉です。", 5, 7, n=4)    # 同文本断开，前一条更长
+    hide, part = bt.seg_hide(0, 7 * S, [a1, a2, other], TOL)
+    check("同文本断开、前一条更长：只藏一条，那一行还看得见", len({id(a1), id(a2)} & hide) == 1, (hide, part))
+    big2, small2 = run("おいおいー", 0, 1, n=2), run("おいおい", 1, 6, n=10)        # 杂行 + 它的碎片
+    hide, part = bt.seg_hide(0, 6 * S, [big2, small2, other], TOL)
+    check("杂行加上它的碎片：那一行留一条看得见的", id(small2) not in hide or id(big2) not in hide, (hide, part))
+    late = run("無事で何よりよ、ビリー", 5, 5.5, y=1100, n=1)
+    check("自成一行、晚打出来、只读到 1 次的正文（≥ 3 字）不藏", id(late) not in bt.seg_hide(0, 7 * S, [other, late], TOL)[0])
+    tip1 = run("0", 5, 5.5, y=1100, n=1)
+    check("自成一行的 1–2 字杂字（▼ 读成的 `0`）照藏", id(tip1) in bt.seg_hide(0, 7 * S, [other, tip1], TOL)[0])
+    j1, j2 = run("飼育·展示することを決めた", 0, 4, n=8), run("飼育・展示することを決めた", 4, 5, n=2)   # 抖动续接断得晚：前一条更长
+    hide, part = bt.seg_hide(0, 5 * S, [j1, j2, other], TOL)
+    check("OCR 抖动的续接断得晚（前一条更长）：只留一条可见，另一条是半截行", len({id(j1), id(j2)} & part) == 1, (hide, part))
+    o1, o2 = run("同時に読めた行です", 0, 6, n=12), run("同時に読めた行です", 1, 5, n=8)     # 同文本、时间重叠的两次读数
+    check("同文本、时间重叠的两次读数：只留一条", len({id(o1), id(o2)} & bt.seg_hide(0, 6 * S, [o1, o2, other], TOL)[0]) == 1)
+    c1, c2 = (run("キャッシュの行です", 0, 6, n=12), other), (run("キャッシュの行です", 0, 6, n=12), other)
+    bt._HIDE_CACHE[(0, 6 * S, TOL, tuple(id(r) for r in c2))] = (c1, ({-1}, {-1}))     # 同样的键、另一批对象（id 复用的情形）
+    check("seg_hide 的缓存：键对上但不是同一批 run 时不用缓存的结果", bt.seg_hide(0, 6 * S, list(c2), TOL) != ({-1}, {-1}))
+    host = run("飼育·展示することを決めた", 0, 3, x0=100, n=6)
+    jit = run("飼育・展示することを決めた", 3, 7, x0=100, n=8)
+    fr = bt.Run([100 + 40 * 4, 900, 100 + 40 * 10, 940], "することを", int(1 * S), int(2 * S), 3, 0.9)
+    fr.nameplate = False
+    hide, part = bt.seg_hide(0, 7 * S, [host, jit, fr, other], TOL)
+    check("碎片的宿主被藏、代表是抖动版：碎片也藏，不露半行", id(fr) in hide and id(jit) not in hide, (hide, part))
+    lv1, lv2 = run("Lv.90", 0, 7, x0=100, n=14), run("Lv.90", 2, 5, x0=1200, n=6)
+    check("同一高度、横向离得远的两处同样的字：都留着", not bt.seg_hide(0, 7 * S, [lv1, lv2, other], TOL)[0])
+    # 藏：同一行同文本的重复读数只留活得最久的；一行都不剩时不藏
+    w1, w2, w3 = run("取録", 0, 9, y=100, n=18), run("取録", 15, 20, y=100, n=10), run("KU100", 0, 30, y=60, n=60)
+    hide, partial = bt.seg_hide(0, 30 * S, [w1, w2, w3], TOL)
+    check("同一行文本相同的几条只留一条（消失得晚的那条）", partial == {id(w1)} and id(w2) not in hide, (hide, partial))
+    lone = run("x", 0, 1, n=1)
+    check("一段只有短命行时不藏", bt.seg_hide(0, 10 * S, [lone], TOL) == (set(), set()))
+    h1, h2 = run("0", 0, 0.5, n=1), run("0", 0.5, 1, n=1)                         # 代表也是 1–2 字的杂字：只撤杂行，半截行照藏
+    check("代表全被判成杂行时：杂行不藏，半截行照藏", bt.seg_hide(0, 10 * S, [h1, h2], TOL) == ({id(h1)}, {id(h1)}),
+          bt.seg_hide(0, 10 * S, [h1, h2], TOL))
+    from flowocr.artifacts import tracksio as _T
+    rdoc = {"events": [{"id": 0, "t_start": 0, "t_end": 1 * S}, {"id": 1, "t_start": 1 * S, "t_end": 5 * S}],
+            "tracks": [{"id": "r00", "cues": [{"id": "c0", "t_start": 0, "t_end": 5 * S, "events": [0, 1], "hide": [0], "partial": [0]}]}]}
+    before = _T.event_times(rdoc)
+    rdoc["events"][0]["t_start"] = 300_000                 # 回抠把半截行的首字挪到 0.3 s
+    _T.refresh_cue_bounds(rdoc, before)
+    check("合并后回抠：cue 起点跟着半截行回抠后的起点走（半截行仍是成员）", rdoc["tracks"][0]["cues"][0]["t_start"] == 300_000)
+    # 投影：cue 上的 hide / partial
+    doc = {"events": [{"id": i, "text": t, "flags": []} for i, t in enumerate(["半截", "全句", "▼"])]}
+    tr = {"ui_lines": []}
+    cue = {"events": [0, 1, 2], "hide": [0, 2], "partial": [0]}
+    check("cue_lines：剔 UI 的投影两类都不给，全部文字的视图只不给半截行",
+          [e["text"] for e in tracksio.cue_lines(doc, tr, cue)] == ["全句"]
+          and [e["text"] for e in tracksio.cue_lines(doc, tr, cue, drop_filtered=False)] == ["全句", "▼"])
+
+
 def t_ui_alarm_gate() -> None:
     """**报警的门必须低于剔除的门**（2026-09-19 实测踩到的一档）。
 
@@ -1097,6 +1363,49 @@ def t_band_regions() -> None:
           bt.MAIN_BAND_DEFAULT > 0, str(bt.MAIN_BAND_DEFAULT))
 
 
+def t_band_windows() -> None:
+    print("build_tracks.band_windows（--main-band-unit window）")
+    import statistics
+    from flowocr.analyze import build_tracks as bt
+    W, H, M = 1920, 1080, 60_000_000
+
+    def run(cy, h, t0):
+        return bt.Run([600, cy - h / 2, 1300, cy + h / 2], "あいうえお", int(t0), int(t0 + 2e6), 4, 0.9)
+
+    # 区域 1 是混合区域：窗 0 里是字幕带上的两行（cy 885、字高 42），窗 1、2 里是上方的大字（cy 460、字高 90），
+    # 整块的中位几何离主轨远（整块判不并），按窗拆开窗 0 那块就在带上
+    runs = ([run(885, 42, k * M + 1e6) for k in range(3)]          # 0–2：主轨
+            + [run(885, 42, 5e6), run(885, 42, 9e6)]               # 3–4：区域 1 的窗 0
+            + [run(460, 90, M + 1e6), run(460, 90, M + 5e6), run(460, 90, 2 * M + 1e6), run(460, 90, 2 * M + 5e6)])
+    ids = {0: [0, 1, 2], 1: [3, 4, 5, 6, 7, 8]}
+    feats = {ri: {"cy": statistics.median(runs[i].cy for i in v) / H,
+                  "h": statistics.median(runs[i].h for i in v) / H} for ri, v in ids.items()}
+    rep = [(0, "subtitle", feats[0]), (1, "dialogue-or-caption", feats[1])]
+    geom = {ri: bt.region_geom(runs, v) for ri, v in ids.items()}
+    check("整块判：混合区域不并", bt.band_regions(rep, 0, 3.0, need_x=True, geom=geom, W=W) == [])
+    got = bt.band_windows(runs, ids, rep, 0, {0}, M, 3.0, 0.7, 1.4, False, geom[0], W, H)
+    check("**按窗判：只并带上那个窗的 run**", got == {1: [3, 4]}, str(got))
+    # 块过了带、块里单条不在带上的不进来：窗 0 再加一条下方的小字（cy 1010、字高 25），块的中位几何仍在带上
+    runs2 = runs + [run(1010, 25, 7e6)]
+    ids2 = {0: [0, 1, 2], 1: [3, 4, 9, 5, 6, 7, 8]}
+    got2 = bt.band_windows(runs2, ids2, rep, 0, {0}, M, 3.0, 0.7, 1.4, False, geom[0], W, H)
+    check("**块过了带，成员逐条再过一次**：块里单条不在带上的不并", got2 == {1: [3, 4]}, str(got2))
+    check("--main-band-unit 只有 region / window（逐条 run 的对照臂量下来更差，已删）",
+          next(a for a in bt.make_parser()._actions if a.dest == "main_band_unit").choices == ("region", "window"))
+    check("已经整块并进来的区域不再拆", bt.band_windows(runs, ids, rep, 0, {0, 1}, M, 3.0, 0.7, 1.4, False, geom[0], W, H) == {})
+    check("label 闸门照样管按窗的块",
+          bt.band_windows(runs, ids, [(0, "subtitle", feats[0]), (1, "misc", feats[1])], 0, {0}, M,
+                          3.0, 0.7, 1.4, True, geom[0], W, H) == {})
+    # 下游"在不在主轨"按事件判：区域整块在主轨里，或事件带 band_merged（按窗补进来的）
+    from flowocr.artifacts import tracksio
+    check("**按窗补进来的事件算主轨**（区域不在 regions 里，靠 band_merged）",
+          tracksio.in_main({"region": 7, "flags": ["band_merged"]}, {0, 3}))
+    check("整块并进来的区域里的事件算主轨", tracksio.in_main({"region": 3, "flags": []}, {0, 3}))
+    check("同一块区域里没补进来的事件不算", not tracksio.in_main({"region": 7, "flags": []}, {0, 3}))
+    check("--main-band-unit 默认是 region（按窗是实验开关，翻默认归 owner）",
+          bt.make_parser().get_default("main_band_unit") == "region")
+
+
 def t_pick_main() -> None:
     """主轨：**排名和接受是两件事**，接受不了就没有主轨。
 
@@ -1179,6 +1488,13 @@ def t_audit7() -> None:
           bt.text_ui_lines(segs, args, {}) == set())
     check("`--ui-gate text` 真的关掉框位门",
           bt.ui_footprints([], 500_000, argparse.Namespace(ui_gate="text")) == set())
+    # 名牌保护绑时间窗（审计七 §3.8）：左上角常驻按钮 10 分钟里每分钟一条，第 0 条被误标成名牌——只放行它所在那个窗
+    auto = [bt.Run(box=[80, 20, 220, 60], text="オート再生", t_start=k * 60_000_000, t_end=k * 60_000_000 + 50_000_000,
+                   n_obs=100, conf=.9) for k in range(10)]
+    auto[0].nameplate = True
+    dargs = bt.make_parser().parse_args(["x.jsonl", "--outdir", "o"])
+    check("框位门的名牌保护只盖名牌标所在的那个窗（同一位置别的时段照判 UI）",
+          bt.ui_footprints(auto, 500_000, dargs) == set(range(2, 10)), sorted(bt.ui_footprints(auto, 500_000, dargs)))
 
     # ---- ④重分配：成员守恒 + 碎片化看得见（§2.1）----
     runs = [bt.Run(box=[100, 100 + 60 * k, 400, 130 + 60 * k], text=f"行{k}",
@@ -1348,11 +1664,21 @@ def t_audit7() -> None:
     check("共享服务不提供 det 时**返回 False**（调用方自己 spawn），不抛",
           cli._attach(fake_server({"ok": 0, "missing": ["det"], "models": ["rec"]}),
                       {"det": "x.onnx"}) is False)
-    check("服务给得出就接上去",
-          cli._attach(fake_server({"ok": 1, "models": ["rec"], "provider": "CUDAExecutionProvider",
-                                   "device": "gpu"}), {"rec": "x.onnx"}) is True)
-    check("接上之后记下服务实际用的 provider（进 _meta.ort，追溯设备）",
+    _addr = fake_server({"ok": 1, "models": ["rec", "det"], "device": "gpu",
+                         "providers": {"rec": "CUDAExecutionProvider", "det": "TensorrtExecutionProvider"}})
+    check("服务给得出就接上去；记下连的是哪个服务（合并几个进程的服务端累计数时分组用）",
+          cli._attach(_addr, {"rec": "x.onnx"}) is True and cli.server_id == _addr)
+    check("接上之后记下服务给**这个 client 的模型**实际用的 provider（进 _meta.ort，追溯设备；det 走 TRT 不串到 rec 上）",
           cli.provider == "CUDAExecutionProvider")
+    check("默认拓扑下 client 带着两个模型时，追溯设备按模型取（det 退回 CUDA、rec 走 TRT 时各是各的）",
+          cli.provider_for("det") == "TensorrtExecutionProvider" and cli.provider_for("rec") == "CUDAExecutionProvider")
+    check("几个模型 provider 不同时用 + 连起来",
+          oc.provider_of({"providers": {"det": "TensorrtExecutionProvider", "rec": "CUDAExecutionProvider"}}, ["det", "rec"])
+          == "TensorrtExecutionProvider+CUDAExecutionProvider")
+    import io as _io
+    check("ready 行之前的提示行（缺 TRT 引擎时现建）跳过，读到的是 ready 那行",
+          oc.read_ready(_io.StringIO('{"note": "[trt] 建 det"}\nnative noise\n{"ready": 1, "providers": {}}\n')).get("ready") == 1
+          and oc.read_ready(_io.StringIO("Traceback boom\n")) == {"line": "Traceback boom\n"})
     cli.f.close()
     cli.sock.close()
     check("**设备对不上就不接**（服务是 CPU 的、这个 client 要 GPU）：返回 False，自己 spawn",
@@ -1622,6 +1948,10 @@ def t_rejoin_split() -> None:
     check("振り仮名：中心正下方（±1 字）没有汉字的不标（片假名名字 / 称号压在假名或片假名上，peer 审查 edb5cc4）",
           bt.ruby_runs([kata, R([610, 786, 700, 814], "ここ")]) == set()
           and bt.ruby_runs([kata, R([1210, 786, 1300, 814], "みな")]) == {1})
+    label = R([800, 812, 1000, 852], "聖火競技場")                     # 地图地名：5 字的短标签，注音整词居中
+    check("振り仮名：居中只在正文是正文长度（≥ BODY_CLEN 内容字）时当名牌不标；短标签上整词居中的注音照标（gi1 留出检验）",
+          bt.ruby_runs([label, R([790, 786, 1010, 814], "せいかきょうぎじょう")]) == {1}
+          and 2 not in bt.ruby_runs(runs))
     from flowocr.output import script as OVL
     rdoc = {"events": [{"id": 0, "text": "こんれいいん", "flags": ["ruby"], "box": [600, 786, 684, 814], "region": 0,
                         "t_start": 0, "t_end": 1_000_000},
@@ -1688,26 +2018,42 @@ def t_cluster_lines() -> None:
     b2 = SL.band_cooccur(lines_, sig_, rr, [0, 1, 2])
     check("--cluster lines：同刻在场的上下两行（锚类型不同）并成一条带，从不同时在场的相邻行不并",
           b2[0] == b2[1] and b2[2] not in (b2[0], b2[1]), b2)
+    # 聚类的尺的 S5（同刻相邻行）：只看几何和时间——同时在场的上下行进候选；不同时在场的、同一行左右两段、隔得远的都不进
+    from types import SimpleNamespace as _NS
+    from flowocr.analyze import slot_pairs as SP
+    r5 = [bt.Run(box=[600, 900, 1300, 936], text="一行目です", t_start=0, t_end=4_000_000, n_obs=5, conf=.9),
+          bt.Run(box=[650, 950, 1250, 986], text="二行目です", t_start=500_000, t_end=4_000_000, n_obs=5, conf=.9),
+          bt.Run(box=[650, 1000, 1250, 1036], text="あとの行です", t_start=5_000_000, t_end=8_000_000, n_obs=5, conf=.9),
+          bt.Run(box=[1310, 900, 1600, 936], text="同じ行の右側", t_start=0, t_end=4_000_000, n_obs=5, conf=.9),
+          bt.Run(box=[600, 300, 1300, 336], text="遠くの行です", t_start=0, t_end=4_000_000, n_obs=5, conf=.9)]
+    adj = SP.adjacent_pairs(_NS(runs=r5))
+    check("尺·S5 候选：同时在场的上下相邻行才进（不同时在场、同一行、隔得远的不进）",
+          [(i, j) for i, j, _ in adj] == [(0, 1)] and 500_000 <= adj[0][2] <= 4_000_000, adj)
 
     # 回抠结算救回被回补作废的结尾证据（--refine-salvage-end）
     import json as _json
     from flowocr.analyze import refine_boundaries as RBS
     with tempfile.TemporaryDirectory() as td:
         op = Path(td) / "o.jsonl"
-        off = {"lo": 0, "hi": 60, "last_idx": 30, "stale": True}
+        off = {"lo": 0, "hi": 60, "last_idx": 30, "stale": True, "text": "あ"}
         rows = [{"_meta": {"stride": 30, "src_fps": 60.0}},
                 {"frame": 30, "t_us": 500_000, "box": [0, 0, 100, 30], "text": "あ", "conf": .9, "edge": {"off": off}},
                 {"frame": 60, "t_us": 1_000_000, "box": [0, 100, 100, 130], "text": "い", "conf": .9,
-                 "edge": {"off": {**off, "last_idx": 60, "short": True}}}]
+                 "edge": {"off": {**off, "last_idx": 60, "short": True, "text": "い"}}},
+                # 换句那条路：回补把挂证据的这一行也改成了新句（行上 `う`、证据量的是旧句 `え`）——模板帧上已经是新句
+                {"frame": 30, "t_us": 500_000, "box": [0, 200, 100, 230], "text": "う", "conf": .9,
+                 "edge": {"off": {**off, "text": "え"}}}]
         op.write_text("\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
         jobs = lambda: [{"run": {"t_start": 0, "t_end": 1_000_000, "box": [0, 0, 100, 30]}},   # noqa: E731
-                        {"run": {"t_start": 0, "t_end": 1_500_000, "box": [0, 100, 100, 130]}}]
+                        {"run": {"t_start": 0, "t_end": 1_500_000, "box": [0, 100, 100, 130]}},
+                        {"run": {"t_start": 0, "t_end": 1_000_000, "box": [0, 200, 100, 230]}}]
         j0, j1 = jobs(), jobs()
         s0 = RBS.refine_from_obs(j0, op, 1e6 / 60, 500_000, salvage_stale_end=False)
         s1 = RBS.refine_from_obs(j1, op, 1e6 / 60, 500_000, salvage_stale_end=True)
-        check("回抠·救回作废的结尾证据：关了不认领；开了认领窗口凑齐的那条（作废标去掉）、窗口不全的仍不认",
+        check("回抠·救回作废的结尾证据：关了不认领；开了认领窗口凑齐、挂它的行没被改写的那条（作废标去掉）；"
+              "窗口不全的、挂它的行被回补改成别的文本的仍不认",
               s0["jobs_with_off"] == 0 and s1["jobs_with_off"] == 1 and s1["jobs_with_off_salvaged"] == 1
-              and j1[0]["ev_off"]["stale"] is False and "ev_off" not in j1[1], (s0, s1))
+              and j1[0]["ev_off"]["stale"] is False and "ev_off" not in j1[1] and "ev_off" not in j1[2], (s0, s1))
 
     # 匹配器的相邻合并按来源区域各自判（nonoise 喂法把各区域的 cue 交错着喂）
     from flowocr.analyze import scriptmatch as SM
@@ -1754,6 +2100,14 @@ def t_cluster_lines() -> None:
             (2, [ev(2, [100, 120, 600, 148], 1_000_000, 1_500_000), ev(3, [100, 150, 600, 178], 1_000_000, 1_500_000)])]
     check("叠加·画的框换成行数更多的那条时，段里已有的也要和新框同处，不同处就另起一段",
           [[e["id"] for e in evs] for evs, _, _, _ in SM.position_segments(swap, dcues, 0, 1_500_000)] == [[0, 1], [2, 3]])
+    still = {"id": 9, "box": [586, 735, 692, 770], "t_start": 0, "t_end": 9_000_000}
+    scroll = {**still, "boxes": [[0, [586, 963, 692, 999]], [500_000, [588, 739, 690, 768]], [1_000_000, [586, 735, 692, 770]],
+                                 [1_500_000, [586, 677, 692, 713]], [2_000_000, [586, 663, 692, 713]], [5_000_000, [584, 735, 694, 780]]]}
+    check("叠加·名牌层：不动的事件一段（框和起止就是事件的）；在动的沿轨迹按位置切段、同处的并成一段、首尾贴事件的起止（星铁对话记录里的 `ドロシー`）",
+          SM.event_segments(still) == [([586, 735, 692, 770], 0, 9_000_000)]
+          and [(a, b) for _, a, b in SM.event_segments(scroll)]
+          == [(0, 500_000), (500_000, 1_500_000), (1_500_000, 5_000_000), (5_000_000, 9_000_000)],
+          SM.event_segments(scroll))
     check("叠加·打字机长字（小框落进大框）不切，只有一段时起止就是记录的起止",
           [(a, b) for _, _, a, b in SM.position_segments(grow + [(2, [])], pcues, 983_000, 1_533_000)]
           == [(983_000, 1_533_000)])

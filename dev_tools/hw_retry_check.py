@@ -47,7 +47,8 @@ VIDEO = str(archive_root() / "gamestream/slices/wuwa-s2.mp4")     # h264：硬�
 OUT = Path("tmp/hwretry/out.jsonl")
 ORPHAN = Path("tmp/hwretry/orphan.pid")
 OUT.parent.mkdir(parents=True, exist_ok=True)
-PY = str(CODE / ".venv/Scripts/python.exe")   # 开发 venv（2026-09-22 起驱动脚本只认它；旧的 旧的 paddleocr 实验 venv 已不用）
+PY = str(next((p for p in (CODE / ".venv/Scripts/python.exe", CODE / ".venv/bin/python") if p.exists()),
+               CODE / ".venv/Scripts/python.exe"))   # 开发 venv（Windows 的 Scripts、Linux 的 bin）
 
 
 def alive(pid: int, ct: float) -> bool:

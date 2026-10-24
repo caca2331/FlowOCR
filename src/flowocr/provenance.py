@@ -8,7 +8,7 @@
 
 ⚠ 这次统一让所有产物的 `code_fp` 都变了（表的格式变了，不只是内容）。它证明的是代码身份，
 证明不了新旧代码行为等价——迁移验收靠产物级对账（同一份 obs 重建、`obs_identical` / `obs_textdiff`），
-不靠指纹相同。改动前的五个指纹记在 project-structure 账本。
+不靠指纹相同。改动前的五个指纹记在 project-structure 账本（已删；归档的 project-structure 计划开头写了怎么回查）。
 
 `git_head` 只在源码 checkout / worktree 里有意义；安装态下没有仓库，返回 `"?"`。
 """

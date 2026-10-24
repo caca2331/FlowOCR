@@ -68,8 +68,132 @@ def ncc(a: np.ndarray, b: np.ndarray) -> float:
     return float((a * b).sum() / d) if d > 1e-6 else 0.0
 
 
+# uint8 灰度上的中位数 / 95 分位用 256 格直方图算（2026-10-16，rec-workload 计划）：回抠线程里 `polarity` 原来占约 15%，
+# 直方图版快约 10 倍；取哪两个次序统计量、怎么插值逐步照抄 numpy 2.x 的 median / percentile（linear），随机与偏态数组 2 万例逐位相同。
+_Q95 = np.true_divide(95, 100)
+
+
+def _order(c: np.ndarray, k: int) -> int:
+    """累计计数 `c`（下标 = 值）里排序后第 k 个（0 起）元素的值。"""
+    return int(np.searchsorted(c, k, side="right"))
+
+
+def _u8_median_int(img: np.ndarray, c: np.ndarray | None = None) -> int:
+    """`int(np.median(img))`，img 是 uint8。"""
+    if c is None:
+        c = np.cumsum(np.bincount(img.ravel(), minlength=256))
+    n = img.size
+    return _order(c, n // 2) if n % 2 else (_order(c, n // 2 - 1) + _order(c, n // 2)) // 2
+
+
+def _pct95(h: np.ndarray):
+    """计数 `h[d]`（值 d 的个数，按 int16 数组算）上的 `np.percentile(·, 95)`：同 numpy 的 linear 与 `_lerp`。"""
+    c = np.cumsum(h)
+    n = int(c[-1])
+    v = (n - 1) * _Q95
+    lo = int(np.floor(v))
+    if v >= n - 1:
+        return np.float64(np.int16(_order(c, n - 1)))
+    g = v - np.float64(lo)
+    a, b = np.int16(_order(c, lo)), np.int16(_order(c, lo + 1))
+    d = b - a
+    return b - d * (1 - g) if g >= 0.5 else a + d * g
+
+
+def _u8_median_f32(u: np.ndarray) -> np.float32:
+    """`np.median(u.astype(np.float32))`，u 是非空 uint8。"""
+    c = np.cumsum(np.bincount(u.ravel(), minlength=256))
+    n = u.size
+    return np.float32(_order(c, n // 2)) if n % 2 else np.float32((_order(c, n // 2 - 1) + _order(c, n // 2)) / 2)
+
+
+def _u8_rowmedian_f32(x: np.ndarray) -> np.ndarray:
+    """`np.median(x.astype(np.float32), axis=1)`，x 是 (行, 列≥1) 的 uint8：每行一份直方图、一次 bincount。"""
+    r, n = x.shape
+    h = np.bincount((x + (np.arange(r, dtype=np.intp) * 256)[:, None]).ravel(), minlength=256 * r).reshape(r, 256)
+    c = np.cumsum(h, axis=1)
+    hi = (c > n // 2).argmax(axis=1)
+    if n % 2:
+        return hi.astype(np.float32)
+    return ((c > n // 2 - 1).argmax(axis=1) + hi).astype(np.float32) / np.float32(2)
+
+
+def _first_unlike_ref(frames: np.ndarray) -> int | None:
+    """`_first_unlike` 的原式（离门限近时退回它）。"""
+    stds = frames.std(axis=(1, 2))
+    if not stds[0] >= 1.0:
+        return None
+    F = frames.astype(np.float32).astype(np.float64)
+    A = F - F.mean(axis=(1, 2))[:, None, None]
+    den = np.sqrt((A * A).sum(axis=(1, 2))) * np.sqrt((A[0] * A[0]).sum())
+    num = (A * A[0]).sum(axis=(1, 2))
+    cc = np.where(den > 1e-6, num / np.where(den > 1e-6, den, 1.0), 0.0)
+    hit = np.nonzero((stds >= 1.0) & (cc < EMPTY_THR))[0]
+    return int(hit[0]) if hit.size else None
+
+
+def _first_unlike(frames: np.ndarray) -> int | None:
+    """(帧, 行, 列) 的 uint8 叠里第一帧"有内容（std ≥ 1）且和首帧的相关系数 < `EMPTY_THR`"的下标；首帧 std < 1 就 None。
+    用整数矩算：Σx、Σx²、Σx·x₀ 走 float64 求和 / 点积，每一步都是 < 2^53 的整数、精确；std 和相关系数由它们直接得出。
+    有一帧离两道门限近到原式的浮点可能差最后一位（相对差 ≤ 1e-6）就整叠退回原式（`_first_unlike_ref`），所以结果逐位同原式。
+    原式对整叠做 float64 去均值和逐元素乘，占 `signals` 一半多（2026-10-16，rec-workload 计划）。"""
+    t = frames.reshape(len(frames), -1)
+    n = t.shape[1]
+    if n == 0 or len(frames) == 0 or frames.dtype != np.uint8 or n > 10_000_000:
+        return _first_unlike_ref(frames)                 # 整数矩精确的前提：uint8；n²·65025 装得进 int64（n < 约 1.19e7）
+    f = t.astype(np.float64)
+    s = f.sum(axis=1).astype(np.int64)
+    d = n * np.einsum("ij,ij->i", f, f).astype(np.int64) - s * s      # n² × 方差
+    nn = n * n
+    if (np.abs(d - nn) <= nn * 1e-6).any():
+        return _first_unlike_ref(frames)
+    big = d >= nn
+    if not big[0]:
+        return None
+    cov = n * (f @ f[0]).astype(np.int64) - s * s[0]
+    cc = np.where(d > 0, cov / (np.sqrt(np.maximum(d, 1).astype(np.float64)) * np.sqrt(float(d[0]))), 0.0)
+    if (big & (np.abs(cc - EMPTY_THR) <= 1e-6)).any():
+        return _first_unlike_ref(frames)
+    hit = np.nonzero(big & (cc < EMPTY_THR))[0]
+    return int(hit[0]) if hit.size else None
+
+
+def _hits(frames: np.ndarray, ref: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+    """(帧, 像素)：`ys, xs` 那些像素上和 `ref` 差 ≤ `GLYPH_TOL`。只碰字形像素、不对整叠做 int16 减法；
+    uint8 上直接比上下界（同 `|帧 − ref| ≤ GLYPH_TOL`）。"""
+    if frames.dtype != np.uint8 or not isinstance(GLYPH_TOL, int):     # 非整数容差时 uint8 上下界会截断
+        return np.abs(frames[:, ys, xs].astype(np.int16) - ref[ys, xs].astype(np.int16)) <= GLYPH_TOL
+    g = (frames.reshape(len(frames), -1)[:, ys * frames.shape[2] + xs] if frames.flags.c_contiguous
+         else frames[:, ys, xs])
+    r = ref[ys, xs].astype(np.int16)
+    return (g >= np.maximum(r - GLYPH_TOL, 0).astype(np.uint8)) & (g <= np.minimum(r + GLYPH_TOL, 255).astype(np.uint8))
+
+
+def ncc_to(tpl: np.ndarray):
+    """`lambda a: ncc(a, tpl)`，模板那一侧（去均值、范数）只算一次：同一模板比很多帧时用，逐位同 `ncc`。"""
+    if tpl.size == 0:
+        return lambda a: 0.0
+    b = tpl.astype(np.float32) - tpl.mean()
+    nb = np.linalg.norm(b)
+
+    def f(a: np.ndarray) -> float:
+        if a.shape != b.shape:
+            return 0.0
+        a = a.astype(np.float32) - a.mean()
+        d = float(np.linalg.norm(a) * nb)
+        return float((a * b).sum() / d) if d > 1e-6 else 0.0
+    return f
+
+
 def polarity(img: np.ndarray) -> bool:
     """True = 亮字。看的是更极端的那一侧（偏离量的 95 分位）——一行里字占的像素最多。"""
+    if img.dtype == np.uint8 and img.size:
+        h = np.bincount(img.ravel(), minlength=256)
+        med = _u8_median_int(img, np.cumsum(h))
+        hb, hd = h[med + 1:], h[:med][::-1]              # 亮侧偏离 1..255-med、暗侧偏离 1..med（下标 0 补一个空格）
+        pb = _pct95(np.concatenate(([0], hb))) if hb.sum() else 0
+        pd = _pct95(np.concatenate(([0], hd))) if hd.sum() else 0
+        return bool(pb >= pd)
     dev = img.astype(np.int16) - int(np.median(img))
     bright, dark = dev[dev > 0], -dev[dev < 0]
     return bool((np.percentile(bright, 95) if bright.size else 0) >= (np.percentile(dark, 95) if dark.size else 0))
@@ -78,7 +202,7 @@ def polarity(img: np.ndarray) -> bool:
 def glyph_mask(tpl: np.ndarray, bright: bool | None = None) -> np.ndarray:
     """模板里算字形的像素：只取字那一侧的极性——两侧都算会把描边、底板边缘、背景纹理收进来。"""
     t = tpl.astype(np.int16)
-    dev = t - int(np.median(t))
+    dev = t - (_u8_median_int(tpl) if tpl.dtype == np.uint8 and tpl.size else int(np.median(t)))
     if bright is None:
         bright = polarity(tpl)
     return dev >= GLYPH_DIFF if bright else dev <= -GLYPH_DIFF
@@ -87,10 +211,11 @@ def glyph_mask(tpl: np.ndarray, bright: bool | None = None) -> np.ndarray:
 def glyph_score(frames: np.ndarray, tpl: np.ndarray, bright: bool | None = None) -> np.ndarray:
     """逐帧：模板字形像素里，和模板差 ≤ `GLYPH_TOL` 的比例。字形像素太少（< 20）就全是 NaN。"""
     mask = glyph_mask(tpl, bright)
-    if mask.sum() < 20:
+    m = int(mask.sum())
+    if m < 20:
         return np.full(len(frames), np.nan)
-    t = tpl.astype(np.int16)
-    return (np.abs(frames.astype(np.int16) - t)[:, mask] <= GLYPH_TOL).mean(axis=1)
+    ys, xs = np.nonzero(mask)
+    return np.count_nonzero(_hits(frames, tpl, ys, xs), axis=1) / m      # 布尔均值本来就是"计数 / 个数"，逐位同 .mean
 
 
 def last_onset(ok) -> int | None:
@@ -137,15 +262,16 @@ def cell_fit(frames: np.ndarray, ts: list[int], x0: int, x1: int, n_chars: int) 
         return None
     k = len(frames) - 1
     mask = glyph_mask(frames[k], polarity(frames[k]))
-    close = np.abs(frames.astype(np.int16) - frames[k].astype(np.int16)) <= GLYPH_TOL
+    px, py = np.nonzero(mask.T)                       # 字形像素按列排：每格是一段连续的切片
+    close = _hits(frames, frames[k], py, px)
     cw = (x1 - x0) / n_chars
     xs, ys = [], []
     for c in range(n_chars):
-        a, b = int(round(x0 + c * cw)), int(round(x0 + (c + 1) * cw))
-        m = mask[:, a:b]
-        if m.sum() < CELL_MIN_PX:
+        lo, hi, _ = slice(int(round(x0 + c * cw)), int(round(x0 + (c + 1) * cw))).indices(mask.shape[1])
+        i0, i1 = np.searchsorted(px, (lo, hi))
+        if i1 - i0 < CELL_MIN_PX:
             continue
-        o = last_onset(close[:, :, a:b][:, m].mean(axis=1) >= GLYPH_THR)
+        o = last_onset(np.count_nonzero(close[:, i0:i1], axis=1) / (i1 - i0) >= GLYPH_THR)
         if o is not None:
             xs.append(c)
             ys.append(ts[o])
@@ -259,16 +385,8 @@ def signals(frames: np.ndarray, ts: list[int], inner: tuple[int, int, int, int],
     cell = max(1, y1 - y0)                              # CJK 一个字宽 ≈ 字高
     # 旧判据：整框不像窗口首帧。常量图的相关系数恒为 0（C5），一律"不像"——那不是证据，不给候选。
     # 整叠一次算（原来逐帧调 ncc，占 signals 的 2/3；两遍合一遍之后它跑在 OCR 旁边的线程里，2026-09-16）
-    first_old = None
-    stds = frames.std(axis=(1, 2))
-    if stds[0] >= 1.0:
-        F = frames.astype(np.float32).astype(np.float64)
-        A = F - F.mean(axis=(1, 2))[:, None, None]
-        den = np.sqrt((A * A).sum(axis=(1, 2))) * np.sqrt((A[0] * A[0]).sum())
-        num = (A * A[0]).sum(axis=(1, 2))
-        cc = np.where(den > 1e-6, num / np.where(den > 1e-6, den, 1.0), 0.0)
-        hit = np.nonzero((stds >= 1.0) & (cc < EMPTY_THR))[0]
-        first_old = ts[int(hit[0])] if hit.size else None
+    i = _first_unlike(frames)
+    first_old = ts[i] if i is not None else None
     # 首字格"开始出现"（极性按整行判：一格里立绘占得多时，格内判会判成立绘的暗边）
     head = frames[:, :, :x0 + cell]
     r = rise_onset(glyph_score(head, head[k], polarity(frames[k])))
@@ -356,14 +474,17 @@ def contrast_curves(frames: np.ndarray, inner: tuple[int, int, int, int], n_char
         a, b = int(round(x0 + c * cw)), int(round(x0 + (c + 1) * cw))
         if b - a < 2:
             continue
-        t = tpl[y0:y1, a:b].astype(np.float32)
-        dev = t - np.median(t)
+        u = tpl[y0:y1, a:b]
+        t = u.astype(np.float32)
+        u8 = u.dtype == np.uint8                     # 整数值上的中位数走直方图（见 `polarity` 上面），逐位相同
+        dev = t - (_u8_median_f32(u) if u8 and u.size else np.median(t))
         m = dev >= GLYPH_DIFF if bright else dev <= -GLYPH_DIFF
         if m.sum() < CELL_MIN_PX or (~m).sum() < CELL_MIN_PX:
             continue
-        denom = t[m] - np.median(t[~m])
-        seg = frames[:, y0:y1, a:b].astype(np.float32)
-        bg = np.median(seg[:, ~m], axis=1)
+        denom = t[m] - (_u8_median_f32(u[~m]) if u8 else np.median(t[~m]))
+        useg = frames[:, y0:y1, a:b]
+        seg = useg.astype(np.float32)
+        bg = _u8_rowmedian_f32(useg[:, ~m]) if u8 else np.median(seg[:, ~m], axis=1)
         out.append(np.clip(np.median((seg[:, m] - bg[:, None]) / denom[None, :], axis=1), -0.5, 1.5))
     return out
 

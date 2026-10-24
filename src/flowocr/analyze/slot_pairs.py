@@ -11,6 +11,13 @@
     S3  近邻异槽对 基准臂里不同槽、但 y 区间重叠且 x 相交——给**基准臂**的误拆分率的底
                    （⚠ 随机异槽对几乎全是"显然不同"，没信息；所以这个率是"近邻里的"，不是全体的）
     S4  窗内对     同一个窗区域里的两条 run——量窗内聚类
+    S5  同刻相邻行 同时在场（时间重叠 ≥ 较短那条的一半）、上下相邻、横向有重叠的两条 run——**不照任何臂抽**，
+                   各臂在它上面是同一个率；量的是"同一个框里的几行是不是一条轨"（`lines` 在产物上掉覆盖的形状，
+                   原来的四层很少抽到这种对）。`sample-adjacent`
+
+**`lines` / `learned` 两条臂量的是管线的最终分组**（`pipeline_assign`，和 `build_tracks --cluster` 调同一个函数）：
+行位 -> 带之后，`lines` 再并同刻同框的上下行，两者的散 run 回落到缝合分组。2026-10-05 之前量的是 `slot_lines.assign` /
+`slot_learned.assign`（不并同刻行、散 run 各自成单例），那时的读数不是管线里的算法。
 
 ⚠ **每条臂在照自己抽的样本上都最差**（S2 只照得见基准臂的误合并、S3 只照得见它的误拆分）。比两条臂，要两条臂各当一次基准、
 合起来报（cluster-ruler 计划的更正框）。行级算法没有窗区域，用 `sample-learned` / `sample-lines`（run 级的 S1 / S2 / S3）。
@@ -24,7 +31,8 @@
 用法：
     python -m flowocr.analyze.slot_pairs sample f5 --n 40 --seed 1            # 抽样 + 摆帧（要 ffmpeg、PIL）
     python -m flowocr.analyze.slot_pairs sample-learned f5 --seed 4           # 照 slot_learned 自己的聚类抽（run 级、留这一部片子不训）
-    python -m flowocr.analyze.slot_pairs sample-lines f5 --n 25 --seed 5      # 照 slot_lines 的行位抽（run 级）
+    python -m flowocr.analyze.slot_pairs sample-lines f5 --n 25 --seed 5      # 照 --cluster lines 的分组抽（run 级）
+    python -m flowocr.analyze.slot_pairs sample-adjacent zzz --n 20 --seed 6  # S5：同刻相邻行（不照任何臂）
     python -m flowocr.analyze.slot_pairs merge data/gt/slotpairs-f5-s1.json tmp/slotpairs/f5/labels.json --by sonnet
     python -m flowocr.analyze.slot_pairs score data/gt/slotpairs-*.json       # 各臂的误合并 / 误拆分
 """
@@ -162,10 +170,11 @@ def box_at(r, t_us: float) -> list[float]:
     return past[-1] if past else r.boxes[0][1]
 
 
-def panel(L, r, tag: str):
-    """一侧：上面是整帧（960 宽）+ 黄框，下面是框周围的放大条。"""
+def panel(L, r, tag: str, t: float | None = None):
+    """一侧：上面是整帧（960 宽）+ 黄框，下面是框周围的放大条。`t`（秒）缺省 = 这条 run 自己的时刻。"""
     from PIL import Image, ImageDraw
-    t = (r.t_start + min(r.t_end, r.t_start + 4_000_000)) / 2e6   # 长驻的取前 4 秒的中点
+    if t is None:
+        t = (r.t_start + min(r.t_end, r.t_start + 4_000_000)) / 2e6   # 长驻的取前 4 秒的中点
     im = grab(L.video, t)
     sc = 960 / im.width
     small = im.resize((960, round(im.height * sc)))
@@ -188,7 +197,8 @@ def panel(L, r, tag: str):
 
 def render(L, pair: dict, dest: Path) -> None:
     from PIL import Image
-    a, b = (panel(L, L.runs[i], s) for i, s in zip(pair["runs"], "AB"))
+    t = pair.get("t_us")                    # S5 的两条同时在场：两侧摆同一帧
+    a, b = (panel(L, L.runs[i], s, None if t is None else t / 1e6) for i, s in zip(pair["runs"], "AB"))
     im = Image.new("RGB", (a.width + b.width + 8, max(a.height, b.height)), (24, 24, 24))
     im.paste(a, (0, 0))
     im.paste(b, (a.width + 8, 0))
@@ -281,77 +291,118 @@ def sample_runs(L, base: dict[int, int], other: dict[int, int], n: int, seed: in
     return out
 
 
+def pipeline_assign(L, kind: str, model=None) -> dict[int, int]:
+    """`build_tracks --cluster <kind>` 的最终分组：run 下标 -> 区域号。缝合用 `L` 的生效参数（同管线），
+    之后调管线自己那个函数（`slot_learned.cluster_groups`）——尺量的就是管线产出的分组，不是另抄一份算法。
+    `model`：learned 用的模型（尺传留一部片子训的；缺省 = 随代码走的那个）。"""
+    from flowocr.analyze import slot_learned
+    slot_of_run = {i: k for k, sl in enumerate(CL.stitch(L)) for w in sl for i in L.win_regions[w]["runs"]}
+    groups = slot_learned.cluster_groups(kind, L.runs, L.W, L.H, slot_of_run, L.tag, model=model)
+    return {i: g for g, ids in enumerate(groups) for i in ids}
+
+
+def median_other(L) -> dict[int, int | None]:
+    """run 下标 -> 默认臂（`median` 缝合）的槽号；run 级抽样的 S1（分歧对）拿它当对照。"""
+    med = assignment(L, CL.stitch(L, **ARMS["median"]))
+    return {i: med.get((r.t_start, r.t_end, r.text, tuple(round(v) for v in r.box))) for i, r in enumerate(L.runs)}
+
+
+def write_run_sample(L, a, pairs: list[dict], head: dict) -> int:
+    """run 级抽样（`sample-learned` / `sample-lines` / `sample-adjacent`）的共同落盘：摆帧、真值文件、给标注者的盲清单。"""
+    root = paths.data_root()
+    imgdir = root / "tmp" / "slotpairs" / a.tag
+    imgdir.mkdir(parents=True, exist_ok=True)
+    dest = root / "data" / "gt" / f"slotpairs-{a.tag}-s{a.seed}.json"
+    if dest.exists() and not a.force:
+        raise SystemExit(f"{dest} 已存在；要覆盖给 --force")
+    items = []
+    for n_, p_ in enumerate(pairs):
+        pid = f"{a.tag}-s{a.seed}-{n_:03d}"
+        render(L, p_, imgdir / f"{pid}.jpg")
+        ra, rb = (L.runs[i] for i in p_["runs"])
+        items.append({"id": pid, "image": f"tmp/slotpairs/{a.tag}/{pid}.jpg",
+                      "a": {"key": run_key(ra), "win": int(ra.t_start // 60_000_000)},
+                      "b": {"key": run_key(rb), "win": int(rb.t_start // 60_000_000)},
+                      "label": None, "labeled_by": None, "note": "",
+                      "stratum": p_["stratum"], "together": p_["together"]}
+                     | ({"t_us": p_["t_us"]} if "t_us" in p_ else {}))
+    doc = {"schema": SCHEMA, "tag": a.tag, "video": L.video, "obs": str(L.obs), "seed": a.seed, **head,
+           "split": a.split, "filter": {"min_content": MIN_CONTENT, "min_obs": MIN_OBS}, "items": items}
+    dest.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+    view = [{"id": it["id"], "image": it["image"], "a_text": it["a"]["key"][3], "b_text": it["b"]["key"][3]} for it in items]
+    (imgdir / f"to-label-s{a.seed}.json").write_text(json.dumps(view, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"{len(items)} 对 -> {dest}")
+    return 0
+
+
 def cmd_sample_learned(a) -> int:
-    """照 `slot_learned` 自己的聚类抽样（模型**留这一部片子不训**），给它报绝对错误率。"""
+    """照 `--cluster learned` 的分组抽样（模型**留这一部片子不训**），给它报绝对错误率。"""
     from flowocr.analyze import pair_model
     from flowocr.analyze import slot_learned
-    root = paths.data_root()
     L = CL.load(a.tag)
     X, y, meta, _ = pair_model.load(a.train.split(","))
     keep = [k for k, m in enumerate(meta) if m[0] != a.tag]
     model = slot_learned.fit(X[keep][:, slot_learned.COLS], y[keep])
-    base = slot_learned.assign(L, model, verbose=True)
-    med = assignment(L, CL.stitch(L, **ARMS["median"]))
-    other = {i: med.get((r.t_start, r.t_end, r.text, tuple(round(v) for v in r.box))) for i, r in enumerate(L.runs)}
-    pairs = sample_runs(L, base, other, a.n, a.seed)
-    imgdir = root / "tmp" / "slotpairs" / a.tag
-    imgdir.mkdir(parents=True, exist_ok=True)
-    items = []
-    for n_, p_ in enumerate(pairs):
-        pid = f"{a.tag}-s{a.seed}-{n_:03d}"
-        render(L, p_, imgdir / f"{pid}.jpg")
-        ra, rb = (L.runs[i] for i in p_["runs"])
-        items.append({"id": pid, "image": f"tmp/slotpairs/{a.tag}/{pid}.jpg",
-                      "a": {"key": run_key(ra), "win": int(ra.t_start // 60_000_000)},
-                      "b": {"key": run_key(rb), "win": int(rb.t_start // 60_000_000)},
-                      "label": None, "labeled_by": None, "note": "",
-                      "stratum": p_["stratum"], "together": p_["together"]})
-    dest = root / "data" / "gt" / f"slotpairs-{a.tag}-s{a.seed}.json"
-    if dest.exists() and not a.force:
-        raise SystemExit(f"{dest} 已存在；要覆盖给 --force")
-    doc = {"schema": SCHEMA, "tag": a.tag, "video": L.video, "obs": str(L.obs), "seed": a.seed,
-           "base": "learned(lofo)", "train": a.train, "share": RUN_SHARE, "split": a.split,
-           "filter": {"min_content": MIN_CONTENT, "min_obs": MIN_OBS}, "items": items}
-    dest.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-    view = [{"id": it["id"], "image": it["image"], "a_text": it["a"]["key"][3], "b_text": it["b"]["key"][3]} for it in items]
-    (imgdir / f"to-label-s{a.seed}.json").write_text(json.dumps(view, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"{len(items)} 对 -> {dest}")
-    return 0
+    pairs = sample_runs(L, pipeline_assign(L, "learned", model), median_other(L), a.n, a.seed)
+    return write_run_sample(L, a, pairs, {"base": "learned(lofo, pipeline)", "train": a.train, "share": RUN_SHARE})
 
 
 def cmd_sample_lines(a) -> int:
-    """照 `slot_lines` 自己的分组抽样（`build_tracks --cluster lines` 的区域），给它一个和 median / learned 对等的抽样框。
-    其余和 `sample-learned` 相同：S1 = 和 median 的分歧对，S2 / S3 = lines 的同组 / 近邻异组。"""
-    from flowocr.analyze import slot_lines
-    root = paths.data_root()
+    """照 `--cluster lines` 的分组抽样，给它一个和 median / learned 对等的抽样框。
+    S1 = 和 median 的分歧对，S2 / S3 = lines 的同组 / 近邻异组。"""
     L = CL.load(a.tag)
-    base = slot_lines.assign(L)
-    med = assignment(L, CL.stitch(L, **ARMS["median"]))
-    other = {i: med.get((r.t_start, r.t_end, r.text, tuple(round(v) for v in r.box))) for i, r in enumerate(L.runs)}
-    pairs = sample_runs(L, base, other, a.n, a.seed)
-    imgdir = root / "tmp" / "slotpairs" / a.tag
-    imgdir.mkdir(parents=True, exist_ok=True)
-    items = []
-    for n_, p_ in enumerate(pairs):
-        pid = f"{a.tag}-s{a.seed}-{n_:03d}"
-        render(L, p_, imgdir / f"{pid}.jpg")
-        ra, rb = (L.runs[i] for i in p_["runs"])
-        items.append({"id": pid, "image": f"tmp/slotpairs/{a.tag}/{pid}.jpg",
-                      "a": {"key": run_key(ra), "win": int(ra.t_start // 60_000_000)},
-                      "b": {"key": run_key(rb), "win": int(rb.t_start // 60_000_000)},
-                      "label": None, "labeled_by": None, "note": "",
-                      "stratum": p_["stratum"], "together": p_["together"]})
-    dest = root / "data" / "gt" / f"slotpairs-{a.tag}-s{a.seed}.json"
-    if dest.exists() and not a.force:
-        raise SystemExit(f"{dest} 已存在；要覆盖给 --force")
-    doc = {"schema": SCHEMA, "tag": a.tag, "video": L.video, "obs": str(L.obs), "seed": a.seed,
-           "base": "lines", "share": RUN_SHARE, "split": a.split,
-           "filter": {"min_content": MIN_CONTENT, "min_obs": MIN_OBS}, "items": items}
-    dest.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-    view = [{"id": it["id"], "image": it["image"], "a_text": it["a"]["key"][3], "b_text": it["b"]["key"][3]} for it in items]
-    (imgdir / f"to-label-s{a.seed}.json").write_text(json.dumps(view, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"{len(items)} 对 -> {dest}")
-    return 0
+    pairs = sample_runs(L, pipeline_assign(L, "lines"), median_other(L), a.n, a.seed)
+    return write_run_sample(L, a, pairs, {"base": "lines(pipeline)", "share": RUN_SHARE})
+
+
+ADJ_CO = 0.5
+"""S5：两条 run 的时间重叠至少是较短那条时长的这么多，才算"同时在场"。"""
+ADJ_GAP_H = 1.0
+"""S5：上下两行的竖直间隙不超过这么多倍字高（较高那行）。比 `slot_lines.GAP_H` 宽一点：抽样宁宽，判断交给标注。"""
+
+
+def adjacent_pairs(L) -> list[tuple[int, int, int]]:
+    """S5 的候选：`(i, j, 摆帧时刻 us)`。两条像样的、没动过的 run，同时在场、上下相邻（不是同一行：竖直重叠不到较矮那行的一半）、
+    横向有重叠。**只看几何和时间，不看任何臂的分组**——所以 S5 上各臂的读数是同一个率。"""
+    good = sorted((i for i, r in enumerate(L.runs) if good_run(r) and not getattr(r, "moving", False)),
+                  key=lambda i: L.runs[i].t_start)
+    out, active = [], []
+    for i in good:
+        a = L.runs[i]
+        active = [j for j in active if L.runs[j].t_end > a.t_start]
+        for j in active:
+            b = L.runs[j]
+            ov = min(a.t_end, b.t_end) - max(a.t_start, b.t_start)
+            if ov < ADJ_CO * min(a.t_end - a.t_start, b.t_end - b.t_start):
+                continue
+            y_ov = min(a.box[3], b.box[3]) - max(a.box[1], b.box[1])
+            if y_ov >= 0.5 * min(a.h, b.h) or -y_ov > ADJ_GAP_H * max(a.h, b.h):
+                continue
+            if min(a.box[2], b.box[2]) <= max(a.box[0], b.box[0]):
+                continue
+            t0 = max(a.t_start, b.t_start)
+            out.append((j, i, (t0 + min(a.t_end, b.t_end, t0 + 4_000_000)) // 2))
+        active.append(i)
+    return out
+
+
+def cmd_sample_adjacent(a) -> int:
+    """S5（同刻相邻行）：在候选里均匀抽，一条 run 至多进一对（别让一屏密排的菜单占满样本）。"""
+    L = CL.load(a.tag)
+    cand = adjacent_pairs(L)
+    rnd = random.Random(a.seed)
+    rnd.shuffle(cand)
+    used, pairs = set(), []
+    for i, j, t in cand:
+        if i in used or j in used:
+            continue
+        used |= {i, j}
+        pairs.append({"stratum": "S5", "runs": [i, j], "t_us": int(t), "together": {}})
+        if len(pairs) >= a.n:
+            break
+    print(f"  [S5] 候选 {len(cand)} 对（像样的 run {sum(1 for r in L.runs if good_run(r))}），抽 {len(pairs)}")
+    return write_run_sample(L, a, pairs, {"base": "adjacent(S5)", "share": {"S5": 1.0},
+                                          "adjacent": {"co": ADJ_CO, "gap_h": ADJ_GAP_H}})
 
 
 def assignment(L, slots: list[list[int]]) -> dict[tuple, int]:
@@ -480,10 +531,9 @@ def cmd_merge(a) -> int:
 
 
 def cmd_score(a) -> int:
-    from flowocr.analyze import slot_lines
     from flowocr.analyze import slot_modes
     from flowocr.analyze import slot_veto
-    extra = {"modes": slot_modes.stitch, "lines": slot_lines.assign, "veto": slot_veto.stitch,
+    extra = {"modes": slot_modes.stitch, "lines": lambda L: pipeline_assign(L, "lines"), "veto": slot_veto.stitch,
              "veto+soft": lambda L: slot_veto.stitch(L, soft=0.3),
              "soft-only": lambda L: slot_veto.stitch(L, td_max=99.0, soft=0.3)}
     tot: dict[str, Counter] = {}
@@ -495,7 +545,7 @@ def cmd_score(a) -> int:
         print(f"[{doc['tag']} s{doc['seed']} {doc.get('split')}] {dict(lab)}")
         for name, c in score_doc(doc, ARMS, extra).items():
             tot.setdefault(name, Counter()).update(c)
-    strata = ("S1", "S2", "S3", "S4", "S2-4")
+    strata = ("S1", "S2", "S3", "S4", "S2-4", "S5")
     for c in tot.values():                               # S2-4 = 三个"率"层合起来（S1 按分歧挑，不并）
         for k, v in list(c.items()):
             if k[0] in ("S2", "S3", "S4"):
@@ -515,7 +565,8 @@ def cmd_score(a) -> int:
         print(row + (f"   ⚠ 对不回 run {lost}" if lost else "") + (f"   （重新锚定 {moved} 对）" if moved else ""))
     print("\n误合并 = 标 different 却同槽；误拆分 = 标 same 却异槽；widget / unsure 不进分母。\n"
           "⚠ S1 按各臂分歧挑，只能比臂。S2（默认臂同槽）/ S3（默认臂近邻异槽）对**默认臂**是无偏的率，\n"
-          "  对别的臂是『同一批对上的表现』：默认臂在 S2 只可能误合并、在 S3 只可能误拆分，别的臂两种都可能。")
+          "  对别的臂是『同一批对上的表现』：默认臂在 S2 只可能误合并、在 S3 只可能误拆分，别的臂两种都可能。\n"
+          "  S5（同刻相邻行）不照任何臂抽，各臂在它上面是同一个率；不并进 S2-4。")
     return 0
 
 
@@ -544,6 +595,13 @@ def main() -> int:
     sn.add_argument("--split", default="dev", choices=("dev", "acceptance"))
     sn.add_argument("--force", action="store_true")
     sn.set_defaults(fn=cmd_sample_lines)
+    sa = sub.add_parser("sample-adjacent")
+    sa.add_argument("tag")
+    sa.add_argument("--n", type=int, default=20)
+    sa.add_argument("--seed", type=int, default=6)
+    sa.add_argument("--split", default="dev", choices=("dev", "acceptance"))
+    sa.add_argument("--force", action="store_true")
+    sa.set_defaults(fn=cmd_sample_adjacent)
     m = sub.add_parser("merge")
     m.add_argument("gt")
     m.add_argument("labels")

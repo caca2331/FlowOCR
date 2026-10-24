@@ -11,6 +11,131 @@ from pathlib import Path  # noqa: F401
 from guards._common import *  # noqa: F401,F403
 
 
+def t_shm_attach_untracked() -> None:
+    """挂接别人建的共享内存段，挂接方退出不能把段带走（2026-10-17 WSL 上的 Linux 试跑）：POSIX 上 CPython 3.12 挂接也登记进
+    挂接方的 resource_tracker，挂接方一退就 unlink 掉、打 leaked 警告。管线侧（`childproc.attach_shm`）和 ORT 服务侧
+    （`ort_server.attach_shm`，那边不 import flowocr、另写一份）各核一次：子解释器挂上就退，段还在、建的一方 unlink 得掉、子进程没警告。"""
+    print("共享内存挂接不登记")
+    import subprocess
+    from multiprocessing import shared_memory
+    from pathlib import Path
+
+    from flowocr.extract import childproc
+    srv = Path(childproc.__file__).with_name("ort_server.py")     # 不 import：它顶层就拉 onnxruntime
+    for what, code in (("childproc", "from flowocr.extract.childproc import attach_shm"),
+                       ("ort_server", f"import importlib.util as u; s = u.spec_from_file_location('srv', {str(srv)!r}); "
+                                      "m = u.module_from_spec(s); s.loader.exec_module(m); attach_shm = m.attach_shm")):
+        seg = shared_memory.SharedMemory(create=True, size=4096)
+        try:
+            r = subprocess.run([sys.executable, "-c", f"{code}; m = attach_shm({seg.name!r}); m.buf[0] = 7; m.close()"],
+                               capture_output=True, text=True, timeout=60)
+            again = shared_memory.SharedMemory(name=seg.name)      # 段还在（挂接方没把它 unlink 掉）
+            ok = r.returncode == 0 and again.buf[0] == 7 and "leaked" not in r.stderr
+            again.close()       # 同一进程对同一个名字只登记一次（建的时候），下面 unlink 撤掉；这里再撤 tracker 会报 KeyError
+        finally:
+            seg.close()
+            seg.unlink()
+        check(f"{what}：挂接方退出后段还在、建的一方 unlink 得掉、挂接方没有 resource_tracker 警告", ok, r.stderr[-300:])
+
+
+def t_ort_attachment_cancel_close() -> None:
+    """取消 socket 后发送 bye 会失败，但缓冲流和 socket 仍须分别关闭。"""
+    import socket
+    from flowocr.extract.ortclient import OrtClient
+    client,peer=socket.socketpair()
+    cli=OrtClient.__new__(OrtClient)
+    cli.shared=True
+    cli.sock=client
+    cli.f=client.makefile('rwb')
+    cli.shm=None
+    try:
+        client.shutdown(socket.SHUT_RDWR)
+        cli.close()
+        check('ORT 附着连接取消后实际关闭两个句柄',cli.f.closed and client.fileno()==-1)
+    finally:
+        peer.close()
+        cli.close()
+
+
+def t_edge_completion_at_timeout() -> None:
+    """完成和原始错误在超时边界到达时，不能被看门狗覆盖。"""
+    from flowocr.extract import edge_proc as EP
+    from unittest.mock import patch
+    from types import SimpleNamespace
+
+    for event in ("finished", "error", "progress", "slow_batch", "stalled"):
+        class CV:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def wait(self, *args):
+                if event == "finished": p.stats = {"finished": True}
+                elif event == "error": p.error = "original error"
+                elif event == "progress": p.done_seq += 1
+                elif event == "slow_batch": p.work_progress += 1
+        p = SimpleNamespace(cv=CV(), done_seq=0, work_progress=0, stats=None, error=None, stall_sec=60)
+        with patch.object(EP.time, "perf_counter", side_effect=[0, 61, 122, 183]):
+            EP.EdgeProxy._wait(p, lambda: p.stats is not None or p.done_seq >= 2 or p.work_progress >= 2, "probe")
+        check(f"edge timeout boundary: {event}",
+              p.error is None if event in ("finished", "progress", "slow_batch") else
+              p.error == "original error" if event == "error" else "没前进" in p.error)
+
+
+def t_edge_work_messages() -> None:
+    """真实窗内工作产生进度和证据；进度消息不能提前放行批次水位。"""
+    import threading
+    import numpy as np
+    from types import SimpleNamespace
+    from flowocr.extract import edge_proc as EP, edge_refine as ER
+    from flowocr.extract.framegrid import AuxGrid, TimeGrid
+
+    messages = []
+    grid = AuxGrid(TimeGrid.every(1), TimeGrid.every(2))
+    edge = ER.EdgeRefiner(src_fps=60, start_idx=0, width=16, height=16,
+                          scale=1, grid=grid, thr=.98, ring_cap=32)
+    edge.on_progress = lambda: messages.append(("progress",))
+    edge.on_done = lambda seq: messages.append(("done", seq))
+    ref = EP.RowRef(1, messages.append)
+    try:
+        for i in range(24):
+            edge.ring.push(i, np.zeros((16, 16), np.uint8))
+        edge.ring.close()
+        edge.sample(0, 0, 0, [(1, ref, [2, 2, 14, 14], "文字", "new")], [])
+        edge.sample(1, 2, 33333, [(1, ref, [2, 2, 14, 14], "文字", "same")], [])
+        edge.sample(2, 4, 66667, [], [(1, ref, [2, 2, 14, 14], "文字", 2)])
+        # Bounded join: a regression must fail the guard instead of hanging it.
+        edge.q.put(("f", 4))
+        edge.th.join(5)
+        check("窗内工作线程完成且无异常", not edge.th.is_alive() and edge.error is None)
+    finally:
+        edge.abort()
+        edge.th.join(1)
+    messages.append(("fin", {"complete": True}))
+    p = EP.EdgeProxy.__new__(EP.EdgeProxy)
+    p.cv, p.rows = threading.Condition(), {1: ({}, 0)}
+    p.done_seq, p.work_progress, p.stats, p.error = -1, 0, None, None
+    seen = []
+    pending = iter(messages)
+
+    def recv():
+        seen.append((p.done_seq, p.work_progress, set(p.rows[1][0].get("edge", {}))))
+        return next(pending)
+
+    p.conn = SimpleNamespace(recv=recv)
+    p._recv()
+    valid = True
+    for i, msg in enumerate(messages[:-1]):
+        before, after = seen[i], seen[i + 1]
+        if msg[0] == "progress":
+            valid &= before[0] == after[0] and after[1] == before[1] + 1
+        if msg == ("done", 1):
+            valid &= "on" in after[2]
+        if msg == ("done", 2):
+            valid &= "off" in after[2]
+    check("实际工作产生 progress，证据先于 done，progress 不推进可落盘水位",
+          valid and p.work_progress >= 3 and p.done_seq == 2 and p.error is None
+          and set(p.rows[1][0]["edge"]) == {"on", "off"})
+
+
 def t_reuse_v2() -> None:
     """复用判据第二版（src/flowocr/extract/reuse_v2.py）的两条不变量，都是 2026-09-17 审计的最小复现：
 
@@ -73,8 +198,8 @@ def t_reuse_v2() -> None:
         # `chain.pending` 却没退 `cache_bytes`，**两边一起错**——这一行原来的判据照样通过，而缓存虚高
         # 让 `cache_forced` 多触发、判决跟着变（8,026 行里 14 行产物不同）。所以再核一条：
         # `cache_bytes` 必须等于那条链 `pending` 里裁剪的实际字节数。
-        real = sum(int(pnd[2].nbytes) for c in v.live for pnd in c.pending)
-        book = sum(c.cache_bytes for c in v.live)
+        real = sum(int(pnd[2].nbytes) for c in (*v.live, *v.held) for pnd in c.pending)
+        book = sum(c.cache_bytes for c in (*v.live, *v.held))
         if (v.cache != book + sum(v.reserved.values()) or v.cache > v.cache_cap or book != real):
             bad += 1
     check("缓存的账逐帧对得上、峰值不越上限（随机 200 帧）",
@@ -134,6 +259,7 @@ def t_reuse_v2() -> None:
           "corr" in v.buf[1][0], v.buf[1][0])
 
 
+@high_quality_default
 def t_ocr_complete() -> None:
     print("ocr_complete.is_complete")
     from flowocr.extract import ocr_complete as oc
@@ -157,7 +283,7 @@ def t_ocr_complete() -> None:
           and oc.aux_shortfall({"aux_sent": 5, "aux_last_key": _ng.prev(90)}, 90, _ng) is not None)
     _ro2 = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
     check("run_ocr2：辅助流没交够一票否决 complete（接线）",
-          "and bad_pts is None and aux_bad is None" in _ro2 and "ocr_complete.aux_shortfall(" in _ro2)
+          "and loop.bad_pts is None and aux_bad is None" in _ro2 and "ocr_complete.aux_shortfall(" in _ro2)
     from flowocr.extract import timeline as _tlm
     _old = (_tlm._ev, _tlm._path, _tlm._role, _tlm._dropped, _tlm.MAX_EVENTS)
     try:
@@ -270,7 +396,15 @@ def t_ocr_complete() -> None:
                                                      "--progress-every", "5"])[0])
         check("同一个视频换成相对 / 绝对写法不算两条臂",
               ocr_args.config_of(["v.mp4", "--out", "x"])["video"]
-              == str(Path("v.mp4").resolve()))
+              == ocr_args.config_of([str(Path("v.mp4").resolve()), "--out", "x"])["video"])
+        from flowocr import paths as _paths, provenance as _pv
+        in_root = _paths.data_root() / "out" / "v.mp4"
+        check("**obs 不带本机路径**：数据根下的视频记成相对数据根，用户目录下记成 `~/…`（owner 2026-10-06）",
+              ocr_args.config_of([str(in_root), "--out", "x"])["video"] == "out/v.mp4"
+              and _pv.portable(Path.home() / "zz-not-in-root" / "v.mp4") == "~/zz-not-in-root/v.mp4")
+        check("复用判据：旧 obs 记的绝对路径和新记的 portable 路径是同一个视频（现成 obs 不因此重建）",
+              ocr_args.config_differs({"video": str(in_root)}, {"video": "out/v.mp4"}) == []
+              and ocr_args.config_differs({"video": str(in_root)}, {"video": "out/w.mp4"}) == ["video"])
         # record_corr 是有意的唯一例外（2026-09-14，综合清单 X3）：只多写 obs 行上的 `corr` 字段、不改判决 / 文本 / 框，
         # 算进配置的代价是全部现成 obs 重跑；"开和不开去掉 corr 后逐行相同"在 quick 六段上核过（try-list-results 报告 X3）
         # refine_ring 只管帧环装多少帧（什么时候解码）：容量有下限 max(5, strides)，只能更大，不会少量出证据
@@ -278,8 +412,10 @@ def t_ocr_complete() -> None:
         #    config 相等就会让空臂的 obs 被当默认产物复用（见 ocr_args.OPT_IN_FUSED 那段）
         # `trace` 同 `record_corr` 的理由（2026-09-18）：只把复用判据的因果**另写一个文件**，
         # 不改判决 / 文本 / 框——进配置就是全部现成 obs 重跑，而它连 obs 都不碰
-        check("不产物的参数只收这五个（输出去哪、打印多勤、只多写 corr 字段、帧环大小、另写一份因果轨迹）",
-              ocr_args.NON_PRODUCT == {"out", "progress_every", "record_corr", "refine_ring", "timeline", "trace"},
+        # `quality`（2026-10-05）：档位只填 --fps / --aux-max-fps / --refine-scale 的默认值，那三个的**生效值**照旧进 config；
+        # 档位名进 config 的话，没有这个键的旧产物全部判成对不上而重建
+        check("不产物的参数只收这六个（输出去哪、打印多勤、精度档位名、只多写 corr 字段、帧环大小、另写一份因果轨迹）",
+              ocr_args.NON_PRODUCT == {"out", "progress_every", "quality", "record_corr", "refine_ring", "timeline", "trace"},
               sorted(ocr_args.NON_PRODUCT))
         # owner 2026-09-16：三个提速旋钮进默认（docs/architecture/defaults.md §4.0）。上面那几条臂因此改用 --rec-bucket 16
         dflt = ocr_args.config_of([vid, "--out", "x"])
@@ -288,8 +424,8 @@ def t_ocr_complete() -> None:
         #    3 个 worker 各开一套模型、显存按份数线性涨，而跑它的机器往往同时是日常用机（开发机 8 GB 配额）。
         #    它**改产物**（切点之后差几行闪烁的 UI，defaults.md §4.0.2），所以在复用判据里，
         #    翻默认 = **磁盘上所有现成 obs 的 config 都对不上、驱动会一律重建**。
-        check("默认 rec_bucket 16 / det_batch 4 / **workers 1**（rec_bucket owner 09-21 从 32 降到 16；workers 09-19 改回 1）",
-              (dflt["rec_bucket"], dflt["det_batch"], dflt["workers"]) == (16, 4, 1), dflt)
+        check("默认 rec_bucket 16 / det_batch auto / **workers 1**（rec_bucket owner 09-21 从 32 降到 16；workers 09-19 改回 1；det_batch 10-04 改按设备：GPU 4、CPU 1）",
+              (dflt["rec_bucket"], dflt["det_batch"], dflt["workers"]) == (16, "auto", 1), dflt)
         off = ocr_args.config_of([vid, "--out", "x", "--no-reuse-v2"])
         check("**`--reuse-v2` 是默认**（owner 09-17）：那组参数默认就在 config 里，`--no-reuse-v2` / `--no-reuse` 时一个不留（OPT_IN）",
               ocr_args.OPT_IN <= set(dflt) and not (set(off) & ocr_args.OPT_IN)
@@ -526,6 +662,11 @@ def t_detpost() -> None:
     _srv = (ROOT / "src/flowocr/extract/ort_server.py").read_text(encoding="utf-8")
     check("ort_server 有 --threads / --spin（CPU 路径的线程池旋钮；关自旋 gi-s1 60 s 64.1 → 51.3 s）",
           "intra_op_num_threads = a.threads" in _srv and "session.intra_op.allow_spinning" in _srv)
+    _cli = (ROOT / "src/flowocr/extract/ortclient.py").read_text(encoding="utf-8")
+    check("ort_server 的 --cublas-ws 不盖掉环境里已有的 CUBLAS_WORKSPACE_CONFIG、在载入 CUDA 库之前设；生效值经两种握手回到 OrtClient.stats()",
+          'if a.cublas_ws and not os.environ.get("CUBLAS_WORKSPACE_CONFIG")' in _srv
+          and _srv.index('os.environ["CUBLAS_WORKSPACE_CONFIG"]') < _srv.index("ort.preload_dlls()")
+          and _srv.count('"cublas_ws"') >= 2 and '"cublas_ws": self.cublas_ws' in _cli)
 
 
 
@@ -645,6 +786,154 @@ def t_audit_perf0925() -> None:
         return ns[name]
 
     det_stream = lift("det_stream", {"itertools": __import__("itertools"), "time": _time, "stage": lambda k, t0: None})
+    # det 批按设备定（defaults §1.35）：auto 在 CPU 上 1、GPU 上 4，显式给数原样；check_args 认 auto、拒 0
+    det_batch = lift("det_batch", {})
+    _NS2 = __import__("types").SimpleNamespace
+    check("det_batch：auto 在 cpu 上取 1、在 gpu / gpu:1 上取 4；显式给数照给",
+          (det_batch(_NS2(det_batch="auto"), "cpu"), det_batch(_NS2(det_batch="auto"), "gpu"),
+           det_batch(_NS2(det_batch="auto"), "gpu:1"), det_batch(_NS2(det_batch=2), "cpu")) == (1, 4, 4, 2))
+    # 接在共享服务上（多组 / --workers，FLOWOCR_ORT_ADDR）时 rec 在途 auto 取 1（defaults §1.42）
+    import os
+    _env_old = os.environ.pop("FLOWOCR_ORT_SHARED", None)
+    rec_inflight = lift("rec_inflight", {"SHARED_ENV": "FLOWOCR_ORT_SHARED"})
+    _ri = _NS2(rec_async=True, rec_inflight="auto")
+    _alone = (rec_inflight(_ri, "gpu"), rec_inflight(_ri, "cpu"))
+    _addr_old = os.environ.get("FLOWOCR_ORT_ADDR")
+    os.environ["FLOWOCR_ORT_ADDR"] = "det=127.0.0.1:1"     # 用户自己设的地址不算接在共享服务上
+    _user = rec_inflight(_ri, "gpu")
+    os.environ.pop("FLOWOCR_ORT_ADDR")
+    if _addr_old is not None:
+        os.environ["FLOWOCR_ORT_ADDR"] = _addr_old
+    os.environ["FLOWOCR_ORT_SHARED"] = "1"
+    _shared = (rec_inflight(_ri, "gpu"), rec_inflight(_NS2(rec_async=True, rec_inflight=2), "gpu"))
+    os.environ.pop("FLOWOCR_ORT_SHARED")
+    if _env_old is not None:
+        os.environ["FLOWOCR_ORT_SHARED"] = _env_old
+    check("rec_inflight：auto 单独跑 GPU 2 / CPU 1；接在共享服务上 auto 取 1、显式给数照给",
+          _alone == (2, 1) and _user == 2 and _shared == (1, 2), (_alone, _user, _shared))
+    from flowocr.extract import recort as _rc
+
+    class _FakeCli:                                  # 记下 OrtRec.predict 每次发出去的批（不起服务）
+        pre, sent = False, []
+
+        def run(self, name, x):
+            self.sent.append(tuple(x.shape))
+            import numpy as _np
+            return _np.zeros((x.shape[0], x.shape[-1] // 8), _np.int64), _np.zeros((x.shape[0], x.shape[-1] // 8), _np.float32)
+    _orec = _rc.OrtRec.__new__(_rc.OrtRec)
+    _orec.max_batch, _orec.grid, _orec.cli, _orec.pre_on_server, _orec.ladder = 16, 320, _FakeCli(), False, ()
+    _orec.t, _orec.labels = {"pre": 0.0, "decode": 0.0}, ["_"]
+    import numpy as _np
+    _orec.predict([_np.zeros((48, 2560, 3), _np.uint8)] * 16 + [_np.zeros((48, 320, 3), _np.uint8)] * 16)
+    check("OrtRec.predict 按 batch_cap 拆批：16 张宽 2560 拆成两批各 8 张，16 张宽 320 照旧一批 16",
+          sorted(s[0] for s in _FakeCli.sent if s[-1] == 2560) == [8, 8] and [s[0] for s in _FakeCli.sent if s[-1] == 320] == [16],
+          _FakeCli.sent)
+    check("recort.batch_cap：批 × 张量宽 ≤ 20480、取 2 的幂（宽 ≤ 1280 → 16，1600–2560 → 8，2880 / 3200 → 4）",
+          [_rc.batch_cap(w) for w in range(320, 3201, 320)] == [16] * 4 + [8] * 4 + [4] * 2)
+    _src_srv = (ROOT / "src/flowocr/extract/ort_server.py").read_text(encoding="utf-8")
+    _admit_cls = next(n for n in ast.parse(_src_srv).body if isinstance(n, ast.ClassDef) and n.name == "Admit")
+    _ns_ad = {"contextlib": __import__("contextlib"), "threading": __import__("threading"), "time": __import__("time")}
+    exec(compile(ast.Module([_admit_cls], []), "ort_server.Admit", "exec"), _ns_ad)
+    _det = _ns_ad["Admit"](4, "img")
+    check("ort_server.Admit 的单位：img 按张数（竖屏 / 裁切也一样）、bw 按 批 × 张量宽",
+          _det.units((4, 3, 960, 544)) == _det.units((4, 3, 544, 960)) == 4 and _ns_ad["Admit"](20480).units((8, 3, 48, 2560)) == 20480)
+    _ad = _ns_ad["Admit"](10)
+    _got = []
+    _waits = []
+    with _ad(30) as _w0:                            # 手上没有时超过上限的也放（不死锁）
+        _got.append(_ad.used)
+        _waits.append(_w0)
+    with _ad(6):
+        def _second():
+            with _ad(6) as _w:
+                _got.append(_ad.used)
+                _waits.append(_w)
+        _t = __import__("threading").Thread(target=_second)
+        _t.start()
+        _t.join(0.3)
+        _blocked = _t.is_alive()                    # 6 + 6 > 10：第二个要等
+    _t.join(2)
+    check("ort_server.Admit：单个超上限的照放；在算的加上新来的超上限就等，放掉之后再进；`as` 拿到这次等了多久（秒）",
+          _got[0] == 30 and _blocked and not _t.is_alive() and _got[-1] == 6
+          and _waits[0] < 0.1 and _waits[-1] >= 0.25, (_got, _blocked, _waits))
+    _infer = _src_srv[_src_srv.index("    def infer("):_src_srv.index("    if a.warm and a.per_shape:")]
+    _warm = _src_srv[_src_srv.index("    def warm("):_src_srv.index("    def infer(")]
+    check("ort_server：推理和预热都过准入（admits[name]）；推理把这次准入等了多久回给客户端（`admit_ms`）",
+          "admits[name](admits[name].units(shape))" in _infer and "admits[name](admits[name].units(shape))" in _warm
+          and '"admit_ms": admit_s * 1000' in _infer)
+    _ltl = next(n for n in ast.parse(_src_srv).body if isinstance(n, ast.FunctionDef) and n.name == "load_timeline")
+    _ns_tl = {"json": json, "sys": sys, "__file__": str(ROOT / "src/flowocr/extract/ort_server.py")}
+    exec(compile(ast.Module([_ltl], []), str(ROOT / "src/flowocr/extract/ort_server.py"), "exec"), _ns_tl)
+    _env_tl = os.environ.pop("FLOWOCR_TIMELINE", None)
+    try:
+        _off = _ns_tl["load_timeline"]()
+        with tempfile.TemporaryDirectory() as _td:
+            os.environ["FLOWOCR_TIMELINE"] = str(Path(_td) / "x.tl.jsonl")
+            _tlm = _ns_tl["load_timeline"]()
+            _tlm.span("ort_run", 1.0, 2.0, ["rec", [1, 3, 48, 320]])
+            _tlm.dump()
+            _lines = (Path(_td) / "x.tl.jsonl.ort.jsonl").read_text(encoding="utf-8").splitlines()
+    finally:
+        os.environ.pop("FLOWOCR_TIMELINE", None)
+        if _env_tl is not None:
+            os.environ["FLOWOCR_TIMELINE"] = _env_tl
+    check("ort_server.load_timeline：没开 --timeline 时返回 None；开着时写 `<路径>.ort.jsonl`（角色 ort）",
+          _off is None and json.loads(_lines[0])["_meta"]["role"] == "ort" and json.loads(_lines[1])["k"] == "ort_run", _lines[:2])
+    import contextlib as _cl
+    import importlib.util as _ilu
+    import io as _io
+    _spec = _ilu.spec_from_file_location("_tlr", ROOT / "dev_tools" / "timeline_report.py")
+    _tlr = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_tlr)
+    _ev = [{"role": "ort", "th": "c1", "k": "ort_req", "t0": 9.9, "t1": 10.2, "a": "rec"},       # 跨窗口左边的请求：整个不算
+           {"role": "ort", "th": "c1", "k": "ort_run", "t0": 10.0, "t1": 10.1, "a": ["rec", [1]]},
+           {"role": "ort", "th": "c1", "k": "ort_out", "t0": 10.1, "t1": 10.2, "a": "rec"},
+           {"role": "ort", "th": "c1", "k": "ort_req", "t0": 11.0, "t1": 12.0, "a": "rec"},
+           {"role": "ort", "th": "c1", "k": "ort_run", "t0": 11.2, "t1": 11.9, "a": ["rec", [1]]},
+           {"role": "ort", "th": "c2", "k": "ort_run", "t0": 11.0, "t1": 11.5, "a": ["rec", [1]]},   # 别的线程上、不属于任何请求
+           {"role": "main", "th": "MainThread", "k": "rec_infer", "t0": 10.9, "t1": 12.1, "a": 1}]
+    _buf = _io.StringIO()
+    with _cl.redirect_stdout(_buf):
+        _tlr.server_split(_ev, 10.0, 20.0)
+    _buf2 = _io.StringIO()
+    with _cl.redirect_stdout(_buf2):
+        _tlr.server_split(_ev + [{"role": "main", "th": "MainThread", "k": "rec_infer", "t0": 15.0, "t1": 16.0, "a": 1}], 10.0, 20.0)
+    check("timeline_report：服务端各段按所属请求收（跨窗口边的请求整个进或整个不进，别的线程的不串），\"其它\"不会是负数；"
+          "两边请求数对不上时标出集合差",
+          "rec 1 次" in _buf.getvalue() and "推理   0.70" in _buf.getvalue() and "其它  0.30" in _buf.getvalue()
+          and "差值含窗口边上的请求" not in _buf.getvalue() and "客户端 2 次、服务端 1 次" in _buf2.getvalue(), (_buf.getvalue(), _buf2.getvalue()))
+    check("ort_server：每次请求记 ort_sess / ort_run / ort_req 进时间线（关着时只多几次 None 判断）；断开连接和管道收尾时落盘",
+          all(f'tl.span("{k}"' in _infer for k in ("ort_sess", "ort_run", "ort_req")) and "if tl is not None:" in _infer
+          and _src_srv.count("on_close=tl_dump") == 2 and "    tl_dump()\n    return 0" in _src_srv)
+    _bt = ast.parse((ROOT / "src/flowocr/analyze/build_tracks.py").read_text(encoding="utf-8"))
+    _keys = set()
+    # 只认 o / p / a / b / x 这几个名字的观测 dict（这几个函数现在就这么叫）；改了变量名要跟着改这里，不然新读的键扫不到
+    for _fn in (n for n in _bt.body if isinstance(n, ast.FunctionDef) and n.name in ("build_runs", "rejoin_split_lines", "estimate_shift", "_joined")):
+        for _n in ast.walk(_fn):
+            if isinstance(_n, ast.Subscript) and isinstance(_n.slice, ast.Constant) and isinstance(_n.slice.value, str) \
+                    and isinstance(_n.value, ast.Name) and _n.value.id in ("o", "p", "a", "b", "x"):
+                _keys.add(_n.slice.value)
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Attribute) and _n.func.attr == "get" \
+                    and isinstance(_n.func.value, ast.Name) and _n.func.value.id in ("o", "p", "a", "b", "x") \
+                    and _n.args and isinstance(_n.args[0], ast.Constant):
+                _keys.add(_n.args[0].value)
+    from flowocr.artifacts import obsio as _obsio
+    check("obsio.RUN_FIELDS 覆盖 build_runs / rejoin_split_lines / estimate_shift / _joined 从观测里读的全部键（阶段 2 只投影这几个，漏了是静默的）",
+          _keys and _keys <= set(_obsio.RUN_FIELDS), sorted(_keys))
+    _src_ro = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
+    _sos = _src_ro[_src_ro.index("def start_ort_services"):_src_ro.index("def run_parallel")]
+    check("start_ort_services 只起一个服务（det 并进 rec）、带 --admit；FLOWOCR_ORT_ADDR 两个模型指同一个端口",
+          _sos.count("subprocess.Popen(") == 1 and '"--admit", admit' in _sos and 'for m, _ in want]' in _sos
+          and ":img,rec={recort.BATCH_AREA}:bw" in _sos and "env[SHARED_ENV] = \"1\"" in _sos)
+    from flowocr.extract import ocr_args as _oa
+    check_args = lift("check_args", {"ocr_args": _oa, "resolve_aux_grid": lambda *a, **k: None})
+    _ok = True
+    try:
+        check_args(_oa.parse_args(["v.mp4", "--out", "x"]))
+    except SystemExit:
+        _ok = False
+    check("check_args：默认的 --det-batch auto 不报错、--det-batch 0 报错",
+          _ok and raises(lambda: check_args(_oa.parse_args(["v.mp4", "--out", "x", "--det-batch", "0"])), SystemExit))
 
     class FakeDet:
         def __init__(self, fail_at=None):
@@ -683,11 +972,56 @@ def t_audit_perf0925() -> None:
     check("det 流水：0 / 1 两档同序同值（0~17 帧、批 2 / 4，含尾批）；推理出错两档交出同样多帧再抛同一个错；提前关不卡",
           same and err0 == err1 and err1[-1] == ("err", "假的：推理炸了") and len(err1) == 5 and not t.is_alive(), (err0, err1))
 
+    # 关闭时段只省检测：真实 PTS、空帧推进、混合批维和 pregate 的前帧都要保留。
+    import numpy as np
+    from flowocr.extract import regions as RG
+    times = [0.03, 0.10, 0.18, 0.26, 0.34, 0.43, 0.51, 0.62, 0.72]
+    group = RG.from_spec({"name": "closed", "rects": [
+        {"box": [0, 0, 100, 100], "neg": True, "t": [0.15, 0.45]},
+        {"box": [0, 0, 100, 100], "neg": True, "t": [0.7, None]},
+    ]}, 4, 4)
+    namespace = {"itertools": __import__("itertools"), "time": _time, "stage": lambda k, t0: None,
+                 "cv2": NS(COLOR_BGR2GRAY=0, cvtColor=lambda f, _: f[:, :, 0].copy()),
+                 "pregate_of": lambda gray, prev, polys: (gray, prev)}
+    masked_stream = lift("det_stream", namespace)
+    passed = []
+    for batch, look in [(b, l) for b in (1, 2, 4) for l in (0, 1)]:
+        frames = [np.full((4, 4, 3), i, np.uint8) for i in range(len(times))]
+        source = RG.MaskedSource(zip(range(len(times)), times, frames), group)
+        calls = []
+        class ClosedDet:
+            def infer_batch(self, images):
+                calls.append(tuple(id(f) for f in images))
+                return len(images)
+            def post_batch(self, size):
+                return [([size], []) for _ in range(size)]
+            def predict_batch(self, images):
+                return self.post_batch(self.infer_batch(images))
+            def predict(self, frame):
+                return self.predict_batch([frame])[0]
+        detector = ClosedDet()
+        got = list(masked_stream(source, detector, batch, True, look))
+        expected = [tuple(id(f) for f in frames[i:i+batch]) for i in range(0, len(times), batch)
+                    if not all(source.detection_closed_at(t) for t in times[i:i+batch])]
+        passed.append(calls == expected and len(got) == len(times) and
+                      all(row[0] == i and row[1] == times[i] and row[2] is frames[i] and
+                          (row[4][1] is None if i == 0 else np.array_equal(row[4][1], frames[i-1][:, :, 0]))
+                          for i, row in enumerate(got)))
+    check("关闭检测：只省整批 / 尾批，混合批不压缩；真实帧和 PTS 全交付，灰度前帧照常推进（含逐帧批 1）", all(passed), passed)
+    empty_source = RG.MaskedSource([], RG.from_spec({"name": "all", "rects": []}, 4, 4))
+    positive = RG.MaskedSource([], RG.from_spec({"name": "pos", "rects": [
+        {"box": [0, 0, 100, 100], "t": [1, 2]}]}, 4, 4))
+    check("关闭判据：None 是无限制，负矩形未生效是开放，正矩形未生效是关闭；切点用真实 PTS、右端开",
+          not empty_source.detection_closed_at(0) and not source.detection_closed_at(0.1499)
+          and source.detection_closed_at(0.15) and not source.detection_closed_at(0.45)
+          and positive.detection_closed_at(0.99) and not positive.detection_closed_at(1)
+          and positive.detection_closed_at(2))
+
     # ④ 字节预算的等待里主流交到块尾：辅助帧要放行（原来 main_eof 只在进等待前算一次，Codex P1）
     from flowocr.extract import decode_shards as dsh
     s = dsh.ShardedSource("v", lanes=["hw"], blocks=[(0, 60, None)], start_idx=0, end_idx=60, grid=_every(30), src_fps=60.0,
                           width=4, height=4, hwaccel="cuda", aux_remote=None, budget_mb=0.00001)
-    b = NS(last_main=None, hi=60, waiting=0, throttled=False, nbytes=0)
+    b = NS(k=0, last_main=None, hi=60, waiting=0, throttled=False, nbytes=0, err=None, aux_done=False)
     s._buffered = 10_000
     done = []
 
@@ -782,7 +1116,7 @@ def t_audit_perf0925() -> None:
 
     # ⑥ 参数：rec_inflight auto、det_lookahead 只收 0 / 1、ort_server_extra 进 config 且只赦免空
     from flowocr.extract import ocr_args
-    ri = lift("rec_inflight", {})
+    ri = lift("rec_inflight", {"SHARED_ENV": "FLOWOCR_ORT_SHARED"})
     a = ocr_args.parse_args(["x.mp4", "--out", "o.jsonl"])
     a3 = ocr_args.parse_args(["x.mp4", "--out", "o.jsonl", "--rec-inflight", "3"])
     check("rec_inflight：auto = GPU 2 / CPU 1；显式给数 CPU 上也照给的；同步路径 1",
@@ -794,12 +1128,12 @@ def t_audit_perf0925() -> None:
     except SystemExit:
         la_ok = True
     c0 = ocr_args.config_of(["x.mp4", "--out", "o.jsonl"])
-    c1 = ocr_args.config_of(["x.mp4", "--out", "o.jsonl", "--ort-server-extra=--cuda-graph-batch 4"])
+    c1 = ocr_args.config_of(["x.mp4", "--out", "o.jsonl", "--ort-server-extra=--cudnn-conv-search HEURISTIC"])
     old = {k: v for k, v in c0.items() if k != "ort_server_extra"}
     check("--det-lookahead 只收 0 / 1；--ort-server-extra 进 config：没这个键的旧产物照复用，非空的不复用",
-          la_ok and c1["ort_server_extra"] == "--cuda-graph-batch 4" and not ocr_args.config_differs(old, c0)
+          la_ok and c1["ort_server_extra"] == "--cudnn-conv-search HEURISTIC" and not ocr_args.config_differs(old, c0)
           and "ort_server_extra" in ocr_args.config_differs(c0, c1), ocr_args.config_differs(c0, c1))
-    sa = lift("ort_server_args", {"os": __import__("os")})
+    sa = lift("ort_server_args", {"os": __import__("os"), "trt_plan": lambda a: {"server_args": [], "why": ""}})   # TRT 的那份在 t_trt_backend
     ax = ocr_args.parse_args(["x.mp4", "--out", "o.jsonl", "--ort-server-extra=--threads 4"])
     g, c = sa(ax, "gpu"), sa(ax, "cpu")
     a_on = ocr_args.parse_args(["x.mp4", "--out", "o.jsonl", "--ort-spin", "on"])
@@ -808,6 +1142,14 @@ def t_audit_perf0925() -> None:
           "--warm" in g and "--per-shape" not in g and "--warm" not in c and c[c.index("--per-shape") + 1] == "0"
           and g[g.index("--spin") + 1] == c[c.index("--spin") + 1] == "0" and "--spin" not in sa(a_on, "gpu")
           and g[-2:] == c[-2:] == ["--threads", "4"], (g, c))
+    a_old = ocr_args.parse_args(["x.mp4", "--out", "o.jsonl", "--ort-arena-extend", "pow2", "--ort-cublas-ws", "off"])
+    g_old = sa(a_old, "gpu")
+    check("ort_server_args：GPU 默认带 --arena-extend same / --cublas-ws :4096:1，CPU 不带；pow2 / off 回退时都不带；"
+          "两个键在 NOISE_EQUIV（显存怎么分不改读数，defaults 1.41）",
+          g[g.index("--arena-extend") + 1] == "same" and g[g.index("--cublas-ws") + 1] == ":4096:1"
+          and "--arena-extend" not in c and "--cublas-ws" not in c
+          and "--arena-extend" not in g_old and "--cublas-ws" not in g_old
+          and {"ort_arena_extend", "ort_cublas_ws"} <= ocr_args.NOISE_EQUIV, (g, c, g_old))
 
 
 def t_analysis_speed() -> None:
@@ -819,6 +1161,7 @@ def t_analysis_speed() -> None:
 
     from flowocr.analyze import build_tracks as BT
     from flowocr.analyze import uigate as UG
+    from flowocr import textfold as TFOLD
 
     rnd = random.Random(20260924)
     alpha = "あいうえおかきくけこアイウエ…！、。abcAB12 "
@@ -899,10 +1242,11 @@ def t_analysis_speed() -> None:
         a, b = "".join(prev_text.split()), "".join(cur_text.split())
         if len(a) < max(1, min_chars) or len(b) <= len(a):
             return False
+        fa, fb = TFOLD.fold(a), TFOLD.fold(b)     # 前缀比较先折字形（2026-10-05）；对拍的是"几何先判"这次重排
         if len(a) < 2:
-            if not b.startswith(a):
+            if not fb.startswith(fa):
                 return False
-        elif SM(None, a, b[:len(a)]).ratio() < 0.8:
+        elif SM(None, fa, fb[:len(fa)]).ratio() < 0.8:
             return False
         ah, bh = prev_box[3] - prev_box[1], cur_box[3] - cur_box[1]
         if max(ah, bh) / max(1.0, min(ah, bh)) > 1.4:
@@ -935,6 +1279,13 @@ def t_analysis_speed() -> None:
           and BT.typewriter_growth(_half, "はいはーい！私は橘", _full, "はいはーい！私は橘シェリーっていいますっ。")
           and not BT.typewriter_growth(_half, "はいはーい！私は橘", _full, "はいはーい！私は橘シェリーっていいますっ。",
                                        h_ratio=1.4))
+    # zzz-s1 245.8 s：半截和整句的同一个字读成了不同字形（`!`/`！`、`っ`/`つ`、`よ`/`ょ`），逐字比 0.75 断链、首字晚 40 帧
+    check("打字机生长判前缀先折字形（NFKC + 小书写假名）：`ビリー、行くよ!えっと…` 长成 `ビリー、行くょ！えつと…こうや…` 接得上；"
+          "真换了字的仍不接",
+          BT.typewriter_growth([676, 872, 1002, 899], "ビリー、行くよ!えっと…",
+                               [678, 872, 1242, 899], "ビリー、行くょ！えつと…こうやればいいのかな")
+          and not BT.typewriter_growth([676, 872, 1002, 899], "ビリー、来たね!さあね…",
+                                       [678, 872, 1242, 899], "ビリー、行くょ！えつと…こうやればいいのかな"))
 
     def old_dominant(rs_):
         groups = []
@@ -1034,6 +1385,20 @@ def t_edge_proc() -> None:
     bl3 = list(dsh.iter_blocks(iter([0.0, 150.0]), 0, 18000, 60.0, 20.0))
     check("iter_blocks：关键帧来一个判一个（边探边切）；长 GOP 切出的就是长块（内存靠字节预算，不靠块长）",
           bl3 == [(0, 9000, None), (9000, 18000, 150.0005)], bl3)
+    _kf2 = [2.0 * i for i in range(200)]
+    tb2 = dsh.plan_blocks("v", 0, 18000, 60.0, 60.0, kfs=_kf2, lanes=2)
+    tb90 = dsh.plan_blocks("v", 0, 5400, 60.0, 60.0, kfs=_kf2, lanes=2)
+    check("plan_blocks 尾部按路数均分（rec-workload 计划 2026-10-16）：剩下不到 路数 × 块长 时每块取 剩下的 / 路数、逐块重算、不短于 10 s；"
+          "90 s 窗口两路也切开；一路时和不均分一样",
+          tb2 == [(0, 3600, None), (3600, 7200, 60.0005), (7200, 10800, 120.0005), (10800, 14400, 180.0005),
+                  (14400, 16200, 240.0005), (16200, 17160, 270.0005), (17160, 18000, 286.0005)]
+          and tb90 == [(0, 2760, None), (2760, 4080, 46.0005), (4080, 4800, 68.0005), (4800, 5400, 80.0005)]
+          and dsh.plan_blocks("v", 0, 18000, 60.0, 60.0, kfs=_kf2, lanes=1)
+          == [(k * 3600, (k + 1) * 3600, None if k == 0 else k * 60 + 0.0005) for k in range(5)],
+          (tb2, tb90))
+    check("解码分片同时在途的块默认 = 路数 + 1（尾部均分后先解完的那一路不用干等名额）",
+          dsh.ShardedSource("v", lanes=["hw", "hw"], blocks=[(0, 60, None)], start_idx=0, end_idx=60, grid=_every(30),
+                            src_fps=60.0, width=4, height=4, hwaccel="cuda").ahead == 3)
     _shard_behaviour_checks(dsh, fsx)
     cmd = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=0.0, n_out=10, select_by="pts", src_fps=60.0,
                                block=(660, 1500, 11.0005),
@@ -1126,6 +1491,79 @@ def t_edge_proc() -> None:
     check("decode_proc 出错：子进程的回溯在管线进程这边抛出来", err is not None and "Traceback" in err, (err or "")[-300:])
     check("decode_proc 出错：close 很快返回、子进程已退", dt < 10 and dp.child.proc.poll() is not None,
           (round(dt, 1), dp.child.proc.poll()))
+    # 契约（效率分支复审）：serve 遇到取帧层里的 HwaccelMismatch、收摊又出错时，hello 之后**第一条**必须是 `hw`
+    # （管线进程见到它才整段改软解重跑）；清理错误排在后面发 `err`，并且打到 stderr（管线已按 hw 退出、不会读那条 err）
+    import contextlib as _cl
+    import io as _io
+    import threading as _thd
+    from unittest import mock as _mock
+
+    from flowocr.extract import framesource as _fsm
+    _sent: list = []
+    _faulted = _thd.Event()
+
+    class _Conn:
+        n = 0
+
+        def recv(self):
+            _Conn.n += 1
+            if _Conn.n == 1:
+                return ("go", {"H": 2, "W": 2, "slots": 1, "aux": None})
+            _faulted.wait(10)                       # 收消息的线程：故障发出去之后管线进程才断开
+            raise EOFError
+
+        def close(self):
+            pass
+
+    def _send(msg):
+        _sent.append(msg)
+        if msg[0] in ("hw", "err"):
+            _faulted.set()
+
+    class _Src:
+        def describe(self):
+            return "假的取帧层"
+
+        def __iter__(self):
+            raise _fsm.HwaccelMismatch("假的：块内硬解交付错")
+
+        def close(self):
+            raise RuntimeError("假的：辅助流取消后读线程未退出")
+
+    _err_buf = _io.StringIO()
+    with _mock.patch.object(dpx.childproc, "connect", lambda: (_Conn(), _send)), \
+            _mock.patch.object(dpx, "make_source", lambda cfg, remote: _Src()), _cl.redirect_stderr(_err_buf):
+        _rc = dpx.serve()
+    _kinds = [m[0] for m in _sent]
+    check("契约：decode_proc.serve 块内硬解失败 + 收摊出错 -> hello 之后第一条是 hw，清理错误排在后面发 err、并打到 stderr",
+          _rc == 0 and _kinds[:2] == ["hello", "hw"] and "err" in _kinds[2:] and "取帧层收摊失败" in _err_buf.getvalue()
+          and "读线程未退出" in _err_buf.getvalue(), (_kinds, _err_buf.getvalue()[-200:]))
+    # OwnedSocket.connect：abort 在 check() 和 select() 之间把 socket 分离（fd = -1），select 抛 ValueError——在根因处转成 OSError，
+    # 调用方（`ShardedSource._forward`）只接 OSError（效率分支复审）
+    from flowocr.extract import aux_transport as _at
+
+    class _PendingSock:
+        def setblocking(self, flag):
+            pass
+
+        def connect_ex(self, addr):
+            return 10035                            # 连接还在进行（WSAEWOULDBLOCK）
+
+    def _select_after_abort(r, w, x, t):
+        _own.abort()                                # 另一个线程恰在这时 abort：socket 已分离
+        raise ValueError("file descriptor cannot be a negative integer (-1)")
+
+    _own = _at.OwnedSocket()
+    _own.abort = lambda: _own.cancelled.set()       # 替身 socket 没有 shutdown / detach：只置取消
+    with _mock.patch.object(_at.socket, "socket", lambda *a, **k: _PendingSock()), \
+            _mock.patch.object(_at.select, "select", _select_after_abort):
+        _conn_err = None
+        try:
+            _own.connect(("127.0.0.1", 9))
+        except Exception as exc:                    # noqa: BLE001
+            _conn_err = exc
+    check("OwnedSocket.connect：连接中途被 abort、select 抛 ValueError -> 转成 OSError（调用方只接 OSError）",
+          isinstance(_conn_err, OSError), repr(_conn_err))
     from flowocr.extract import childproc
     _ep = (ROOT / "src/flowocr/extract/edge_proc.py").read_text(encoding="utf-8")
     check("拆进程的胶水只有一份：回抠进程和只解码进程都走 childproc（起子进程 / 口令 / 收尾）",
@@ -1163,7 +1601,7 @@ def t_audit_0923() -> None:
                             set(todo), assign, lambda i: np.zeros((18, 60, 3), np.uint8), {}, False)
         return s, todo
 
-    # 1. 固定滞后 W=4（第 k 帧在第 k+3 帧 stage1 之后结算）：同一条链连续几帧真读，结算最老的一个**不许**清掉在途标记
+    # 1. 窗口 4、rec 慢到主线程顶在领先上限（第 k 帧在第 k+3 帧 stage1 之后才结算）：同一条链连续几帧真读，结算最老的一个**不许**清掉在途标记
     v, st = fresh()
     win, reads, pend_before = [], [], []
     for seq in range(6):
@@ -1466,22 +1904,28 @@ def t_regions_cuts() -> None:
     from unittest import mock as _mock
 
     from flowocr.extract import decode_proc as DPm
-    from flowocr.extract import decode_shards as DSm
+    from flowocr.extract import aux_transport as ATm
 
     class _W:
         def __init__(self, remote):
-            if remote.bad:
-                raise ConnectionRefusedError("假的：这一组的回抠进程没了")
             self.remote = remote
+
+        def open(self):
+            if self.remote.bad:
+                raise ConnectionRefusedError("假的：这一组的回抠进程没了")
+            return self
 
         def send(self, frame, n, t):
             self.remote.got.append(n)
 
         def close(self):
             self.remote.closed = True
+
+        def abort(self):
+            pass
     from types import SimpleNamespace as _NS
     rems = [_NS(bad=False, got=[], closed=False, pts_put=lambda x: None), _NS(bad=True, got=[], closed=False, pts_put=lambda x: None)]
-    with _mock.patch.object(DSm, "TcpAux", _W):
+    with _mock.patch.object(ATm, "TcpAux", _W):
         fan = DPm.AuxFanout(rems, depth=4).open()
         for k in range(20):
             fan.send(_np.zeros(3, _np.uint8), k, k / 60)
@@ -1541,10 +1985,14 @@ def t_rec_window() -> None:
     BOXES = [[0, 0, 40, 18], [60, 0, 96, 18], [120, 0, 152, 18]]
     ABC = "abcdefghijklmnopqrstuvwxyz"
 
-    def run(window: int, lag: int) -> tuple[list[dict], int, int, ReuseV2]:
+    def run(window: int, lag: int, delays: list[int] | None = None):
         """跑一遍。`window <= 1` 走老路（`commit`）；否则 stage1 排队、**按帧序** stage2。
 
-        `lag` = 结果滞后几帧才回来（0 = 整窗一起回 = 同步窗口；1 = 边跑边回 = 异步消费者）。
+        `lag` = 结果滞后几帧才回来（0 = 整窗一起回 = 同步窗口；1 = 边跑边回 = 异步消费者）；
+        给了 `delays` 时它是领先上限，单给 `lag` = rec 慢到主线程每帧都顶在上限（异步路径结算最晚的情形）。
+        `delays`（异步路径的"回来就结算"，`run_ocr2.Loop.settle_ready`）：第 seq 帧的读在第 seq+delays[seq] 帧判决前回来；
+        每帧判决前按帧序结算已回来的最老几帧、遇到没回来的就停，领先超过 `lag` 帧时阻塞结算最老的。
+        返回值最后一项是每帧在第几帧判决前 / 后结算（和"顶在上限"比结算时刻用）。
         """
         # `--no-reuse-confirm`：这组验的是策略 B（文本待定走严门）本身。假 rec 每次都返回新串、链永远证实不了，
         # 开着 `--reuse-confirm` 时所有链都走严门，策略 B 的效果被它盖住、测不出来（证实门另有守卫，见 t_reuse_confirm）
@@ -1563,12 +2011,18 @@ def t_rec_window() -> None:
         win: list[tuple] = []
         n_read = n_pend = 0
         bad_cache = [0]
+        settled_at: dict[int, float] = {}
 
-        def settle(items: list[tuple]) -> None:
+        def settle(items: list[tuple], at: float = 0.0) -> None:
             for st_, texts in items:                      # **按帧序**提交
                 v.commit_stage2(st_, texts, fh)
+                settled_at[st_["seq"]] = at
 
         for seq, c in enumerate(CORR):
+            if delays is not None:                        # 回来就结算：判决前收已经回来的（按帧序，没回来就停）
+                while win and win[0][0]["seq"] + delays[win[0][0]["seq"]] <= seq:
+                    settle(win[:1], seq - 0.5)
+                    win = win[1:]
             state["corr"] = c
             polys = [[[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]] for b in BOXES]
 
@@ -1589,25 +2043,35 @@ def t_rec_window() -> None:
                                  assign, crop, {}, False)
             win.append((st, texts))
             if len(win) >= window:                        # 窗口满了：整窗结算（同步那条路）
-                settle(win)
+                settle(win, seq)
                 win = []
             elif lag and len(win) > lag:                  # 异步那条路：滞后 lag 帧就结算最老的一帧
-                settle(win[:1])
+                settle(win[:1], seq)
                 win = win[1:]
-            real = sum(int(pnd[2].nbytes) for c in v.live for pnd in c.pending)
-            book = sum(c.cache_bytes for c in v.live)
+            real = sum(int(pnd[2].nbytes) for c in (*v.live, *v.held) for pnd in c.pending)
+            book = sum(c.cache_bytes for c in (*v.live, *v.held))
             bad_cache[0] += (book != real or v.cache != book + sum(v.reserved.values())
                              or v.cache > v.cache_cap)
-        settle(win)
+        settle(win, len(CORR))
         v.flush_all(fh)
         rows = [json.loads(x) for x in fh.getvalue().splitlines()]
-        return rows, n_read, n_pend, v, bad_cache[0]
+        return rows, n_read, n_pend, v, bad_cache[0], settled_at
 
-    r0, read0, _p0, _v0, _c0 = run(0, 0)
-    r8, read8, pend8, v8, bad_cache = run(8, 0)
-    r8b, read8b, _p8b, _v8b, _c8b = run(8, 0)
-    ra, reada, penda, _va, _ca = run(8, 3)
-    _r1, read1, pend1, _v1, _c1 = run(8, 1)
+    r0, read0, _p0, _v0, _c0, _s0 = run(0, 0)
+    r8, read8, pend8, v8, bad_cache, _s8 = run(8, 0)
+    r8b, read8b, _p8b, _v8b, _c8b, _s8b = run(8, 0)
+    ra, reada, penda, _va, _ca, sat_lag = run(8, 3)
+    _r1, read1, pend1, _v1, _c1, _s1 = run(8, 1)
+    # 回来就结算（rec-batching 计划）：同一个领先上限（3 帧）、结果在 0~3 帧内随机回来
+    import random as _rnd
+    ready_ok = []
+    for seed in range(20):
+        rng = _rnd.Random(seed)
+        dl = [rng.randint(0, 3) for _ in CORR]
+        rr, readr, pendr, _vr, bad_r, sat_r = run(8, 3, dl)
+        ready_ok.append((all(sat_r[k] <= sat_lag[k] for k in sat_lag), readr <= reada, pendr <= penda, bad_r == 0,
+                         [(r["frame"], tuple(r["box"])) for r in rr] == [(r["frame"], tuple(r["box"])) for r in ra]))
+    _rz, readz, _pz, _vz, _cz, _sz = run(8, 3, [99] * len(CORR))     # 结果一直不回来：只剩领先上限的阻塞结算
 
     reused8 = [r for r in r8 if r.get("reused")]
     tokens = {r["text"] for r in r0} | {r["text"] for r in r8} | {r["text"] for r in ra}
@@ -1631,9 +2095,209 @@ def t_rec_window() -> None:
     # 一路读下去，而整窗同步在窗口边界一次清空——两者不单调可比。单调可比的是同一个窗口下的滞后长短
     check("同一个窗口，结果回得越早（滞后 1 对 3），文本待定的链越少、真读也越少",
           pend1 <= penda and read1 <= reada and penda > 0, (pend1, penda, read1, reada))
+    check("回来就结算：20 组随机回包时刻下，每帧结算不晚于顶在上限时、真读和待定不多于它、缓存记账逐帧对得上、行和框一致",
+          all(all(x) for x in ready_ok), [i for i, x in enumerate(ready_ok) if not all(x)])
+    check("回来就结算：结果一直不回来时只剩领先上限的阻塞结算，真读和顶在上限时相同", readz == reada, (readz, reada))
     check("窗口路径上**缓存记账逐帧对着真字节核**（拆 commit 那次就是这里错的；"
           "跑完才核一次会放过中途虚高——`t_reuse_v2` 那条本来就是逐帧的）",
           bad_cache == 0 and v8.stats["cache_overrun"] == 0, (bad_cache, v8.stats["cache_overrun"]))
+
+
+def t_rec_settle_ready() -> None:
+    """异步路径的"回来就结算"（`run_ocr2.Loop.settle_ready`，rec-batching 计划）在主循环这一层：不阻塞结算按帧序、
+    遇到第一帧没齐就停，不取走部分结果、不往池子的优先集里加东西（每帧都标优先的话挑批退回"一来就发"）；
+    以及它带来的复用口径（owner 2026-10-11：`rec_settle` 键进 `NOISE_EQUIV`，异步路径上的窗口大小进 `NOISE_EQUIV_IF`）。"""
+    print("结算时机：读数回来就结算")
+    from flowocr.extract import ocr_args as OA
+    from flowocr.extract.run_ocr2 import Loop
+
+    class Pool:
+        def __init__(self, done):
+            self.done, self.calls = set(done), []
+
+        def collect(self, rids, block=True, prio=False):
+            self.calls.append((tuple(rids), block, prio))
+            if all(r in self.done for r in rids):
+                return {r: ("t", 0.9) for r in rids}
+            return None
+
+    class V2:
+        def __init__(self):
+            self.seqs = []
+
+        def commit_stage2(self, st, texts, fh):
+            self.seqs.append(st["seq"])
+            return 0
+
+    class N:
+        frames, lost, rec, settled = 5, 0, 0, 0
+
+    lp = Loop.__new__(Loop)
+    lp.pool, lp.v2, lp.n, lp.fh, lp.settle_lag = Pool({0, 1, 2, 4}), V2(), N(), None, {}
+    lp.win = [{"seq": k, "idx": k} for k in range(4)]
+    lp.win_ids = [[(0, 0)], [(1, 0), (2, 1)], [(3, 0)], [(4, 0)]]      # 第 2 帧（请求 3）还没回来
+    lp.settle_ready()
+    check("不阻塞结算：按帧序收第 0、1 帧，第 2 帧没齐就停（第 3 帧回来了也不跳过去）",
+          lp.v2.seqs == [0, 1] and [w["seq"] for w in lp.win] == [2, 3] and lp.n.settled == 2, lp.v2.seqs)
+    check("不阻塞结算不标优先、不阻塞（每次 collect 都是 block=False, prio=False）",
+          all(not b and not p for _, b, p in lp.pool.calls), lp.pool.calls)
+    check("逐帧结算延迟记进 settle_lag（结算时它后面已判决几帧）", lp.settle_lag == {4: 1, 3: 1}, lp.settle_lag)
+
+    base = ["v.mp4", "--out", "x.jsonl"]
+    cur = OA.config_of(base)
+    no_key = {k: v for k, v in cur.items() if k != "rec_settle"}
+    check("`--rec-settle` 删了、键不再写；本分支记着 lag / ready 的 obs 和没这个键的旧 obs 都对上默认不重建",
+          "rec_settle" not in cur
+          and all(OA.config_differs({**no_key, "rec_settle": v}, cur) == [] for v in ("lag", "ready"))
+          and OA.config_differs(no_key, cur) == [], cur.get("rec_settle"))
+
+    def diff(a: list[str], b: list[str]) -> list[str]:
+        return OA.config_differs(OA.config_of(base + a), OA.config_of(base + b))
+    no_ra = {k: v for k, v in cur.items() if k != "recover_async"}
+    check("异步回补（--recover-async）过了两道门、进 NOISE_EQUIV：开 / 关 / 没这个键的旧 obs 互相复用",
+          diff(["--recover-async"], []) == [] and OA.config_differs(no_ra, OA.config_of(base + ["--recover-async"])) == []
+          and "recover_async" in OA.NOISE_EQUIV, diff(["--recover-async"], []))
+    check("两边都异步时窗口大小不同照样复用（4 对 8 / 32、1 对 4）",
+          diff(["--rec-window", "8"], []) == [] and diff(["--rec-window", "32"], []) == []
+          and diff(["--rec-window", "1"], []) == [], (diff(["--rec-window", "8"], []), diff(["--rec-window", "1"], [])))
+    check("同步和异步之间照旧判不同：窗口 0 对 4、同步窗口 4 对异步 4、两个同步窗口 4 对 8",
+          diff(["--rec-window", "0"], []) == ["rec_async", "rec_window"]
+          and diff(["--no-rec-async"], []) == ["rec_async"]
+          and diff(["--no-rec-async"], ["--no-rec-async", "--rec-window", "8"]) == ["rec_window"],
+          (diff(["--rec-window", "0"], []), diff(["--no-rec-async"], []),
+           diff(["--no-rec-async"], ["--no-rec-async", "--rec-window", "8"])))
+    old = {k: v for k, v in cur.items() if k not in ("rec_async", "rec_window")}
+    check("加窗口旋钮之前的旧 obs（缺键 = 同步逐帧）对上异步默认照旧判不同",
+          OA.config_differs(old, cur) == ["rec_async", "rec_window"], OA.config_differs(old, cur))
+    det = OA.parse_args(base + ["--device", "cpu", "--hwaccel=", "--rec-window", "0"])
+    check("确定性对账路径（--device cpu --hwaccel= --rec-window 0）不走异步池", not det.rec_async, det.rec_async)
+
+
+def t_reads_existing_gaps() -> None:
+    """rec-reads 计划第 1 阶段修的两个现有漏洞。
+
+    1. 读完就断链：第 s 帧真读（延续链）、读数还在途，第 s+1 帧链没接上——原来结束那一刻就把回补缓存丢了，
+       s 读回来发现文本变了也回补不了，前面的沿用行留着旧文本。现在还有读在途的结束链先留着缓存（`ReuseV2.held`），
+       最后一次读结算完再整条丢；读还在途时又被接回的不丢。
+    2. 换句时旧段漏标作废：回抠遇到同一条链换句、旧段还开着时，先 `_settle` 旧段再并作废标记，
+       于是回补改过的旧句照样写出 `on` 证据（hsr-s2 frame 13500 的实物）。"""
+    print("现有漏洞：读完就断链的回补、换句时旧段的作废")
+    import io
+    import json
+
+    import numpy as np
+
+    from flowocr.extract import edge_refine as ER
+    from flowocr.extract import ocr_args
+    from flowocr.extract.reuse_v2 import ReuseV2
+
+    box = [[10, 10, 70, 28]]
+    poly = [[[10, 10], [70, 10], [70, 28], [10, 28]]]
+    gray = np.zeros((100, 100), np.uint8)
+
+    change = {"at": 99}                                    # 真实文本在这一帧从 AAA 变成 BBB；回补读按裁剪里记的帧号给文本
+
+    def fresh():
+        args = ocr_args.parse_args(["dummy.mp4", "--out", "x.jsonl", "--no-refine-fused"])
+        st = {"corr": 1.0}
+        return ReuseV2(args, lambda a, b: st["corr"], lambda a, b: (0, 0),
+                       lambda c: ("BBB" if int(c[0, 0, 0]) >= change["at"] else "AAA", 0.99)), st
+
+    def stage1(v, st, seq, corr, present=True):
+        st["corr"] = corr
+        bx = box if present else []
+        dec, todo, assign = v.decide(seq, gray.copy(), bx)
+        s = v.commit_stage1(seq, seq * 30, seq * 500_000, bx, poly if present else [],
+                            list(dec) + [(i, "", 0.0, 0) for i in todo], set(todo), assign,
+                            lambda i: np.full((18, 60, 3), seq, np.uint8), {}, False)
+        return s, todo
+
+    def books_ok(v):
+        real = sum(int(pnd[2].nbytes) for c in (*v.live, *v.held) for pnd in c.pending)
+        book = sum(c.cache_bytes for c in (*v.live, *v.held))
+        return v.cache == book + sum(v.reserved.values()) and book == real
+
+    # 1. 帧 0 读 AAA（当场结算）；帧 1、2 沿用；帧 3 真读（在途）；帧 4 链没了；再按帧序结算 1~4，帧 3 读出 BBB。
+    #    真实文本在帧 2 就变了：回补要把帧 1 留成 AAA、帧 2 改成 BBB（变化点改对，不只是"回补过"）
+    change["at"] = 2
+    v, st = fresh()
+    fh = io.StringIO()
+    s0, t0 = stage1(v, st, 0, 1.0)
+    v.commit_stage2(s0, {i: ("AAA", 0.99) for i in t0}, fh)
+    win = [stage1(v, st, 1, 1.0), stage1(v, st, 2, 1.0), stage1(v, st, 3, 0.5), stage1(v, st, 4, 1.0, present=False)]
+    held_mid = len(v.held)
+    ok_mid = books_ok(v)
+    for (s_, todo), txt in zip(win, ["", "", "BBB", ""]):
+        v.commit_stage2(s_, {i: (txt, 0.99) for i in todo}, fh)
+    v.flush_all(fh)
+    rows = [json.loads(x) for x in fh.getvalue().splitlines()]
+    rec = [r for r in rows if r.get("recovered")]
+    check("读完就断链：读数还在途时链结束，缓存先留着（held 1 条、账对得上），读回来文本变了照常回补前面的沿用行",
+          [t0 == [0], [len(t) for _, t in win]] == [True, [0, 0, 1, 0]] and held_mid == 1 and ok_mid
+          and v.stats["recover_reads"] > 0 and [r["text"] for r in rows] == ["AAA", "AAA", "BBB", "BBB"],
+          (held_mid, ok_mid, v.stats["recover_reads"], [(r["frame"], r["text"]) for r in rows]))
+    check("读完就断链：最后一次读结算完，结束链的缓存整条丢掉，计数归零", v.held == [] and v.cache == 0 and books_ok(v),
+          (v.held, v.cache))
+
+    # 1b. 读在途时链在 s+2 才断（中间又沿用一帧）：照样回补，结束后沿用的那一帧也随整条释放
+    change["at"] = 3
+    v, st = fresh()
+    fh = io.StringIO()
+    s0, t0 = stage1(v, st, 0, 1.0)
+    v.commit_stage2(s0, {i: ("AAA", 0.99) for i in t0}, fh)
+    win = [stage1(v, st, 1, 1.0), stage1(v, st, 2, 1.0), stage1(v, st, 3, 0.5), stage1(v, st, 4, 1.0),
+           stage1(v, st, 5, 1.0, present=False)]
+    held_mid = len(v.held)
+    for (s_, todo), txt in zip(win, ["", "", "BBB", "", ""]):
+        v.commit_stage2(s_, {i: (txt, 0.99) for i in todo}, fh)
+    v.flush_all(fh)
+    rows = [json.loads(x) for x in fh.getvalue().splitlines()]
+    check("读在途时链在 s+2 才断：照样回补（帧 1、2 留 AAA，帧 3 起 BBB），最后整条释放、计数归零",
+          held_mid == 1 and [r["text"] for r in rows] == ["AAA", "AAA", "AAA", "BBB", "BBB"]
+          and v.held == [] and v.cache == 0 and books_ok(v),
+          (held_mid, [r["text"] for r in rows], v.cache))
+
+    # 2. 读还在途时链又被跨空档接回：不整条丢，接回之后攒的沿用行留着
+    v, st = fresh()
+    s0, t0 = stage1(v, st, 0, 1.0)
+    v.commit_stage2(s0, {i: ("AAA", 0.99) for i in t0}, io.StringIO())
+    win = [stage1(v, st, 1, 1.0), stage1(v, st, 2, 0.5), stage1(v, st, 3, 1.0, present=False)]
+    held_gap = len(v.held)
+    win.append(stage1(v, st, 4, 1.0))                     # 跨一帧空档接回（gap1）、沿用
+    relinked = v.held == [] and len(v.live) == 1 and [len(t) for _, t in win] == [0, 1, 0, 0]
+    for (s_, todo), txt in zip(win, ["", "BBB", "", ""]):
+        v.commit_stage2(s_, {i: (txt, 0.99) for i in todo}, io.StringIO())
+    ch = v.live[0] if v.live else None
+    check("读还在途时被跨空档接回：不算结束链（held 清空）、读回来照常回补，接回之后那一帧的缓存还在",
+          held_gap == 1 and relinked and ch is not None and [p[0] for p in ch.pending] == [4] and books_ok(v),
+          (held_gap, relinked, ch and [p[0] for p in ch.pending], v.cache))
+
+    # 3. 换句时旧段还开着：`_settle` 之前作废标记已经并进旧段
+    er = ER.EdgeRefiner(src_fps=60, start_idx=0, width=64, height=32, scale=1.0, grid=[1, 2, 1, 6], thr=.8)
+    er.abort()
+    er.anchor = (0, 0)
+    seen = []
+    er._capture = lambda seg, lo, hi: None
+    er._end = lambda *a, **k: None
+    er._settle = lambda seg, hi, b: seen.append(seg.stale)
+    b = [4, 4, 40, 20]
+    er._batch(0, 12, [(7, {}, b, "AAA", "new")], [], set())
+    er._batch(1, 18, [(7, {}, b, "XYZ", "changed")], [], {7})
+    check("换句时旧段还开着：停变时旧段已经带上作废标记（不然回补改过的旧句照样写出 on 证据）",
+          seen == [True], seen)
+
+
+def t_reuse_cache_budget() -> None:
+    """回补缓存预算 8 -> 32 MB（rec-reads 计划的 A）：量过的这两个值的 obs 互相复用（`EQUIV_VALUES`），别的预算照常判不同。"""
+    print("回补缓存预算：8 / 32 MB 互相复用")
+    from flowocr.extract import ocr_args as OA
+    base = ["v.mp4", "--out", "x.jsonl"]
+
+    def diff(mb):
+        return OA.config_differs(OA.config_of(base + ["--reuse-cache-mb", mb]), OA.config_of(base))
+    check("默认 32 MB；8 MB 的旧 obs 对上默认不重建，4 / 64 MB 照常判不同",
+          OA.parse_args(base).reuse_cache_mb == 32.0 and diff("8") == [] and diff("32") == []
+          and diff("4") == ["reuse_cache_mb"] and diff("64") == ["reuse_cache_mb"], (diff("8"), diff("4")))
 
 
 def t_recpool() -> None:
@@ -1666,7 +2330,7 @@ def t_recpool() -> None:
         return np.full((48, w, 3), v, np.uint8)
 
     rec = FakeRec()
-    pool = RecPool([rec], cap=8, ratio=0.0, knee=4)
+    pool = RecPool([rec], cap=8, knee=4)
     ids = pool.new_ids(12)
     pool.submit([(r, crop(i + 1)) for i, r in enumerate(ids)])
     got = pool.collect(ids)
@@ -1680,7 +2344,7 @@ def t_recpool() -> None:
     pool.close()
 
     # 后端少返回：**缺的位置必须是 None**，绝不能把后面的结果顶上来
-    pool = RecPool([FakeRec(drop=1)], cap=8, ratio=0.0, knee=1)
+    pool = RecPool([FakeRec(drop=1)], cap=8, knee=1)
     ids = pool.new_ids(3)
     pool.submit([(r, crop(9)) for r in ids])
     got = pool.collect(ids)
@@ -1689,7 +2353,7 @@ def t_recpool() -> None:
     pool.close()
 
     # 插队：优先项所在的那一组先走
-    pool = RecPool([FakeRec()], cap=8, ratio=0.0, knee=99)     # 膝点高到永远不自发
+    pool = RecPool([FakeRec()], cap=8, knee=99)     # 膝点高到永远不自发
     slow = pool.new_ids(2)
     pool.submit([(r, crop(1, 320)) for r in slow])
     fast = pool.new_ids(1)
@@ -1703,7 +2367,7 @@ def t_recpool() -> None:
         def predict(self, crops, batch_size=1):
             raise RuntimeError("后端炸了")
 
-    pool = RecPool([Boom()], cap=4, ratio=0.0, knee=1)
+    pool = RecPool([Boom()], cap=4, knee=1)
     ids = pool.new_ids(1)
     pool.submit([(ids[0], crop(3))])
     try:
@@ -1715,7 +2379,7 @@ def t_recpool() -> None:
 
     # 收工：关了之后要把排着的排空
     rec = FakeRec()
-    pool = RecPool([rec], cap=8, ratio=0.0, knee=99)
+    pool = RecPool([rec], cap=8, knee=99)
     ids = pool.new_ids(5)
     pool.submit([(r, crop(4)) for r in ids])
     pool.close()
@@ -1730,7 +2394,7 @@ def t_recpool() -> None:
 
     for R, want in ((FakeRec, 4), (ShapeRec, 1)):
         rec = R()
-        pool = RecPool([rec], cap=8, ratio=0.0, knee=99)
+        pool = RecPool([rec], cap=8, knee=99)
         ids = pool.new_ids(4)
         pool.submit([(r, crop(i + 1, w)) for i, (r, w) in enumerate(zip(ids, (330, 340, 600, 640)))])
         pool.close()
@@ -1752,7 +2416,7 @@ def t_recpool() -> None:
             return super().predict(crops, batch_size)
 
     a, b = SlowRec(), SlowRec()
-    pool = RecPool([a, b], cap=1, ratio=0.0, knee=1)
+    pool = RecPool([a, b], cap=1, knee=1)
     ids = pool.new_ids(6)
     pool.submit([(r, crop(i + 1)) for i, r in enumerate(ids)])
     got = pool.collect(ids)
@@ -1764,7 +2428,7 @@ def t_recpool() -> None:
 
 
 def t_recpack() -> None:
-    """rec 打包的纯函数（09-10）：近宽分组、异步池挑批、CTC 贪心解码。"""
+    """rec 打包的纯函数（09-10）：按宽分组、异步池挑批、CTC 贪心解码。"""
     print("recpack")
     import numpy as np
 
@@ -1779,28 +2443,21 @@ def t_recpack() -> None:
           and _oa.parse_args(["v.mp4", "--out", "a"]).ort_warm and "ort_warm" in _oa.NOISE_EQUIV, _ws)
     from flowocr.extract import recpack as rp
 
-    g = rp.group_near([320, 320, 336, 400, 320, 800], 0.0, 32)
-    check("ratio=0 就是同宽分桶", sorted(map(sorted, g)) == [[0, 1, 4], [2], [3], [5]])
-    g = rp.group_near([320, 320, 336, 400, 320, 800], 0.25, 32)
-    check("近宽：336/400 并进 320 那组（≤ 320×1.25），800 单独",
-          sorted(map(sorted, g)) == [[0, 1, 2, 3, 4], [5]])
-    check("组内最大宽不超过最小宽 ×(1+ratio)",
-          all(max(w) <= min(w) * 1.1 for w in
-              ([[320, 330, 352, 360, 500, 510][i] for i in grp]
-               for grp in rp.group_near([320, 330, 352, 360, 500, 510], 0.1, 32))))
-    check("每组至多 cap 个", max(map(len, rp.group_near([320] * 70, 0.0, 32))) == 32)
+    g = rp.group_width([320, 320, 336, 400, 320, 800], 32)
+    check("同宽的一组、不同宽的分开", sorted(map(sorted, g)) == [[0, 1, 4], [2], [3], [5]])
+    check("每组至多 cap 个", max(map(len, rp.group_width([320] * 70, 32))) == 32)
     check("每个下标恰好出现一次",
-          sorted(i for grp in rp.group_near([5, 3, 9, 3, 7], 0.5, 2) for i in grp) == [0, 1, 2, 3, 4])
+          sorted(i for grp in rp.group_width([5, 3, 9, 3, 7], 2) for i in grp) == [0, 1, 2, 3, 4])
 
     # pick_batch：异步消费者"有多少取多少"的判据（09-19，组批第二步）
-    check("pick_batch 空表返回空", rp.pick_batch([], 0.05, 32) == [])
+    check("pick_batch 空表返回空", rp.pick_batch([], 32) == [])
     check("没有优先项就取**最大的那一组**（两个桶 2 条和 5 条 -> 取 5 条，不等谁长满）",
-          rp.pick_batch([320, 320, 800, 800, 800, 800, 800], 0.0, 32) == [2, 3, 4, 5, 6])
+          rp.pick_batch([320, 320, 800, 800, 800, 800, 800], 32) == [2, 3, 4, 5, 6])
     check("有优先项就取**含优先项最多**的那一组（哪怕它更小）",
-          rp.pick_batch([320, 320, 800, 800, 800, 800, 800], 0.0, 32, {0, 1}) == [0, 1])
-    check("优先项那一组仍然按近宽 + cap 组好——插队不等于把批打小",
-          rp.pick_batch([320, 320, 320, 800], 0.0, 32, {0}) == [0, 1, 2])
-    check("pick_batch 也守 cap", len(rp.pick_batch([320] * 70, 0.0, 32)) == 32)
+          rp.pick_batch([320, 320, 800, 800, 800, 800, 800], 32, {0, 1}) == [0, 1])
+    check("优先项那一组仍然按宽 + cap 组好——插队不等于把批打小",
+          rp.pick_batch([320, 320, 320, 800], 32, {0}) == [0, 1, 2])
+    check("pick_batch 也守 cap", len(rp.pick_batch([320] * 70, 32)) == 32)
     # **反复取最大组 = 一次性分桶的同一批批**（静态集合下）。这是
     # `--rec-window 1 --rec-async` 能和同步路径逐字节相同的前提：一帧的裁剪一次到齐、中途没有新请求，
     # 于是后台线程一组一组地取，取出来的**批的集合**和 `predict_bucketed` 一次分好的完全一样（只是顺序不同）。
@@ -1809,11 +2466,11 @@ def t_recpack() -> None:
     same = True
     for _ in range(200):
         ws = [_rng.choice([320, 320, 320, 336, 352, 400, 480, 640, 960]) for _ in range(_rng.randint(1, 40))]
-        ratio, cap = _rng.choice([0.0, 0.05, 0.2]), _rng.choice([2, 8, 32])
-        one = sorted(sorted(g) for g in rp.group_near(ws, ratio, cap))
+        cap = _rng.choice([2, 8, 32])
+        one = sorted(sorted(g) for g in rp.group_width(ws, cap))
         left, got = list(range(len(ws))), []
         while left:
-            pick = rp.pick_batch([ws[i] for i in left], ratio, cap)
+            pick = rp.pick_batch([ws[i] for i in left], cap)
             got.append(sorted(left[k] for k in pick))
             left = [i for k, i in enumerate(left) if k not in set(pick)]
         same &= sorted(got) == one
@@ -1912,6 +2569,23 @@ def t_ocr_parallel() -> None:
     check("时间轴取首段起点、末段终点", m["pts_first_sec"] == 0.0 and m["pts_last_sec"] == 9.5)
     check("墙钟是外层的，不是各段相加", m["wall_sec"] == 6.0 and m["part_wall_sec"] == [5.0, 5.0])
     check("配置来自父进程（workers=2 进 config）", m["config"] == {"workers": 2} and m["complete"])
+    m_db = op.merge_metas([part(0.0, 4.5, det_batch=1), part(5.0, 9.5, det_batch=1)], {**base, "det_batch": "auto"},
+                          wall=6.0, cuts_sec=[5.0], interval=0.5)
+    check("合并后的 _meta.det_batch 是各段解析出的生效值，不是父进程的 auto", m_db["det_batch"] == 1, m_db.get("det_batch"))
+    _be = {"requested": "auto", "models": {"det": {"backend": "trt"}, "rec": {"backend": "trt"}}}
+    m_be = op.merge_metas([part(0.0, 4.5, backend=_be), part(5.0, 9.5, backend=_be)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+    check("--workers 合并后 _meta.backend 还在（父进程不建模型，从各段 meta 抄）", m_be.get("backend") == _be, m_be.get("backend"))
+    m_oop = op.merge_metas([part(0.0, 4.5, ort={"det": {"trt_oop": 3, "built": 2, "server": "127.0.0.1:9"}, "rec_side": [{"x": 1}]}),
+                            part(5.0, 9.5, ort={"det": {"trt_oop": 5, "trt_err": 1, "trt_err_first": "boom", "server": "127.0.0.1:9"}})],
+                           base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+    m_sep = op.merge_metas([part(0.0, 4.5, ort={"det": {"trt_oop": 3, "server": "pid:11"}}),
+                            part(5.0, 9.5, ort={"det": {"trt_oop": 5, "server": "pid:12"}}),
+                            part(10.0, 14.5, ort={"det": {"trt_oop": 6, "server": "pid:12"}})],
+                           base, wall=6.0, cuts_sec=[5.0, 10.0], interval=0.5)
+    m_none = op.merge_metas([part(0.0, 4.5, ort={"det": {"built": 2}}), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+    check("--workers 合并保留 TRT 按次退回的计数：按各段实际连的服务分组，同一服务取最大（回信是累计数）、不同服务相加；没有退回时不写",
+          m_oop.get("ort") == {"det": {"trt_oop": 5, "trt_err": 1, "trt_err_first": "boom"}} and "ort" not in m_none
+          and m_sep["ort"]["det"]["trt_oop"] == 9, (m_oop.get("ort"), m_sep.get("ort")))
     bad = op.merge_metas([part(0.0, 5.0), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
     check("**段间 PTS 不递增 → 不算完成**（每段内部的门管不到接缝）",
           not bad["complete"] and "段间" in bad["bad_pts"])
@@ -1946,9 +2620,10 @@ def t_ocr_parallel() -> None:
           "按整片估是 12 s（拒）——复审 2026-09-10",
           f3_5min < 0.125 and f3 > gate)
     from flowocr.extract import ocr_args
-    check("workers / det-batch 是产物参数（进 config，复用判据会比）",
+    check("workers / det-batch 进 config（workers 复用判据会比；det_batch owner 10-04 定为噪音级，NOISE_EQUIV 不比）",
           {"workers", "det_batch"} <= set(ocr_args.config_of(["v.mp4", "--out", "x"]))
-          and not ({"workers", "det_batch"} & ocr_args.NON_PRODUCT))
+          and not ({"workers", "det_batch"} & ocr_args.NON_PRODUCT)
+          and "det_batch" in ocr_args.NOISE_EQUIV and "workers" not in ocr_args.NOISE_EQUIV)
 
 
 def t_ptsclock() -> None:
@@ -2502,6 +3177,30 @@ def t_frame_grid() -> None:
         _ps = None
     if _ps is None:
         print("  （跳过 ppid 闭包的行为核对：这个解释器没有 psutil）")
+    elif sys.platform.startswith("linux"):
+        # Linux 上孤儿被收养、ppid 指不回这棵树：监督者设成 subreaper，孤儿归到它名下（2026-10-17 WSL 上的 Linux 试跑后补）。
+        # subreaper 是整个进程的属性，放进子解释器里核，不改守卫进程自己。顺带核 worker 随监督者死（PR_SET_PDEATHSIG）
+        _code = (
+            "import os, signal, subprocess, sys, time\n"
+            "import psutil\n"
+            "from flowocr.extract import supervisor as S\n"
+            "t0 = time.time()\n"
+            "sub = S._become_subreaper()\n"
+            "pp = subprocess.Popen([sys.executable, '-c', \"import subprocess, sys; q = subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(30)']); print(q.pid, flush=True)\"], stdout=subprocess.PIPE, text=True)\n"
+            "gc = int(pp.stdout.readline()); pp.wait()\n"
+            "clean = S._drain_tree({}, pp.pid, t0)\n"
+            "sup = subprocess.Popen([sys.executable, '-c', \"import subprocess, sys, time; from flowocr.extract import supervisor as S; "
+            "w = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], preexec_fn=S._die_with_parent()); "
+            "print(w.pid, flush=True); time.sleep(30)\"], stdout=subprocess.PIPE, text=True)\n"
+            "w = int(sup.stdout.readline()); sup.send_signal(signal.SIGKILL); sup.wait()\n"
+            "gone = psutil.wait_procs([psutil.Process(w)], timeout=5)[1] == []\n"
+            "print(sub, clean, psutil.pid_exists(gc), gone)\n")
+        _r = subprocess.run([sys.executable, "-c", _code], capture_output=True, text=True, timeout=60)
+        check("Linux：监督者是 subreaper，父进程已退、轮询没记到的孙进程也找得到、杀得掉；监督者被强杀时 worker 跟着死",
+              _r.stdout.split() == ["True", "True", "False", "True"], (_r.stdout, _r.stderr[-500:]))
+    elif sys.platform != "win32":
+        print("  （跳过 ppid 闭包的行为核对：Job Object 只有 Windows 有，subreaper 只有 Linux 有）")
     else:
         import time
 
@@ -2693,7 +3392,7 @@ def t_accel_defaults() -> None:
     old = {k: v for k, v in oa.config_of(base).items()
            if k not in ("rec_engine", "det_engine", "rec_onnx", "det_onnx", "det_prefetch",
                         "ort_share", "ort_max_sessions", "ort_share_mem", "ort_batch_ladder", "pregate",
-                        "rec_async", "rec_knee", "rec_near", "rec_window")}
+                        "rec_async", "rec_knee", "rec_window")}
     # 2026-09-23 翻的两批默认：`--ort-share-mem`（池子跟着到 64；文本 0 行改动 -> owner 定噪音级，进 NOISE_EQUIV、不重建）
     # 和异步 rec（`--rec-window 4 --rec-async --rec-knee 1`，改读哪一帧，照规矩重建）
     want_diff = ["rec_async", "rec_engine", "rec_knee", "rec_window"]
@@ -2705,9 +3404,10 @@ def t_accel_defaults() -> None:
     # SCHEDULING 的门槛：只放"取任何值都不改产物"的键，别当成第二个 ADDED_NOOP
     check("SCHEDULING 的成员是白名单，不许随手加",
           oa.SCHEDULING == frozenset({"det_prefetch", "edge_proc", "decode_shards", "decode_block", "front_proc", "det_proc",
-                                      "det_lookahead"}),
+                                      "det_lookahead", "flush_lag"}),
           sorted(oa.SCHEDULING))   # det_proc / decode_shards：gi-s1 60 s 确定性路径 obs_identical 逐字节相同（decode-buffer §8.22 / §8.24）；
-                                   # det_lookahead：同一段同一路径 0 / 1 两趟 obs_identical（2026-09-25，tmp/tl/detlook0925）
+                                   # det_lookahead：同一段同一路径 0 / 1 两趟 obs_identical（2026-09-25，tmp/tl/detlook0925）；
+                                   # flush_lag：gi-s2 60 s CPU 软解，窗口 0 和同步窗口 32 各 0 / 非 0 两趟 obs_identical，后者推迟写 109 次（2026-10-12，tmp/meas/s6）
     check("SCHEDULING 和 NON_PRODUCT 不重叠（重叠了就分不出臂）",
           not (oa.SCHEDULING & oa.NON_PRODUCT))
     check("det_prefetch 已从 ADDED_NOOP 挪走（留着会让人以为只有 0 才赦免）",
@@ -2772,6 +3472,33 @@ def t_model_paths() -> None:
           and _oa_m.config_differs(_mc, {**_mc, "det_onnx": "mine.onnx"}) == ["det_onnx"]
           and "rec_onnx" not in _oa_m.NOISE_EQUIV and "det_onnx" not in _oa_m.NOISE_EQUIV
           and not _oa_m.same_arm(["v.mp4", "--out", "a"], ["v.mp4", "--out", "b", "--rec-onnx", "x.onnx"]))
+    # --det-precision（defaults.md 1.58）：默认 fp16、只在 GPU 上换；CPU / 设备不明取 fp32；给了 --det-onnx 默认取 fp32、显式 fp16 才报错；噪音级互相复用
+    from flowocr.extract import run_ocr2 as _r2m
+    _dp = _oa_m.resolve(_oa_m.build_parser().parse_args(["v.mp4", "--out", "o", "--det-precision", "fp16"]))
+    _fp16_called = []
+    _orig_fp16 = FM.fp16_path
+    FM.fp16_path = lambda name: _fp16_called.append(name) or "det_fp16.onnx"
+    _orig_path = FM.path
+    FM.path = lambda name: f"{name}_fp32.onnx"
+    try:
+        check("--det-precision fp16：GPU 上取半精度派生图，CPU 和设备不明（判语言探测）取 fp32",
+              _r2m.onnx_path(_dp, "det", "gpu:0") == "det_fp16.onnx" and _r2m.onnx_path(_dp, "det", "cpu") == "det_fp32.onnx"
+              and _r2m.onnx_path(_dp, "det") == "det_fp32.onnx" and _r2m.onnx_path(_dp, "rec", "gpu:0") != "det_fp16.onnx"
+              and _fp16_called == ["det"])
+    finally:
+        FM.fp16_path, FM.path = _orig_fp16, _orig_path
+    check("--det-precision：没给 = fp16，给了 --det-onnx 没给精度 = fp32；fp16 / fp32 / 老产物没这个键的互相复用（NOISE_EQUIV，owner 2026-10-16）",
+          _mc["det_precision"] == "fp16"
+          and _oa_m.config_of(["v.mp4", "--out", "o", "--det-onnx", "x.onnx"])["det_precision"] == "fp32"
+          and _oa_m.config_differs({k: v for k, v in _mc.items() if k != "det_precision"}, _mc) == []
+          and _oa_m.config_differs(_mc, {**_mc, "det_precision": "fp32"}) == []
+          and "det_precision" in _oa_m.NOISE_EQUIV and "det_precision" not in _oa_m.ADDED_NOOP)
+    try:
+        _oa_m.resolve(_oa_m.build_parser().parse_args(["v.mp4", "--out", "o", "--det-precision", "fp16", "--det-onnx", "x.onnx"]))
+        _both = False
+    except SystemExit:
+        _both = True
+    check("显式 --det-precision fp16 和 --det-onnx 同给直接报错（半精度只从默认 det 派生）", _both)
     # 源文件换了（表里换提交号 / 重新下载），派生的 argmax 图必须重做（Codex 复审：原来只看派生文件在不在）——全离线造一个小模型走 ensure
     _saved_mr = os.environ.get("FLOWOCR_MODELS")
     try:
@@ -2799,6 +3526,9 @@ def t_model_paths() -> None:
             check("源文件换了派生的 argmax 图就重做（按来源 sha 判，不按文件在不在）",
                   _first == ["Identity", "ArgMax", "ReduceMax"] and _stale and not FM.derived_stale(_m2)
                   and _second == ["Relu", "ArgMax", "ReduceMax"], (_first, _stale, _second))
+            FM._src_mark(_m2).write_text(_s2 + "\n", encoding="utf-8")       # 旧版标记：只有源文件 sha、没有融合做法的版本
+            check("融合做法换了版本（来源标记里没有 / 不是现在的 FUSE_VERSION）派生图也算过期；派生文件名带版本",
+                  FM.derived_stale(_m2) and _m2.onnx.name == f"inference_argmax{FM.FUSE_VERSION}.onnx")
     except ImportError:
         print("  SKIP  派生图过期（这个解释器没装 onnx）")
     finally:
@@ -2817,10 +3547,95 @@ def t_model_paths() -> None:
             onnx.save(helper.make_model(_g), str(_td / "a.onnx"))
             FM.fuse_argmax(_td / "a.onnx", _td / "b.onnx")
             _m = onnx.load(str(_td / "b.onnx"))
+            # 改名失败（Windows 上目标正被别人开着）：标记已是这次要写的才接受别人那份，过期的旧图照旧抛、不标成新的
+            from unittest import mock as _mk
+            _dst, _mark = _td / "b.onnx", _td / "b.onnx.src-sha256"
+            _mark.write_text("old\n", encoding="utf-8")
+            with _mk.patch.object(FM.os, "replace", side_effect=PermissionError("in use")):
+                _stale_raised = raises(lambda: FM.fuse_argmax(_td / "a.onnx", _dst, mark=_mark, want="new"), PermissionError)
+                _mark_after_stale = _mark.read_text(encoding="utf-8").strip()
+                _mark.write_text("new\n", encoding="utf-8")
+                FM.fuse_argmax(_td / "a.onnx", _dst, mark=_mark, want="new")      # 别的进程已发布同一版：不抛
+            FM.fuse_argmax(_td / "a.onnx", _dst, mark=_mark, want="v3")
+            check("派生图改名失败时：目标是过期旧图（标记不对）就抛、标记不改；标记已是这一版才接受别人那份；改名成功才写标记；不留 .part-<pid>",
+                  _stale_raised and _mark_after_stale == "old" and _mark.read_text(encoding="utf-8").strip() == "v3"
+                  and not list(_td.glob("*.part-*")), (_stale_raised, _mark_after_stale))
             check("fuse_argmax：输出换成 cls(int64) + prob，原有节点一个不动、只多两个",
                   [o.name for o in _m.graph.output] == ["cls", "prob"]
                   and _m.graph.output[0].type.tensor_type.elem_type == TensorProto.INT64
                   and [n.op_type for n in _m.graph.node] == ["Identity", "ArgMax", "ReduceMax"])
+            # 两级归约：C = 37 分 4 段（每段 10，补 3 个 0）；并列最大（同段 / 跨段 / 末段）、整段为 0、最大值在最后一个类别
+            _g = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "g",
+                                   [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", 37])],
+                                   [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["b", "t", 37])])
+            import numpy as _np
+            import onnxruntime as _ort
+            _outs = []
+            for _ops in (11, 13, 18):                # Squeeze / ReduceMax 的 axes 在 13 / 18 从属性改成输入；PP-OCRv6 的 rec 是 11
+                onnx.save(helper.make_model(_g, opset_imports=[helper.make_opsetid("", _ops)]), str(_td / f"c{_ops}.onnx"))
+                FM.fuse_argmax(_td / f"c{_ops}.onnx", _td / f"d{_ops}.onnx", split=4)
+            _x = _np.random.default_rng(0).random((3, 6, 37)).astype(_np.float32)
+            _x[0, 0, [3, 7]] = 2.0                  # 同段并列
+            _x[0, 1, [9, 10]] = 2.0                 # 跨段边界并列
+            _x[0, 2, [31, 36]] = 2.0                # 末段并列
+            _x[1, 0, :] = 0.0                       # 整行为 0：第一个最大是下标 0
+            _x[1, 1, :10] = 0.0                     # 整段为 0
+            _x[1, 2, 36] = 5.0                      # 最大值在最后一个类别（补齐段之前）
+            for _ops in (11, 13, 18):
+                _cls, _prob = _ort.InferenceSession(str(_td / f"d{_ops}.onnx"), providers=["CPUExecutionProvider"]).run(None, {"x": _x})
+                _m = onnx.load(str(_td / f"d{_ops}.onnx"))
+                _outs.append(_np.array_equal(_cls, _x.argmax(-1)) and _np.array_equal(_prob, _x.max(-1))
+                             and _m.graph.node[0].op_type == "Identity" and [o.name for o in _m.graph.output] == ["cls", "prob"])
+            _g5 = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "g",       # C 太小、退回一级：opset 18 的 ReduceMax 也得合法
+                                    [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", 5])],
+                                    [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["b", "t", 5])])
+            onnx.save(helper.make_model(_g5, opset_imports=[helper.make_opsetid("", 18)]), str(_td / "g.onnx"))
+            FM.fuse_argmax(_td / "g.onnx", _td / "h.onnx")
+            _x5 = _x[:, :, :5].copy()
+            _c5, _p5 = _ort.InferenceSession(str(_td / "h.onnx"), providers=["CPUExecutionProvider"]).run(None, {"x": _x5})
+            _outs.append(_np.array_equal(_c5, _x5.argmax(-1)) and _np.array_equal(_p5, _x5.max(-1)))
+            _m7 = helper.make_model(_g, opset_imports=[helper.make_opsetid("", 7)])          # 韩 / 俄 / 泰的 rec：IR 3 / opset 7，退回一级
+            _m7.ir_version = 3
+            onnx.save(_m7, str(_td / "o7.onnx"))
+            FM.fuse_argmax(_td / "o7.onnx", _td / "p7.onnx", split=4)
+            _c7, _p7 = _ort.InferenceSession(str(_td / "p7.onnx"), providers=["CPUExecutionProvider"]).run(None, {"x": _x})
+            _outs.append(_np.array_equal(_c7, _x.argmax(-1)) and _np.array_equal(_p7, _x.max(-1))
+                         and not onnx.load(str(_td / "p7.onnx")).graph.initializer)
+            _g40 = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "g",
+                                     [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", 40])],
+                                     [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["b", "t", 40])])
+            onnx.save(helper.make_model(_g40, opset_imports=[helper.make_opsetid("", 11)]), str(_td / "e.onnx"))
+            FM.fuse_argmax(_td / "e.onnx", _td / "f.onnx", split=4)          # 40 能被 4 整除：不补齐
+            _x40 = _np.random.default_rng(1).random((2, 5, 40)).astype(_np.float32)
+            _x40[0, 0, [9, 10, 39]] = 3.0
+            _c40, _p40 = _ort.InferenceSession(str(_td / "f.onnx"), providers=["CPUExecutionProvider"]).run(None, {"x": _x40})
+            _outs.append(_np.array_equal(_c40, _x40.argmax(-1)) and _np.array_equal(_p40, _x40.max(-1))
+                         and "Pad" not in [n.op_type for n in onnx.load(str(_td / "f.onnx")).graph.node])
+            check("fuse_argmax 两级归约（opset 11 / 13 / 18；C 除得尽时不补齐；C 太小退回一级时 opset 18 也合法；IR 3 / opset 7 的老图退回一级、不加 initializer、ORT 加载得了）：和整行的第一个最大逐位相同（并列取低下标、整段为 0、末段、补齐段选不中），原有节点不动",
+                  all(_outs), _outs)
+            # 融合产物的结构指纹（节点、属性、initializer 的值）钉在 FUSE_VERSION 上：改了融合做法就得升版本，
+            # 不然已经生成过派生图的模型根不会重做（来源标记只认版本号）。三份：真实的 C = 18710 / opset 11、opset 18 补齐、IR 3 / opset 7 退回一级
+            import hashlib
+            from onnx import numpy_helper
+
+            def _fp(m) -> str:
+                parts = [(n.op_type, list(n.input), list(n.output), sorted((at.name, repr(helper.get_attribute_value(at))) for at in n.attribute))
+                         for n in m.graph.node] + [(t.name, numpy_helper.to_array(t).tolist()) for t in m.graph.initializer]
+                return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+            _fps = []
+            for _c, _ops, _ir in ((18710, 11, None), (37, 18, None), (37, 7, 3)):
+                _gf = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "g",
+                                        [helper.make_tensor_value_info("x", TensorProto.FLOAT, ["b", "t", _c])],
+                                        [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["b", "t", _c])])
+                _mf = helper.make_model(_gf, opset_imports=[helper.make_opsetid("", _ops)])
+                if _ir:
+                    _mf.ir_version = _ir
+                onnx.save(_mf, str(_td / "fp.onnx"))
+                FM.fuse_argmax(_td / "fp.onnx", _td / "fp2.onnx", **({} if _c > 1000 else {"split": 4}))
+                _fps.append(_fp(onnx.load(str(_td / "fp2.onnx"))))
+            _pinned = {2: ["30203670d939b452", "55179ea9c5fd54bf", "819d6fab79a64250"]}
+            check("fuse_argmax 的产物结构钉在 FUSE_VERSION 上（改了融合做法就升版本，再在这里登记新指纹）",
+                  _pinned.get(FM.FUSE_VERSION) == _fps, (FM.FUSE_VERSION, _fps))
     except ImportError:
         print("  SKIP  fuse_argmax（这个解释器没装 onnx）")
     # ORT worker 的解释器：当前解释器装了 onnxruntime 就用自己，否则 onnxrt 实验目录 那个 venv（生产 venv 故意不装）
@@ -2839,11 +3654,11 @@ def t_model_paths() -> None:
         os.environ.pop("FLOWOCR_ORT_PYTHON", None)
     src = (ROOT / "src" / "flowocr" / "extract" / "ort_server.py").read_text(encoding="utf-8")
     check("ort_server：有 CUDA EP 却回落到 CPU 仍然退出码 3（不静默跑 CPU），只有 CPU 包才走 CPU",
-          "cuda_ok and \"CUDA\" not in prov" in src and "return 3" in src and '"CPUExecutionProvider"' in src)
+          '"CUDA" not in s.get_providers()[0]' in src and "provider 回落" in src and "return 3" in src and '"CPUExecutionProvider"' in src)
     # 2026-09-22 ORT 1.26 + cuDNN 9.9 在 sm_120 上：EXHAUSTIVE 搜索对 fp16 卷积没有可用引擎，ORT 的 python 封装会静默重建成 CPU session；
     # DEFAULT 能跑但慢 25 倍，所以默认**不能**是 DEFAULT
-    check("ort_server：cuDNN 卷积搜索可开臂、默认仍是 EXHAUSTIVE（DEFAULT 慢 25 倍），且关掉 ORT 的静默 CPU 回落",
-          'default="EXHAUSTIVE"' in src and '"cudnn_conv_algo_search": a.cudnn_conv_search' in src and "s.disable_fallback()" in src)
+    check("ort_server：cuDNN 卷积搜索可开臂、默认仍是 EXHAUSTIVE（DEFAULT 慢 25 倍），且建 session 时就关掉 ORT 的静默 CPU 回落（建失败时它还往 stdout 打字）",
+          'default="EXHAUSTIVE"' in src and '"cudnn_conv_algo_search": a.cudnn_conv_search' in src and "enable_fallback=0" in src)
     check("ort_server：stdin 模式下推理抛错回 error 行给调用方，不带着 traceback 死在 DEVNULL 里",
           '{"error": repr(e)[:2000]}' in src)
     src3 = (ROOT / "src" / "flowocr" / "extract" / "ortclient.py").read_text(encoding="utf-8")
@@ -2866,7 +3681,8 @@ def t_model_paths() -> None:
         import threading as _th
 
         import numpy as _np
-        _cli = ortclient.OrtClient({"rec": str(_fm.MODELS["rec"].onnx)}, device="cpu", extra_args=["--side-listen"])
+        _cli = ortclient.OrtClient({"rec": str(_fm.MODELS["rec"].onnx)}, device="cpu",
+                                   extra_args=["--side-listen", "--admit", "rec=640:bw"])
         try:
             _side = _cli.side_channel()
             _x = [_np.random.default_rng(k).standard_normal((2, 3, 48, 320)).astype(_np.float32) for k in (0, 1)]
@@ -2880,10 +3696,14 @@ def t_model_paths() -> None:
             [t.join() for t in _ts]
             _same = all(_got[k] is not None and _np.array_equal(_ref[k][0], _got[k][0])
                         and _np.allclose(_ref[k][1], _got[k][1], atol=1e-5) for k in (0, 1))
+            _st = [c.stats() for c in (_cli, _side)]
             _side.close()
         finally:
             _cli.close()
         check("旁路连接：同一个服务上两条连接同时推理，结果和串行相同（cls 逐位、prob 1e-5 内）", _same)
+        check("开了准入时 stats() 带准入等待（`server_admit_sec` ≤ 等回信的总时长、单次最长 ≤ 总和）",
+              all(0 <= st["server_admit_sec"] <= st["wait_sec"] + 0.01
+                  and st["server_admit_max_ms"] <= st["server_admit_sec"] * 1000 + 0.1 for st in _st), _st)
     src2 = (ROOT / "src" / "flowocr" / "extract" / "run_ocr2.py").read_text(encoding="utf-8")
     # child_env：源码态把 src/ 放进 PYTHONPATH 最前面；安装态什么都不加（site-packages 进 PYTHONPATH 会泄漏给别的解释器起的子进程，
     # 2026-09-22 nightly：FLOWOCR_ORT_PYTHON 钉到 1.29 的 venv，worker 却 import 到了本 venv 的 ORT 1.26 + cu12 库）
@@ -2941,7 +3761,8 @@ def t_model_paths() -> None:
                 "RuntimeError: ORT worker 起不来：…；它的 stderr 尾部：LoadLibrary failed with error 126 when trying to load onnxruntime_providers_cuda.dll",
                 "RuntimeError: ORT worker 起不来：{'error': 'rec 的 provider 回落到 CPUExecutionProvider（这份 onnxruntime 有 CUDA EP 却没用上）'}",
                 "OSError: CUDA driver version is insufficient for CUDA runtime version",
-                'OSError: [WinError 126] Error loading "C:\\x\\cudnn64_9.dll" or one of its dependencies.']
+                'OSError: [WinError 126] Error loading "C:\\x\\cudnn64_9.dll" or one of its dependencies.',
+                "RuntimeError: Failed to load library libonnxruntime_providers_cuda.so with error: libcuda.so.1: cannot open shared object file: No such file or directory"]
     _err = ["RuntimeError: ORT worker 报错：operation not permitted when stream is capturing",
             "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB",
             "ValueError: 输入 120 MB 超过共享内存的输入区",
@@ -3000,9 +3821,10 @@ def t_model_paths() -> None:
           {k: {c: v for c, v in s.items() if c != "diffs"} for k, s in pst.items()})
 
 
+@high_quality_default
 def t_extract_debts() -> None:
     """提取层代码欠账（2026-09-26，followups「提取与推理」）：看得见几张卡、多组先取模型、裁不了的 region_crop 复用、
-    捕图读写闸、回抠进程的等待与收尾、精确 seek 退半帧。"""
+    回抠进程的等待与收尾、精确 seek 退半帧。"""
     print("\n## 提取层代码欠账")
     import threading
     from types import SimpleNamespace as _NS
@@ -3012,6 +3834,7 @@ def t_extract_debts() -> None:
     def proxy(stall: float):
         p = EP.EdgeProxy.__new__(EP.EdgeProxy)      # 不起子进程，只测等待判据
         p.cv, p.done_seq, p.error, p.stats, p.stall_sec = threading.Condition(), 0, None, None, stall
+        p.work_progress = 0
         return p
     slow = proxy(0.4)
 
@@ -3026,6 +3849,7 @@ def t_extract_debts() -> None:
     stuck = proxy(0.4)
     t0 = _time.perf_counter()
     stuck._wait(lambda: stuck.done_seq >= 1, "等")
+    stuck_dt = _time.perf_counter() - t0             # 只量这一步：判卡要等满 stall_sec、又不能一直等下去
     import os as _os
     from flowocr.extract import ocr_args as _OA
     saved = _os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -3047,7 +3871,7 @@ def t_extract_debts() -> None:
     # 2026-10 去掉 Paddle：原来这里还要先取 Paddle 的官方模型（prefetch_paddle_models）；ORT 的模型由共享服务在父进程里取
     check("run_groups 并行起多组之前在父进程起共享服务、det / rec 两个模型都先取好（首跑时几组子进程同时取同一份模型会整批失败）",
           "R.start_ort_services(args" in _insp.getsource(_RG.main)
-          and 'want = [("rec", onnx_path(args, "rec")), ("det", onnx_path(args, "det"))]' in _ro2s)
+          and 'want = [("rec", onnx_path(args, "rec")), ("det", onnx_path(args, "det", srv_dev))]' in _ro2s)
     import json as _json
     from flowocr.extract import framesource as _FS, ocr_complete as _OC
     with tempfile.TemporaryDirectory() as rd:
@@ -3068,35 +3892,6 @@ def t_extract_debts() -> None:
               crop_reusable(off, ["--no-region-crop"]) and crop_reusable(off)
               and not crop_reusable({"region_crop": [0, 0, 100, 50]}, ["--no-region-crop"])
               and crop_reusable({"region_crop": [0, 0, 100, 50]}))
-    from flowocr.extract import ort_server as _OS
-    g = _OS._CaptureGate()
-    order: list = []
-    held = threading.Event()
-
-    def reader(tag, hold):
-        with g.shared():
-            order.append(f"{tag}+")
-            held.set()
-            _time.sleep(hold)
-            order.append(f"{tag}-")
-
-    def writer():
-        held.wait()
-        with g.exclusive():
-            order.append("W+")
-            _time.sleep(0.05)
-            order.append("W-")
-    t_r1 = threading.Thread(target=reader, args=("r1", 0.3))
-    t_w = threading.Thread(target=writer)
-    t_r1.start()
-    t_w.start()
-    _time.sleep(0.1)                                 # 写者已经在排队：之后来的读者要等写者做完
-    t_r2 = threading.Thread(target=reader, args=("r2", 0.0))
-    t_r2.start()
-    for t_ in (t_r1, t_w, t_r2):
-        t_.join(5)
-    check("捕图的读写闸：独占等在途的共享都退出才进；写者排上队之后新来的共享先等（不被源源不断的推理饿死）",
-          order == ["r1+", "r1-", "W+", "W-", "r2+", "r2-"], order)
     fin = proxy(0.3)
     fin.last_seq, fin.wait_sec = 4, 0.0
     fin._send = lambda msg: None
@@ -3118,8 +3913,8 @@ def t_extract_debts() -> None:
     check("回抠进程收尾分两段：积压按进度等，批号到头之后的结尾窗 / 汇总给固定宽限（没有进度信号，按 stall_sec 判会误伤）",
           fin.error is None and fin_stats.get("segments") == 1, fin.error)
     check("回抠进程的等待按进度判卡（同解码分片）：一直在前进就不判，批号不动 stall_sec 才判",
-          slow.error is None and slow.done_seq == 8 and stuck.error is not None and _time.perf_counter() - t0 < 2.5,
-          (slow.error, stuck.error))
+          slow.error is None and slow.done_seq == 8 and stuck.error is not None and 0.35 <= stuck_dt < 2.0,
+          (slow.error, stuck.error, round(stuck_dt, 3)))
 
     from flowocr.extract import framesource as fsx
     # 精确 seek 退半帧：毫秒量化 pts 的帧（比 帧号/帧率 早 0.33 ms）不能被 seek 丢掉（yuka-f5 14843 s，--fps 2.2）
@@ -3142,23 +3937,588 @@ def t_recover_batch() -> None:
 
     def setup():
         v = RV.ReuseV2.__new__(RV.ReuseV2)
-        v.stats = {"recover_reads": 0, "recover_events": 0}
         v.calls = []
         v.rec_one = None
         v.rec_many = lambda crops: (v.calls.append(list(crops)), [(truth[c], 0.9) for c in crops])[1]
-        c1, c2 = RV.Chain([0, 0, 10, 10], "A", 0.9, 0), RV.Chain([0, 20, 10, 30], "X", 0.9, 0)
         p1 = [[j, {"text": "A", "conf": 0.9, "reused": True}, f"c1-{j}"] for j in range(7)]
         p2 = [[j, {"text": "X", "conf": 0.9, "reused": True}, f"c2-{j}"] for j in range(3)]
-        return v, [(c1, "B", 0.9, p1), (c2, "Y", 0.9, p2)]
+        return v, [RV.RecoverTask(("A", 0.9), ("B", 0.9), p1), RV.RecoverTask(("X", 0.9), ("Y", 0.9), p2)], (p1, p2)
 
-    vs, jobs_s = setup()
-    sep = vs._recover(jobs_s[:1]) + vs._recover(jobs_s[1:])
-    vj, jobs_j = setup()
-    joint = vj._recover(jobs_j)
-    rows = lambda jobs: [[r[1]["text"] for r in p] for _, _, _, p in jobs]
-    check("回补跨链并批：两条链一起二分，读的框、写回的文本、返回值和逐链做一样；每层只发一次（调用数 = 最深那条链的层数）",
-          joint == sep and rows(jobs_j) == rows(jobs_s) == [["A"] * 4 + ["B"] * 3, ["X", "Y", "Y"]]
+    def run(v, groups):
+        for g in groups:
+            v._run_tasks(g)
+            for t in g:
+                t.apply()
+
+    vs, ts, ps = setup()
+    run(vs, [ts[:1], ts[1:]])
+    vj, tj, pj = setup()
+    run(vj, [tj])
+    rows = lambda pp: [[r[1]["text"] for r in p] for p in pp]      # noqa: E731
+    res = lambda tt: [(t.reads, t.changed) for t in tt]             # noqa: E731
+    check("回补跨链并批：两条链一起二分，读的框、写回的文本、读数和改没改历史都和逐链做一样；每层只发一次（调用数 = 最深那条链的层数）",
+          res(tj) == res(ts) and rows(pj) == rows(ps) == [["A"] * 4 + ["B"] * 3, ["X", "Y", "Y"]]
           and sorted(c for call in vj.calls for c in call) == sorted(c for call in vs.calls for c in call)
-          and len(vj.calls) == max(sum(1 for call in vs.calls if call[0].startswith(p)) for p in ("c1", "c2"))
-          and vj.stats == vs.stats == {"recover_reads": sum(r for r, _ in sep), "recover_events": 2},
-          (joint, sep, vj.calls, vs.calls))
+          and len(vj.calls) == max(sum(1 for call in vs.calls if call[0].startswith(p)) for p in ("c1", "c2")),
+          (res(tj), res(ts), vj.calls, vs.calls))
+    # 改没改历史对着发起时的文本比（不是对着中途被覆盖过的行）：只差标点的读数不算改
+    pp = [[j, {"text": "AB。", "conf": 0.9, "reused": True}, j] for j in range(4)]
+    t = RV.RecoverTask(("AB。", 0.9), ("XY", 0.9), pp)
+    reads = {0: "AB", 1: "AB、", 2: "XY", 3: "XY"}
+    while (cs := t.next_layer()):
+        t.feed([(reads[c], 0.9) for c in cs])
+    t.apply()
+    check("二分只差标点不算改历史：changed 只因真变了的行成立；中点行换成这次的读数并标 recovered",
+          t.changed and [r[1]["text"] for r in pp] == ["AB。", "AB、", "XY", "XY"]
+          and pp[1][1].get("recovered") and "reused" not in pp[1][1], [r[1] for r in pp])
+
+
+def t_recover_async() -> None:
+    """回补异步（`--recover-async`，rec-reads 计划的 B）：二分交给池子逐层推进，主线程不等；
+    没做完之前那一帧和之后的回抠批次扣着不送（最多 `hold_max` 个），落盘不越过任务会改的行、
+    要等的回抠批还扣着时先送出去。rec 的读数只由裁剪决定时，产物、回抠收到的批次（含作废标记）和回补计数都要和同步回补逐项相同。"""
+    print("回补异步")
+    import io
+    import json
+    import random as _rnd
+
+    import numpy as np
+
+    from flowocr.extract import edge_refine as ER
+    from flowocr.extract import ocr_args
+    from flowocr.extract.reuse_v2 import ReuseV2
+
+    NB, NF = 3, 160
+    boxes = [[10, 10 + 30 * k, 90, 28 + 30 * k] for k in range(NB)]
+    polys = [[[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]] for b in boxes]
+    gray = np.zeros((120, 120), np.uint8)
+    rng0 = _rnd.Random(11)
+    change = [sorted(rng0.sample(range(1, NF), 9)) for _ in range(NB)]
+
+    def truth(k, seq):
+        return "T%d-%d" % (k, sum(seq >= c for c in change[k]))
+
+    def read(crop):
+        return truth(int(crop[0, 0, 1]), int(crop[0, 0, 0]) + 256 * int(crop[0, 0, 2])), 0.9
+
+    class Sink:
+        def __init__(self, v):
+            self.v, self.seen, self.bad_wait, self.sent, self.uid = v, [], 0, -1, {}
+
+        def u(self, k):                                  # 链 uid 是全局计数，两趟之间按出现顺序重新编号
+            return self.uid.setdefault(k, len(self.uid))
+
+        def sample(self, seq, idx, t_us, items, ended, stale=()):
+            self.seen.append((seq, [(self.u(it[0]), it[3], it[4]) for it in items], [(self.u(e[0]), e[3]) for e in ended],
+                              sorted(self.u(k) for k in stale)))
+            self.sent = seq
+
+        def settled_by(self, seq):
+            return seq + ER.MAX_OPEN_SAMPLES + 1
+
+        def ready(self, k):                              # 假回抠收到就做完
+            return k <= self.sent
+
+        def wait_batch(self, k):
+            # 要等的批还扣在主线程这边 = 互等（真回抠会一直等下去）
+            self.bad_wait += any(b["st"]["seq"] <= k for b in self.v.held_batches)
+
+    class Tasks:
+        """假池子：任务每帧以概率 p 推进一层；`wait` 把要等的推完。"""
+        def __init__(self, rng, p):
+            self.rng, self.p, self.live, self.cs = rng, p, [], {}
+
+        def submit(self, t):
+            self.cs[id(t)] = t.next_layer()
+            self.live.append(t)
+
+        def step(self, t):
+            t.feed([read(c) for c in self.cs[id(t)]])
+            self.cs[id(t)] = t.next_layer()
+
+        def tick(self):
+            for t in list(self.live):
+                if self.rng.random() < self.p:
+                    self.step(t)
+            self.live = [t for t in self.live if not t.done]
+
+        def wait(self, ts):
+            for t in ts:
+                while not t.done:
+                    self.step(t)
+            self.live = [t for t in self.live if not t.done]
+
+    def run(mode, seed, lag=3, p=0.3, flush_lag=0):
+        args = ocr_args.parse_args(["dummy.mp4", "--out", "x.jsonl", "--no-refine-fused", "--reuse-cache-mb", "64",
+                                    "--flush-lag", str(flush_lag)])
+        rng = _rnd.Random(seed)
+        corr = {"v": 1.0}
+        v = ReuseV2(args, lambda a, b: corr["v"], lambda a, b: (0, 0), read)
+        v.rec_many = lambda cs: [read(c) for c in cs]
+        sink = Sink(v)
+        v.edge = sink
+        pool = None
+        if mode == "async":
+            pool = Tasks(_rnd.Random(seed + 1), p)
+            v.submit_task, v.wait_tasks = pool.submit, pool.wait
+        fh = io.StringIO()
+        win, bad_books, held_max, n_rec = [], 0, 0, 0
+        for seq in range(NF):
+            corr["v"] = 1.0 if rng.random() < 0.85 else 0.5
+            dec, todo, assign = v.decide(seq, gray.copy(), boxes)
+
+            def crop(i, _s=seq):
+                return np.dstack([np.full((18, 60), _s % 256, np.uint8), np.full((18, 60), i, np.uint8),
+                                  np.full((18, 60), _s // 256, np.uint8)])
+            st = v.commit_stage1(seq, seq * 30, seq * 500_000, boxes, polys, list(dec) + [(i, "", 0.0, 0) for i in todo],
+                                 set(todo), assign, crop, {}, False)
+            win.append((st, {i: read(crop(i)) for i in todo}))
+            if pool is not None:
+                pool.tick()
+            while len(win) > lag:
+                s_, tx = win.pop(0)
+                n_rec += v.commit_stage2(s_, tx, fh)
+            held_max = max(held_max, len(v.held_batches))
+            real = sum(int(pnd[2].nbytes) for c in (*v.live, *v.held) for pnd in c.pending)
+            lent = sum(t.cache_bytes for b in v.held_batches for _, t in b["jobs"])
+            book = sum(c.cache_bytes for c in (*v.live, *v.held))
+            bad_books += book != real or v.cache != book + lent + sum(v.reserved.values())
+        for s_, tx in win:
+            n_rec += v.commit_stage2(s_, tx, fh)
+        n_rec += v.finish_recover()
+        v.flush_all(fh)
+        rows = [json.loads(x) for x in fh.getvalue().splitlines()]
+        return dict(rows=rows, seen=sink.seen, stats={k: v.stats[k] for k in ("recover_reads", "recover_events", "edge_stale")},
+                    n_rec=n_rec, bad_books=bad_books, held_max=held_max, bad_wait=sink.bad_wait, cache=v.cache,
+                    waits=v.stats["recover_waits"], hold=v.hold_max)
+
+    details, base = [], run("sync", 0)
+    for seed in range(12):
+        a, b = run("sync", seed), run("async", seed)
+        ok = (a["rows"] == b["rows"] and a["seen"] == b["seen"] and a["stats"] == b["stats"]
+              and a["n_rec"] == b["n_rec"] == a["stats"]["recover_reads"] and a["cache"] == b["cache"])
+        details.append(dict(seed=seed, ok=ok, held=b["held_max"], waits=b["waits"], books=b["bad_books"],
+                            wait=b["bad_wait"], cache=b["cache"], hold=b["hold"]))
+    still = run("async", 3, p=0.0)                     # 任务自己从不推进：只靠扣满了 / 落盘 / 收尾时主线程等
+    check("回补异步：12 组随机序列下产物逐行、回抠收到的批次（帧序、事件、作废标记）、回补计数都和同步回补相同",
+          all(d["ok"] for d in details) and base["stats"]["recover_events"] > 5,
+          ([d for d in details if not d["ok"]], base["stats"]))
+    check("回补异步：扣住的回抠批次从不超过 hold_max（默认 8，小于落盘等回抠的距离 9）；缓存的账逐帧对得上（任务借走的也算）、"
+          "收尾时和同步回补剩的一样（任务借走的都还回来了）",
+          all(d["held"] <= d["hold"] == 8 and d["books"] == 0 for d in details)
+          and max(d["held"] for d in details) >= 2 and still["held_max"] <= 8 and still["bad_books"] == 0,
+          (details, still["held_max"]))
+    check("回补异步：任务从不自己推进时也不卡死（扣满了主线程等最老的那批、插队），产物照旧和同步相同；"
+          "落盘等回抠时要等的批从来不扣在这边",
+          still["rows"] == run("sync", 3)["rows"] and still["waits"] > 0 and still["bad_wait"] == 0
+          and all(d["wait"] == 0 for d in details), (still["waits"], still["bad_wait"]))
+    fl = [(run("sync", s_), run("async", s_, flush_lag=8), run("async", s_, lag=20, flush_lag=8)) for s_ in range(4)]
+    check("回补异步 + 推迟落盘（--flush-lag 8）、窗口 4 / 21：产物、回抠批次都和同步相同，推迟时等的批也从不扣在这边",
+          all(a["rows"] == b["rows"] == c["rows"] and a["seen"] == b["seen"] == c["seen"] and b["bad_wait"] == c["bad_wait"] == 0
+              for a, b, c in fl), [(b["bad_wait"], c["bad_wait"]) for _, b, c in fl])
+    args = ocr_args.parse_args(["dummy.mp4", "--out", "x.jsonl", "--refresh-every", "4"])
+    check("hold_max 跟着落盘的距离走：horizon 变小时扣得更少，最小 0（= 当场就等，退回同步的节奏）",
+          ReuseV2(args, None, None, None).hold_max == max(0, min(ER.RECOVER_HOLD, 4 + 16 + 2 - ER.MAX_OPEN_SAMPLES - 2)))
+
+
+def t_recpool_tasks() -> None:
+    """`RecPool.submit_task` / `wait_tasks`（回补异步）：任务各层和普通读一起排队、由发批线程逐层推进到做完，
+    结果和同步二分一样；`wait_tasks` 让剩下的层插队（膝点再高也发）；任务里的异常带回主线程。"""
+    print("RecPool 回补任务")
+    import numpy as np
+
+    from flowocr.extract.recpool import RecPool
+    from flowocr.extract.reuse_v2 import RecoverTask
+
+    class Rec:
+        grid = 320
+
+        def predict(self, crops, batch_size=1):
+            return [{"rec_text": "A" if int(c[0, 0, 0]) < 5 else "B", "rec_score": 0.9} for c in crops]
+
+    def task():
+        pend = [[j, {"text": "A", "conf": 0.9, "reused": True}, np.full((20, 60, 3), j, np.uint8)] for j in range(9)]
+        return RecoverTask(("A", 0.9), ("B", 0.9), pend), pend
+
+    pool = RecPool([Rec()], 16, 1)
+    t1, p1 = task()
+    t2, _p2 = task()
+    pool.submit_task(t1)
+    pool.submit_task(t2)
+    ids = pool.new_ids(1)
+    pool.submit([(ids[0], np.full((20, 60, 3), 7, np.uint8))])
+    got = pool.collect(ids)
+    pool.wait_tasks([t1, t2])
+    t1.apply()
+    t2.apply()
+    ref, pr = task()
+    while (cs := ref.next_layer()):
+        ref.feed([("A" if int(c[0, 0, 0]) < 5 else "B", 0.9) for c in cs])
+    ref.apply()
+    pool.close()
+    check("池子逐层推进回补任务到做完：读数、改没改历史、写回的文本和同步二分一样；普通读照常对回去；请求号表清干净",
+          t1.done and t2.done and (t1.reads, t1.changed) == (t2.reads, t2.changed) == (ref.reads, ref.changed)
+          and [r[1]["text"] for r in p1] == [r[1]["text"] for r in pr] == ["A"] * 5 + ["B"] * 4
+          and got[ids[0]][0] == "B" and not pool.owner and not pool.task_ids and not pool.prio,
+          (t1.reads, ref.reads, [r[1]["text"] for r in p1], pool.owner, pool.prio))
+    pool = RecPool([Rec()], 16, 99)                          # 膝点高到永远不自发：只有插队才发
+    t3, _ = task()
+    pool.submit_task(t3)
+    pool.wait_tasks([t3])
+    pool.close()
+    check("wait_tasks：剩下的请求和以后各层都插队，膝点再高也推进到做完", t3.done and t3.reads == ref.reads, t3.reads)
+
+    class Bad(RecoverTask):
+        def feed(self, got):
+            raise ValueError("任务炸了")
+
+    pool = RecPool([Rec()], 16, 1)
+    t4 = Bad(("A", 0.9), ("B", 0.9), [[0, {"text": "A"}, np.zeros((20, 60, 3), np.uint8)],
+                                      [1, {"text": "A"}, np.zeros((20, 60, 3), np.uint8)]])
+    pool.submit_task(t4)
+    try:
+        pool.wait_tasks([t4])
+        err = "没抛"
+    except ValueError as exc:
+        err = str(exc)
+    check("发批线程里推进任务时的异常带回主线程（wait_tasks 抛出来，不是等到 stall_sec）", err == "任务炸了", err)
+
+
+def t_quality_tiers() -> None:
+    """精度档位 `--quality`（overlay-quality-lang 计划第 2 件）：只填三个参数的默认值、显式给的优先；档位名不进 config
+    （现成产物照旧复用）；`_meta.quality` 按生效值反推；开发驱动都显式带 `--quality high` 且在臂参数之前。"""
+    print("精度档位")
+    import re
+
+    from flowocr.extract import ocr_args as OA
+    base = ["v.mp4", "--out", "x.jsonl"]
+    cfg = OA.config_of(base)
+    check("不给 --quality 就是 DEFAULT_QUALITY；档位名不进 config（没有这个键的旧产物照旧对得上）",
+          "quality" not in cfg and cfg == OA.config_of(base + ["--quality", OA.DEFAULT_QUALITY]))
+    hi, de, fa = (OA.config_of(base + ["--quality", q]) for q in ("high", "default", "fast"))
+    check("三档：high = 采样 2 / 辅助流 60 / 缩放 0.35；default 辅助流 30；fast 采样 1、辅助流 15、缩放 0.25",
+          (hi["fps"], hi["aux_max_fps"], hi["refine_scale"]) == (2.0, 60.0, 0.35)
+          and (de["fps"], de["aux_max_fps"], de["refine_scale"]) == (2.0, 30.0, 0.35)
+          and (fa["fps"], fa["aux_max_fps"], fa["refine_scale"]) == (1.0, 15.0, 0.25)
+          and {k for k in hi if hi[k] != de[k]} == {"aux_max_fps"})
+    check("显式给的参数优先于档位；后给的 --quality 盖掉先给的（驱动把 high 放在臂参数前面靠的就是这个）",
+          OA.config_of(base + ["--quality", "default", "--aux-max-fps", "60"]) == hi
+          and OA.config_of(base + ["--quality", "high", "--quality", "default"]) == de)
+    qa = lambda *a: OA.quality_of(OA.parse_args(base + list(a)))           # noqa: E731
+    check("_meta.quality 按生效值反推：正好是哪档记哪档；显式改了某个参数对不上任何档记 custom；关了回抠记 custom",
+          qa() == OA.DEFAULT_QUALITY and qa("--quality", "fast") == "fast"
+          and qa("--quality", "high", "--aux-max-fps", "30") == "default"
+          and qa("--quality", "high", "--aux-max-fps", "45") == "custom"
+          and qa("--no-refine-fused") == "custom")
+    check("辅助流网格：60 fps 素材上 high 和 default 不同（不互相复用）；30 fps 素材上一样",
+          OA.aux_grid(60.0, 2.0, 60.0) != OA.aux_grid(60.0, 2.0, 30.0)
+          and OA.aux_grid(30.0, 2.0, 60.0) == OA.aux_grid(30.0, 2.0, 30.0))
+    drivers = {"sampleset.sh": 2, "run_full_ocr.sh": 1, "run_gamestream_ocr.sh": 1, "regions_run.sh": 1, "ocr_ab.sh": 1, "nsys_server.sh": 1}
+    bad = []
+    for name, n in drivers.items():
+        txt = (ROOT / "dev_tools" / name).read_text(encoding="utf-8")
+        hits = [ln for ln in txt.splitlines() if "--quality high" in ln and not ln.lstrip().startswith("#")]
+        if len(hits) != n or any(re.search(r"OCR_ARGS[^\n]*--quality high", ln) for ln in hits):
+            bad.append(name)
+    calls = [p.name for p in (ROOT / "dev_tools").glob("*.sh")
+             if re.search(r"flowocr\.extract\.(run_ocr2|run_groups)", p.read_text(encoding="utf-8"))]
+    check("开发驱动：调阶段 1 的每个都显式带 --quality high，放在 $OCR_ARGS / 臂参数之前；ocr_ab 加在臂参数串的源头"
+          "（arm_check、ocr_complete --argv 和真正的调用是同一份）",
+          not bad and set(calls) <= set(drivers), (bad, calls))
+
+
+def t_ocr_lang() -> None:
+    """识别语言 `--ocr-lang`（overlay-quality-lang 计划第 3 件）：语言 -> 模型表齐全、钉了提交号和 sha256；`ocr_lang` 进复用判据
+    （旧产物按 zh 算）；和 `--rec-onnx` 冲突当场报错；auto 只在监督者 / run_groups 判一次，worker 没拿到结果就报错；判的规则。"""
+    print("识别语言")
+    import os
+    from flowocr import models
+    from flowocr.extract import langprobe as LP
+    from flowocr.extract import ocr_args as OA
+    from flowocr.extract import supervisor as SV
+    from flowocr.extract.run_ocr2 import lang_probe, ocr_lang
+    base = ["v.mp4", "--out", "x.jsonl"]
+    check("语言表：--ocr-lang 的每个具体语言都有模型，另下的三个钉了 40 位提交号、onnx 和 yml 的 sha256、融 argmax",
+          set(OA.OCR_LANGS) - {"auto"} == set(models.LANG_REC)
+          and all(len(models.MODELS[n].rev) == 40 and len(models.MODELS[n].files.get("inference.onnx", "")) == 64
+                  and len(models.MODELS[n].files.get("inference.yml", "")) == 64 and models.MODELS[n].fuse_argmax
+                  for n in ("rec-ko", "rec-ru", "rec-th")) and models.DEFAULT == ("rec", "det"))
+    cz, ck = OA.config_of(base), OA.config_of(base + ["--ocr-lang", "ko"])
+    check("ocr_lang 进 config、按字面记（auto 就是 auto）；加键之前的旧产物按 zh 算（ADDED_NOOP），换语言不复用",
+          cz["ocr_lang"] == "zh" and OA.config_of(base + ["--ocr-lang", "auto"])["ocr_lang"] == "auto"
+          and OA.ADDED_NOOP.get("ocr_lang") == "zh" and OA.config_differs({k: v for k, v in cz.items() if k != "ocr_lang"}, cz) == []
+          and OA.config_differs(cz, ck) == ["ocr_lang"])
+    check("--rec-onnx 和非 zh 的 --ocr-lang 一起给：当场报错（谁优先说不清）",
+          raises(lambda: OA.parse_args(base + ["--rec-onnx", "my.onnx", "--ocr-lang", "ko"]), SystemExit)
+          and not raises(lambda: OA.parse_args(base + ["--rec-onnx", "my.onnx"])))
+    check("监督者认命令行里最后一个 --ocr-lang（同 argparse），两种写法都认",
+          SV.wants_auto(["v", "--ocr-lang", "auto"]) and SV.wants_auto(["v", "--ocr-lang=auto"])
+          and not SV.wants_auto(["v", "--ocr-lang", "auto", "--ocr-lang", "ko"]) and not SV.wants_auto(["v"]))
+    old = os.environ.pop(SV.OCR_LANG_ENV, None)
+    try:
+        a_auto = OA.parse_args(base + ["--ocr-lang", "auto"])
+        no_env = raises(lambda: lang_probe(a_auto), SystemExit)
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "p.json"
+            f.write_text('{"lang": "ko", "why": "x"}', encoding="utf-8")
+            os.environ[SV.OCR_LANG_ENV] = str(f)
+            got = ocr_lang(a_auto), lang_probe(a_auto)["lang"], ocr_lang(OA.parse_args(base + ["--ocr-lang", "th"]))
+    finally:
+        os.environ.pop(SV.OCR_LANG_ENV, None)
+        if old is not None:
+            os.environ[SV.OCR_LANG_ENV] = old
+    check("worker：auto 读监督者探好的结果文件选语言；没有结果（没经监督者）就报错，不自己探；点名的语言不看它",
+          no_env and got == ("ko", "ko", "th"), got)
+    check("判语言：非默认要比默认高出 MARGIN 才选它；纯英文这类差不多的留在 zh；读出的字太少判不出用 zh；打分只算置信度 ≥ CONF_MIN 的框、字数不算空白",
+          LP.decide({"zh": (100.0, 120), "ko": (400.0, 420), "ru": (90.0, 110)})[0] == "ko"
+          and LP.decide({"zh": (100.0, 120), "ko": (110.0, 125)})[0] == "zh"
+          and LP.decide({"zh": (5.0, 6), "ko": (9.0, 10)})[0] == "zh"
+          and LP.frame_times(0, 30, 3) == [5.0, 15.0, 25.0]
+          and LP.score([{"rec_text": "ab c", "rec_score": 0.9}, {"rec_text": "乱码乱码", "rec_score": LP.CONF_MIN - 0.01}]) == (0.9 * 3, 3))
+
+
+def t_trt_backend() -> None:
+    """TensorRT 后端接进推理服务（TRT 后端计划第 4 步）：session 池的回退计数、启动自检、池子大小、`--backend` 在客户端的判定、复用判据。
+    全离线：假 session、假参考输出；真引擎的部分（缓存在时起服务 `engines/` 不多文件）在第 5 步的验证里跑。"""
+    print("TensorRT 后端")
+    import ast as _ast
+    import contextlib
+    import io
+    import threading
+    import types
+    from unittest import mock
+
+    import numpy as np
+
+    from flowocr.extract import ocr_args as oa
+    from flowocr.extract import trt_engine as E
+
+    class Sess:
+        def __init__(self, fn, fail=False):
+            self.fn, self.fail, self.calls = fn, fail, 0
+
+        def get_inputs(self):
+            return [type("I", (), {"name": "x"})()]
+
+        def run(self, _out, feed):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("enqueue failed")
+            return self.fn(feed["x"])
+
+    fb_calls = []
+
+    def fallback(x):
+        fb_calls.append(x.shape)
+        return ["cuda"]
+
+    p = E.Pool("rec", [Sess(lambda x: ["trt"])])
+    ok = p.run(np.zeros((4, 3, 48, 320), np.float32), fallback)[0] == ["trt"]
+    oop = p.run(np.zeros((32, 3, 48, 320), np.float32), fallback)[0] == ["cuda"]
+    bad = E.Pool("det", [Sess(None, fail=True)])
+    err = bad.run(np.zeros((1, 3, 544, 960), np.float32), fallback)[0] == ["cuda"]
+    again = bad.run(np.zeros((1, 3, 544, 960), np.float32), fallback)[0] == ["cuda"]
+    check("TRT 池子：profile 里的形状走 TRT；超 profile（批 32）退回 CUDA EP 记 oop；TRT 报错退回、记 err 和第一次的错，session 放回池子（下一次还能领）",
+          ok and oop and err and again and (p.oop, p.err, bad.oop, bad.err) == (1, 0, 0, 2) and "enqueue failed" in bad.first_err
+          and bad.free.qsize() == 1 and len(fb_calls) == 3, (p.oop, p.err, bad.err, fb_calls))
+    check("profile 边界：det 32×32 / 4×960×960 在里面，31 宽、批 5（--det-batch 超过默认 4）、rec 宽 3520 在外面",
+          E.Pool("det", [Sess(None)]).fits((1, 3, 32, 32)) and E.Pool("det", [Sess(None)]).fits((4, 3, 960, 960))
+          and not E.Pool("det", [Sess(None)]).fits((1, 3, 31, 64)) and not E.Pool("det", [Sess(None)]).fits((5, 3, 544, 960))
+          and not p.fits((1, 3, 48, 3520)))
+    gate, inside = threading.Event(), []
+
+    def slow(x):
+        inside.append(1)
+        gate.wait(5)
+        return ["trt"]
+
+    two = E.Pool("rec", [Sess(slow), Sess(slow)])
+    th = [threading.Thread(target=two.run, args=(np.zeros((1, 3, 48, 320), np.float32), fallback)) for _ in range(2)]
+    for t in th:
+        t.start()
+    for _ in range(100):
+        if len(inside) == 2:
+            break
+        threading.Event().wait(0.02)
+    both = len(inside) == 2
+    gate.set()
+    for t in th:
+        t.join()
+    check("池子里两个 session 时两个调用线程同时在跑（同一个 TRT session 上是串行的，所以要池子）", both)
+
+    # 自检：参考输出只存不同的那几张（批里第 i 张 = 第 i % 3 张），对得上返回空串，算错的引擎报出哪个形状
+    def fake_model(x):
+        m = x.mean(axis=1, keepdims=True)
+        return [1 / (1 + np.exp(-m))]
+
+    with tempfile.TemporaryDirectory() as d:
+        ref = Path(d) / "det.ref.npz"
+        ins = E.check_inputs("det")
+        np.savez_compressed(ref, **{f"s{j}_o0": fake_model(x[: min(len(x), 3)])[0] for j, x in enumerate(ins)})
+        good = E.selfcheck(Sess(fake_model), "det", ref)
+        broken = E.selfcheck(Sess(lambda x: [fake_model(x)[0] * 0 + 1.0]), "det", ref)
+        jitter = E.selfcheck(Sess(lambda x: [fake_model(x)[0] + 0.03]), "det", ref)
+    check("启动自检：输出对得上 CPU 参考时过；抖动级（全图差 0.03）照样过；算错的引擎（概率图全是 1）不过、说出哪个形状",
+          good == "" and jitter == "" and "(1, 3, 32, 32)" in broken and "CPU 参考" in broken, (good, jitter, broken))
+    with tempfile.TemporaryDirectory() as d:
+        r0 = E.ref_path(Path(d), "rec", E.CHECK)
+        with mock.patch.dict(E.PROFILES, {"rec": ("x:1x3x48x320", "x:4x3x48x320", "x:16x3x48x2560")}):
+            r1 = E.ref_path(Path(d), "rec", E.CHECK)
+    check("自检参考的文件名随 profile 变（改了 profile 不会拿旧参考判自检不过、永久退回 CUDA EP）", r0 != r1 and r0.name.startswith("rec_"), (r0.name, r1.name))
+    check("自检输入是 profile 的 min / opt / max 三个形状（按形状挑核的错只查一个查不出）",
+          [x.shape for x in E.check_inputs("rec")] == [s for spec in E.PROFILES["rec"] for s in E.profile_shapes(spec)]
+          and E.CHECK.is_file())
+
+    # 池子大小：不 import ort_server（顶层拉 onnxruntime），从源码里取常量和解析函数
+    srv = (ROOT / "src" / "flowocr" / "extract" / "ort_server.py").read_text(encoding="utf-8")
+    nodes = [n for n in _ast.parse(srv).body if (isinstance(n, _ast.Assign) and any(getattr(t, "id", "") == "TRT_SESSIONS" for t in n.targets))
+             or (isinstance(n, _ast.FunctionDef) and n.name == "parse_sizes")]
+    ns: dict = {}
+    exec(compile(_ast.Module(nodes, []), "ort_server", "exec"), ns)
+    check("TRT session 池子：det、rec 默认各 1 个（owner 2026-10-16：rec 2 个墙钟持平、多 1 GB 显存）；--trt-sessions 能改",
+          ns["TRT_SESSIONS"] == {"det": 1, "rec": 1}
+          and ns["parse_sizes"]("rec=2") == {"det": 1, "rec": 2} and ns["parse_sizes"]("") == ns["TRT_SESSIONS"])
+
+    # 客户端这一侧的判定（run_ocr2.trt_plan）：模型路径换成假的，不碰网络
+    from flowocr.extract import run_ocr2 as R
+    from flowocr import trt as T
+
+    def plan(argv, have=True, ort_why="", old=""):
+        R._trt_plan.cache_clear()
+        args = oa.parse_args(["v.mp4", "--out", "o.jsonl", *argv])
+        with mock.patch("flowocr.models.path", lambda k: f"M/{k}.onnx"), mock.patch.object(T, "have", lambda m, deep=False: have), \
+                mock.patch.object(T, "ort_compatible", lambda: ort_why), mock.patch("flowocr.models.fp16_path", lambda k: f"M/{k}16.onnx"), \
+                mock.patch.object(T, "stale_install", lambda: old):
+            return R.trt_plan(args), R.ort_server_args(args, "gpu"), R.ort_server_args(args, "cpu"), R.onnx_path(args, "det", "gpu:0")
+
+    (got, gpu_args, cpu_args, det_cuda) = plan([])
+    models_ = [gpu_args[i + 1] for i, a in enumerate(gpu_args) if a == "--trt-model"]
+    check("--backend auto、装了库：det / rec 都走 TRT，引擎从官方 fp32 图建（det 的 CUDA EP 那份仍是半精度派生图，退回时用）；CPU 上不给 TRT 参数",
+          got["why"] == "" and models_ == ["det=M/det.onnx", "rec=M/rec.onnx"] and det_cuda == "M/det16.onnx"
+          and "--trt-precision" in gpu_args and gpu_args[gpu_args.index("--trt-precision") + 1] == "fp32"
+          and not any(a.startswith("--trt") for a in cpu_args), (got, gpu_args))
+    check("没装库 / ORT 对不上 / --backend cuda / 全是自带模型：不给 TRT 参数，原因留着进 _meta.backend",
+          "没装" in plan([], have=False)[0]["why"] and plan([], ort_why="onnxruntime 9.9 不对")[0]["why"].startswith("onnxruntime")
+          and plan(["--backend", "cuda"])[0]["why"] == "--backend cuda"
+          and "自带" in plan(["--det-onnx", "a.onnx", "--rec-onnx", "b.onnx"])[0]["why"]
+          and not plan(["--backend", "cuda"])[1].count("--trt-model"))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        stale = plan([], have=False, old="10.9.0.1")[0]["why"]
+        quiet = plan([], have=False)[0]["why"]
+    check("--backend auto、只装着别的 TensorRT 版本（升级 flowocr 后）：原因写明要重装，并打警告；什么都没装时不打",
+          "10.9.0.1" in stale and "remove" in stale and err.getvalue().count("⚠") == 1 and "没装" in quiet, err.getvalue())
+    one = plan(["--rec-onnx", "b.onnx", "--trt-precision", "fp16"])[1]
+    check("只有 rec 自带：det 照样走 TRT、rec 走 CUDA EP；--trt-precision 传到服务",
+          [one[i + 1] for i, a in enumerate(one) if a == "--trt-model"] == ["det=M/det.onnx"] and one[one.index("--trt-precision") + 1] == "fp16")
+    R._trt_plan.cache_clear()
+
+    meta: dict = {}
+    fake = type("C", (), {"trt": {"version": "10.16.1.11", "models": {"det": {"backend": "trt", "engine": "det_x", "onnx": "M/det.onnx"}}}})()
+    with mock.patch.object(R, "trt_plan", lambda args: {"server_args": ["--trt-model", "det=M/det.onnx"], "why": ""}):
+        R.record_backend(oa.parse_args(["v.mp4", "--out", "o", "--rec-onnx", "b.onnx"]), meta, "gpu:0", fake, fake)
+    check("_meta.backend：每个模型实际走哪个后端、TRT 版本；服务要了 TRT 而这个模型不在里面的记成自带模型走 CUDA EP",
+          meta["backend"]["models"]["det"]["backend"] == "trt" and meta["backend"]["trt_version"] == "10.16.1.11"
+          and meta["backend"]["models"]["rec"] == {"backend": "cuda", "fallback": "custom: 自带的 ONNX 走 CUDA EP"}, meta)
+
+    meta, meta2 = {}, {}
+    nil = type("C", (), {"trt": None})()
+    with mock.patch.object(R, "trt_plan", lambda args: {"server_args": ["--trt-model", "det=M/det.onnx", "--trt-model", "rec=M/rec.onnx"], "why": ""}):
+        R.record_backend(oa.parse_args(["v.mp4", "--out", "o"]), meta, "gpu:0", nil, nil)
+    with mock.patch.object(R, "trt_plan", lambda args: {"server_args": ["--trt-model", "det=M/det.onnx"], "why": ""}):
+        R.record_backend(oa.parse_args(["v.mp4", "--out", "o", "--rec-onnx", "b.onnx"]), meta2, "gpu:0", nil, nil)
+    check("_meta.backend：要了 TRT、服务却没回说明（外部服务没带 TRT 参数）时也写原因；没要 TRT 的自带模型照旧记 custom",
+          all(v.get("fallback", "").startswith("server:") for v in meta["backend"]["models"].values())
+          and meta2["backend"]["models"]["det"]["fallback"].startswith("server:")
+          and meta2["backend"]["models"]["rec"]["fallback"].startswith("custom:"), (meta, meta2))
+
+    # 推理服务这一侧的分阶段回退（ort_server.start_trt）：抠出源码，换上假的 onnxruntime 和假的 trt_engine
+    st_nodes = [n for n in _ast.parse(srv).body if isinstance(n, _ast.FunctionDef) and n.name in ("start_trt", "parse_sizes")]
+
+    import weakref
+
+    class FakeSess:
+        pass
+
+    class FakeE:
+        PROFILES = {"det": (), "rec": ()}
+        fail: dict = {}
+        made: list = []
+        alive_at_build: dict = {}
+
+        @staticmethod
+        def compute_cap(dev): return (12, 0)
+
+        @classmethod
+        def _maybe(cls, stage, name):
+            if cls.fail.get(name) == stage:
+                raise RuntimeError(f"{stage} 坏了")
+
+        @classmethod
+        def build(cls, name, src, prec, eng, cap, ver, dev, log):
+            cls.alive_at_build[name] = sum(w() is not None for w in cls.made)
+            cls._maybe("build", name)
+            return f"{name}_pfx"
+
+        @classmethod
+        def ensure_ref(cls, name, src, eng, log): cls._maybe("ref", name); return Path("ref")
+
+        @classmethod
+        def make_session(cls, name, *a, **k):
+            cls._maybe("load", name)
+            s_ = FakeSess()
+            cls.made.append(weakref.ref(s_))
+            return s_
+
+        @classmethod
+        def selfcheck(cls, sess, name, ref): return "差太多" if cls.fail.get(name) == "selfcheck" else ""
+
+        Pool = staticmethod(lambda name, sessions: ("pool", name, len(sessions)))
+
+        @staticmethod
+        def engine_sha(eng, prefix): return "sha-" + prefix
+
+    def start(fail=None, ver="1.29.0", trt_ep=True):
+        FakeE.fail, FakeE.made, FakeE.alive_at_build = fail or {}, [], {}
+        fort = types.SimpleNamespace(__version__=ver, get_available_providers=lambda: ["TensorrtExecutionProvider"] * trt_ep + ["CUDAExecutionProvider"])
+        ns_ = {"ort": fort, "load_trt_engine": lambda: FakeE, "TRT_SESSIONS": {"det": 1, "rec": 1}}
+        exec(compile(_ast.Module(st_nodes, []), "ort_server", "exec"), ns_)
+        a_ = types.SimpleNamespace(trt_model=["det=d.onnx", "rec=r.onnx"], trt_version="10.16.1.11", trt_precision="fp32", trt_ort="1.29",
+                                   trt_engines="E", trt_sessions="")
+        notes = []
+        pools, info = ns_["start_trt"](a_, {"det": 0, "rec": 0}, {"device_id": 0}, lambda: None, notes.append)
+        return pools, {k: v.get("fallback", "trt") for k, v in info["models"].items()}, info, notes
+
+    ok_pools, ok_fb, ok_info, _ = start()
+    vers = start(ver="1.30.0")[1]
+    noep = start(trt_ep=False)[1]
+    stages = {st: start({"det": st}) for st in ("build", "ref", "load", "selfcheck")}
+    start({"det": "selfcheck"})
+    freed = FakeE.alive_at_build.get("rec")
+    check("start_trt：det 自检不过时，它的 TRT session 在建 rec 引擎之前就放掉了（不占着显存）", freed == 0, FakeE.alive_at_build)
+    check("start_trt：ORT 版本对不上 / 没带 TRT EP 时所有模型记 ort_version；build / ref / load / selfcheck 各自出错只退回那个模型、原因带阶段前缀并打提示；"
+          "都过时池子齐、说明带引擎指纹和 session 数",
+          set(ok_pools) == {"det", "rec"} and ok_fb == {"det": "trt", "rec": "trt"}
+          and ok_info["models"]["det"]["engine_sha256"] == "sha-det_pfx" and ok_info["models"]["rec"]["sessions"] == 1
+          and all(v.startswith("ort_version:") for v in vers.values()) and all(v.startswith("ort_version:") for v in noep.values())
+          and all(set(p_) == {"rec"} and fb["det"].startswith(f"{st}:") and fb["rec"] == "trt" and any("det 退回" in n for n in nt)
+                  for st, (p_, fb, _i, nt) in stages.items()),
+          (ok_fb, vers, {k: v[1] for k, v in stages.items()}))
+
+    # 只装着别的 TensorRT 版本（升级 flowocr 后）
+    with tempfile.TemporaryDirectory() as td:
+        r_ = Path(td)
+        with mock.patch("flowocr.paths.trt_root", lambda: r_):
+            (r_ / T.TRT_VERSION / "lib").mkdir(parents=True)
+            only_cur = T.stale_install()
+            (r_ / "10.9.0.1" / "engines").mkdir(parents=True)
+            engines_only = T.stale_install()
+            (r_ / "10.9.0.1" / "lib").mkdir()
+            old_lib = T.stale_install()
+    check("stale_install：别的版本目录里有 lib/ 才算装着旧版本；只有当前版本、或旧版本只剩引擎缓存时是空串",
+          only_cur == "" and engines_only == "" and old_lib == "10.9.0.1", (only_cur, engines_only, old_lib))
+
+    base = oa.config_of(["v.mp4", "--out", "o"])
+    check("--backend / --trt-precision 进 NOISE_EQUIV（owner 2026-10-16：后端和精度的差异是抖动级，互相复用）",
+          {"backend", "trt_precision"} <= oa.NOISE_EQUIV
+          and not oa.config_differs(oa.config_of(["v.mp4", "--out", "o", "--backend", "cuda", "--trt-precision", "fp16"]), base))

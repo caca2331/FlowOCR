@@ -23,29 +23,12 @@ from pathlib import Path
 from queue import Queue
 
 from flowocr.extract import childproc
+from flowocr.extract.aux_transport import AuxFanout, AuxRemote as aux_remote
 
 
 def slots_for(det_batch: int, det_prefetch: int) -> int:
     """共享内存槽几个：盖住 det 一次要的批和它的前瞻，再留几个给管线进程慢半拍。"""
     return max(8, det_batch * (1 + det_prefetch) + 4)
-
-
-def aux_remote(acfg: dict):
-    """一个回抠进程的辅助流去处：像素连 `url`、逐帧 pts 经它的 `pts_addr` 直接送过去（不绕管线进程）。"""
-    from multiprocessing.connection import Client
-    from types import SimpleNamespace
-
-    from flowocr.extract import framesource
-
-    port2, key2 = acfg["pts_addr"]
-    feed = Client(("127.0.0.1", int(port2)), authkey=bytes.fromhex(key2))
-    flock = threading.Lock()
-
-    def put(item) -> None:
-        with flock:
-            feed.send(("pe",) if item is framesource.QUEUE_SENTINEL else ("p", item))
-
-    return SimpleNamespace(url=acfg["url"], pts_put=put)
 
 
 def make_source(cfg: dict, remote):
@@ -58,7 +41,8 @@ def make_source(cfg: dict, remote):
         cfg["video"], lanes=cfg["lanes"], grid=kw["grid"], src_fps=kw["src_fps"], width=kw["width"],
         height=kw["height"], pix=kw["pix"], select_by=kw["select_by"], hwaccel=kw["hwaccel"],
         start_idx=kw["start_idx"], end_idx=kw["end_idx"],
-        blocks=decode_shards.BlockPlan(cfg["video"], kw["start_idx"], kw["end_idx"], kw["src_fps"], cfg["block_sec"]),
+        blocks=decode_shards.BlockPlan(cfg["video"], kw["start_idx"], kw["end_idx"], kw["src_fps"], cfg["block_sec"],
+                                       len(cfg["lanes"])),
         aux_remote=remote, aux_grid=a.get("grid"), aux_scale=a.get("scale", 0.35))
 
 
@@ -71,6 +55,15 @@ def end_stats(source, slot_wait: float) -> dict:
                        "lane_sec": [round(x, 2) for x in source.lane_sec], "peak_mb": round(source.peak_mb),
                        **({"probe_unknown": source.probe_unknown} if source.probe_unknown else {}),
                        **({"plan_error": source.plan_error} if source.plan_error else {})}}
+
+
+def cleanup_failed() -> str:
+    """取帧层收摊失败（在 except 里调）：回溯**也打到 stderr**（继承自管线进程，进运行日志），再交给调用方当 `err` 发。
+    只发 `err` 不够：硬解失败时 `hw` 先发，管线进程收到就按硬解失败退出、整段改软解重跑，排在后面的 `err` 没人读，
+    清理泄漏（没退干净的 ffmpeg、没收回的辅助流线程）就看不见了（效率分支复审）。"""
+    tb = traceback.format_exc()
+    print(f"[解码进程] 取帧层收摊失败：\n{tb}", file=sys.stderr, flush=True)
+    return tb
 
 
 def serve() -> int:
@@ -94,8 +87,9 @@ def serve() -> int:
     stop = threading.Event()
     free: Queue = Queue()
     listening = False
+    source = None
+    remote = aux_remote(cfg["aux"]) if cfg.get("aux") else None
     try:
-        source = make_source(cfg, aux_remote(cfg["aux"]) if cfg.get("aux") else None)
         H, W, n = cfg["H"], cfg["W"], cfg["slots"]
         nb = H * W * 3
         shm = shared_memory.SharedMemory(create=True, size=nb * n)
@@ -114,9 +108,20 @@ def serve() -> int:
                 pass
             stop.set()
             free.put(None)
+            if source is not None:
+                try:
+                    source.close()
+                except BaseException:
+                    pass                                # source 已登记清理错误，主线程负责发 err 和拆 SHM
+            elif remote is not None:
+                remote.abort()
 
         threading.Thread(target=recv_loop, daemon=True, name="decode-recv").start()
         listening = True
+        source = make_source(cfg, remote)
+        if stop.is_set():
+            source.close()
+            raise RuntimeError("解码器在取帧层登记前已取消")
         send(("hello", {"shm": shm.name, "slots": n, "describe": source.describe()}))
         slot_wait = 0.0
         for idx, t_sec, frame in source:
@@ -140,6 +145,18 @@ def serve() -> int:
             pass
         if not listening:                            # 收消息的线程还没起：没人会置 stop，等就是白等
             stop.set()
+    finally:
+        try:
+            if source is not None:
+                source.close()
+            elif remote is not None:
+                remote.abort()
+        except BaseException:
+            tb = cleanup_failed()
+            try:
+                send(("err", tb))
+            except OSError:
+                pass
     # 管线进程拷完最后一帧、发 "x"（或断开）之前不能拆共享内存。**出错时也要等它**（2026-09-24 审核）：
     # hello 已发、它还没附上共享内存时这边先拆，Windows 上段就没了，它附时 FileNotFoundError 会盖掉管道里的 "hw"——软解重跑就丢了
     if shm is not None:
@@ -174,8 +191,6 @@ class DecodeProxy:
 
     def start(self, cfg: dict) -> None:
         """开流：`cfg` 是取帧参数。各路 ffmpeg 在子进程里起，回 hello 之后才返回。"""
-        from multiprocessing import shared_memory
-
         t0 = time.perf_counter()
         self.child.send(("go", cfg))
         msg = self.child.recv_checked()
@@ -183,7 +198,7 @@ class DecodeProxy:
             raise RuntimeError(f"解码进程起不来：{msg}")
         h = msg[1]
         self.wait_start_sec = time.perf_counter() - t0
-        self.shm = shared_memory.SharedMemory(name=h["shm"])
+        self.shm = childproc.attach_shm(h["shm"])
         self.H, self.W = cfg["H"], cfg["W"]
         self.nb = self.H * self.W * 3
         self._describe = h["describe"]
@@ -282,65 +297,6 @@ class HubLink:
             pass
 
 
-class AuxFanout:
-    """一份辅助流转给**多个**回抠进程（各组一个）：每个订阅者一条**独立的有界队列** + 一个发送线程（审核：别让一个发送线程按顺序
-    sendall 给 N 个——一个回抠进程环满会把别的组一起堵住）。队列满时 `send` 阻塞（背压回到分片的转发线程）——有界、不丢；
-    慢的那组仍会拖住大家（它的帧总得送到），但多了 `depth` 帧的余量。某个订阅者的连接断了：它的队列不再收，别的组照常。
-    内存上限约 depth × 帧字节 × 订阅者数（0.35 辅助流 672×378 约 0.25 MB / 帧：512 帧 ≈ 每组 +128 MB），
-    **在分片的 1 GB 预取预算之外**。"""
-
-    def __init__(self, remotes: list, depth: int = 512) -> None:
-        from queue import Queue
-
-        self.remotes = remotes
-        self.qs = [Queue(depth) for _ in remotes]
-        self.dead = [False] * len(remotes)
-        self.errors: list[str] = []
-        self.ths = [threading.Thread(target=self._pump, args=(i,), daemon=True, name=f"aux-fan-{i}") for i in range(len(remotes))]
-
-    def open(self) -> "AuxFanout":
-        for th in self.ths:
-            th.start()
-        return self
-
-    def _pump(self, i: int) -> None:
-        from flowocr.extract import decode_shards, framesource
-
-        w = None
-        try:
-            w = decode_shards.TcpAux(self.remotes[i])
-            while True:
-                item = self.qs[i].get()
-                if item is None:
-                    return
-                w.send(*item)
-        except Exception as exc:                        # noqa: BLE001  这一组的回抠进程没了：它自己的管线会报，别的组照常
-            self.dead[i] = True
-            self.errors.append(f"订阅者 {i}：{exc!r}")
-            while self.qs[i].get() is not None:         # 排空，免得 send 卡在这条满队列上
-                pass
-        finally:
-            if w is not None:
-                w.close()
-            else:
-                try:
-                    self.remotes[i].pts_put(framesource.QUEUE_SENTINEL)
-                except Exception:                       # noqa: BLE001
-                    pass
-
-    def send(self, frame, n: int, t_sec: float) -> None:
-        buf = bytes(memoryview(frame).cast("B"))        # 一份字节，几条队列共用（不可变）
-        for i, q in enumerate(self.qs):
-            if not self.dead[i]:
-                q.put((buf, n, t_sec))
-
-    def close(self) -> None:
-        for q in self.qs:
-            q.put(None)
-        for th in self.ths:
-            th.join(60)
-
-
 def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
     """广播解码：等 `n_subs` 个订阅者连上、各发 `("go", cfg)`（或 `("x",)` = 这一组不用了），核对取帧参数一致，
     然后只起**一个**分片取帧层；采样帧写进一个共享内存环、同一个槽号发给每个活着的订阅者，**每个订阅者都还了**这个槽才回收
@@ -385,6 +341,9 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
     subs = list(subs)
     live = [(c, cfg) for c, cfg in subs if cfg is not None]
     if not live:
+        lst.close()
+        for c, _ in subs:
+            c.close()
         return 0
 
     def tell_all(msg) -> None:
@@ -395,6 +354,7 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
                 pass
 
     shm = None
+    source = fan = None
     stop = threading.Event()
     try:
         if len(subs) < n_subs:
@@ -408,7 +368,6 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
         if bad or any(bool(c.get("aux")) != bool(cfg0.get("aux")) for _, c in live):
             raise RuntimeError(f"广播解码：各组的取帧参数不一致（{sorted(set(bad))}）——同一个视频、同一个窗口、同一组解码旋钮才能共用")
         fan = AuxFanout([aux_remote(c["aux"]) for _, c in live]) if cfg0.get("aux") else None
-        source = make_source(cfg0, fan)
         H, W = cfg0["H"], cfg0["W"]
         n = max(c["slots"] for _, c in live)
         nb = H * W * 3
@@ -443,14 +402,26 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
             with lock:
                 alive[i] = False
                 mine = list(held[i])
+                all_gone = not any(alive)
             for slot in mine:
                 release(i, slot)
-            if not any(alive):
+            if fan is not None:
+                fan.abort(i)
+            if all_gone:
                 stop.set()
                 free.put(None)
+                if source is not None:
+                    try:
+                        source.close()
+                    except BaseException:
+                        pass                            # source 已登记清理错误，主线程仍须回收 SHM
 
         for i in range(len(live)):
             threading.Thread(target=recv_loop, args=(i,), daemon=True, name=f"hub-recv-{i}").start()
+        source = make_source(cfg0, fan)
+        if stop.is_set():
+            source.close()
+            raise RuntimeError("广播解码取帧层登记前全部订阅组已取消")
         tell_all(("hello", {"shm": shm.name, "slots": n, "describe": source.describe() + f"、广播给 {len(live)} 组"}))
         print(json.dumps({"started": len(live)}), flush=True)   # run_groups 看到它才不再"有组退出就收掉广播进程"
         slot_wait = 0.0
@@ -491,6 +462,15 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
             except OSError:
                 pass
         tell_all(("hw", str(exc)) if isinstance(exc, framesource.HwaccelMismatch) else ("err", traceback.format_exc()))
+    finally:
+        try:
+            if source is not None:
+                source.close()
+            elif fan is not None:
+                fan.abort()
+        except BaseException:
+            tell_all(("err", cleanup_failed()))
+        lst.close()
     # 各组拷完最后一帧、告别（或断开）之前不能拆共享内存（300 s 只是兜底：正常路径是各组 close -> "x" -> 全走了 -> stop；
     # Windows 上 unlink 是空操作、各组还开着的映射照样有效，所以这不是正确性上限）
     if shm is not None:

@@ -305,6 +305,15 @@ class MaskedSource:
 
     def __init__(self, source, group: RegionGroup) -> None:
         self._src, self._g = source, group
+        self._closed: dict[tuple, bool] = {}
+
+    def detection_closed_at(self, t: float) -> bool:
+        """此刻无有效像素，任何检测框都会被 split_polys 丢弃；None 遮罩表示全屏。"""
+        key = self._g.key_at(t)
+        if key not in self._closed:
+            mask = self._g.mask_for(key)
+            self._closed[key] = mask is not None and not mask.any()
+        return self._closed[key]
 
     def __iter__(self):
         for idx, t_sec, frame in self._src:

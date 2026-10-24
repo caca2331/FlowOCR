@@ -12,7 +12,7 @@
    各臂共用；时间只圈范围，命中仍看文本。主认领之后还有**第二遍**（`claim_contained`）：
    一条 cue 常常装着两行剧本（选项按钮 + 正文、并带把两个说话人并成一条），整行落在 cue 里
    就算认领，但**不许和主认领占同一段字**——否则库里近似重复的另一行会被白送一个命中。
-3. **分母里排掉 `gamescript.NON_BAND_KINDS`**（选项 / 黑屏 / 没走的分支 / 单元外 / 重演拷贝 /
+3. **分母里排掉 `gamescript.NON_BAND_KINDS` 的类型和有处境（`gamescript.STATUSES`）的行**（选项 / 黑屏 / 没走的分支 / 单元外 / 重演拷贝 /
    读到过但不在字幕带，判据见那边）。排掉的条目仍参与对齐、只是不计分母；它们若被主轨命中会单独报出来——
    那说明分支判错了，或者选项文本真的进了这条轨。重演拷贝例外：它连序列都不进。
    绝区零的变体组一组只算一个分母条目，任一种说法被认领都记在代表行上（`score`）。
@@ -74,15 +74,21 @@ def load_ref(p: Path) -> Ref:
     by_key, role, variant_of = {}, {}, {}
     for u in doc["units"]:
         for ln in u["lines"]:
-            if ln["kind"] == "Duplicate":     # 同一个节点的第二份 key 相同，别覆盖原件
+            if ln["status"] == "Duplicate":     # 同一个节点的第二份 key 相同，别覆盖原件
                 continue
             by_key[ln["key"]] = SA.Entry(key=ln["key"], kind=ln["kind"], cmd="", text=ln["text"],
-                                         src=u["uid"])
+                                         src=u["uid"], status=ln["status"])
             role[ln["key"]] = ln["role"]
             if ln.get("variant_of"):
                 variant_of[ln["key"]] = ln["variant_of"]
     return Ref(doc=doc, script=[by_key[k] for k, _, _ in doc["sequence"]],
                windows=[w for _, _, w in doc["sequence"]], role=role, variant_of=variant_of)
+
+
+def fresh_script(ref: Ref) -> list[SA.Entry]:
+    """对齐序列的一份干净拷贝（`matched` / `sim` 清零），给要自己跑一遍认领的地方用；处境（`status`）一起抄——
+    漏了它，有处境的行会悄悄变成带内、进分母和认领。"""
+    return [SA.Entry(key=e.key, kind=e.kind, cmd="", text=e.text, src=e.src, status=e.status) for e in ref.script]
 
 
 OBS_READ, OBS_COMMON, OBS_NONE, OBS_SHORT = "obs 读到过", "只撞常用句", "obs 没读到", "太短判不了"
@@ -103,7 +109,7 @@ def obs_side(doc: dict) -> dict[str, str]:
     out = {}
     for u in doc["units"]:
         for ln in u["lines"]:
-            if ln["kind"] == "Duplicate":     # 同 load_ref：同一节点的第二份别覆盖原件
+            if ln["status"] == "Duplicate":     # 同 load_ref：同一节点的第二份别覆盖原件
                 continue
             a = ln["anchor"]
             out[ln["key"]] = (OBS_READ if a and a["unique"] else OBS_COMMON if a else
@@ -136,16 +142,32 @@ def read_cues(p: Path) -> list[tuple[float, str, str]]:
     return [(c.start, "\n".join(c.lines), p.name) for c in srtio.read_subs([p])]
 
 
+def read_ends(p: Path) -> list[float]:
+    """和 `read_cues(p)` 一条对一条的终点秒（`run` / `score` 的 `ends`）。"""
+    return [c.end for c in srtio.read_subs([p])]
+
+
 HEAD_MIN_BODIES = 3
 """一行在整条轨里作为**非末行**、配过至少这么多种不同的末行，就是"开头行"（`head_lines`）。"""
 
 
-def head_lines(subs) -> frozenset[str]:
+def band_lines(script: list[SA.Entry]) -> frozenset[str]:
+    """该在字幕带的剧本行（`band`）的 `SA.norm`：`head_lines` 的 `script_lines` 用它，几个调用点（匹配、叠加、疑似漏字幕判断器）同一份。"""
+    return frozenset(SA.norm(e.text) for e in script if band(e))
+
+
+def head_lines(subs, script_lines: frozenset[str] = frozenset()) -> frozenset[str]:
     """整条轨里的**开头行**（归一化后）：名牌、称号、常驻在正文上面的角标。
 
     判据只看这条轨自己：一行作为非末行出现、而且配过 ≥ `HEAD_MIN_BODIES` 种不同的末行（正文）。
     名牌天然如此——一个说话人要说很多句（gi1 `カチーナ` 配过 271 种正文，zzz `シーシイア` 217 种）；
     真台词作为非末行出现时，下面跟的几乎总是同一句的续行。不靠名字表（库里原神的说话人只覆盖 4% 的节点）。
+
+    `script_lines`（该在字幕带的剧本行，`band_lines`）：**本身逐字就是一整条台词的不算开头行**。全量喂入时一句台词会和
+    别的区域的字同刻并进同一条 cue、落在非末行上，配上十几种"正文"——hsr 整场「あなたが彼を食い止めたのですね。」
+    这样被当成名牌剥掉，匹配前就没了，cue 和剧本逐字相同却记相似度 0（2026-10-05，匹配后漏行逐条追查）。
+    `norm` 留着标点，所以喊名字的台词 `カチーナ！` 挡不住名牌 `カチーナ`。只看带内的行：文本包里的 UI 文案（绝区零
+    `SKILL INFO`、`PM New Eridu`）常驻在变化的正文上面，正是开头行的形状——放进来，zzz 整场它们就被逐条认领，重复认领 232 → 265。
 
     为什么需要（2026-09-12，matcher 计划那 12 条"只由 `extra` 认领"的行逐条看出来的）：
     ①`カチーナ / はあ、はあ` 这种**正文很短**的 cue，去掉末行的那种读法只剩名牌，
@@ -158,7 +180,7 @@ def head_lines(subs) -> frozenset[str]:
         ls = [x for x in raw.split("\n") if x.strip()]
         for x in ls[:-1]:
             k = SA.norm(x)
-            if k and len(k) <= HEAD_MAX_CHARS:
+            if k and len(k) <= HEAD_MAX_CHARS and k not in script_lines:
                 bodies[k].add(SA.norm(ls[-1]))
                 lo, hi = span.get(k, (t, t))
                 span[k] = [min(lo, t), max(hi, t)]
@@ -245,7 +267,7 @@ def variants(raw: str, heads: frozenset[str] = frozenset()) -> list[str]:
 
 
 def band(e: SA.Entry) -> bool:
-    return e.kind not in GS.NON_BAND_KINDS
+    return GS.in_band(e.kind, e.status)
 
 
 ROLE_ROWS = 16
@@ -304,7 +326,149 @@ def claim_contained(script: list[SA.Entry], subs, cand, sub_hit: list[int],
     return out
 
 
-def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float) -> dict:
+SUPERSET_SIM = 0.9
+"""`superset_hit`：以逐字相等那行开头的更长台词，对 cue 更长的读法要像到这个程度才改认它。"""
+
+
+def superset_hit(hit: int, vs: list[str], cnd: list[int], sn: list[str], cn: list[str], sm: SequenceMatcher) -> int:
+    """逐字相等的那行（`hit`）只对上了 cue 的**一部分**读法（去掉了末行 / 开头几行）、而窗里另一条**以它开头**的更长台词
+    对更长的读法像到 ≥ `SUPERSET_SIM` 时，返回那条更长的（多条取最像的）；否则 -1。
+
+    为什么（2026-10-05，匹配后漏行逐条追查）：zzz 0:18:20 屏上是一条两行台词「首席技術者？\\Nってことは、なんかを研究してる人なの？」，
+    剧本里另有一条单独的「首席技術者？」——去掉末行的读法和它逐字相等，精确优先就认了短的，长的那条对整条 cue 0.96 却没人认
+    （第二遍包含认领也认不上：主认领用掉了「首席技術者」那几个字）。只看比逐字相等那种读法**更长**的读法：
+    单行 cue「ありがとう」不会改认「ありがとう！」。
+    要求长台词**以**短行开头、不只是包含（owner 10-06）：只要求包含时 gi1 主轨口径上出过一次巧合——短行归一后只剩「たち」，
+    恰好是一条长台词中间的子串。"""
+    base = len(sn[hit])
+    longer = [v for v in vs if len(v) > base]
+    if not longer or not cn[hit]:
+        return -1
+    best, best_s = -1, SUPERSET_SIM
+    for i in cnd:
+        if i == hit or len(cn[i]) <= len(cn[hit]) or not cn[i].startswith(cn[hit]):
+            continue
+        sm.set_seq2(sn[i])
+        for v in longer:
+            sm.set_seq1(v)
+            if sm.quick_ratio() >= best_s and (r := sm.ratio()) >= best_s:
+                best, best_s = i, r
+    return best
+
+
+PREFIX_MIN, PREFIX_SIM, PREFIX_MAX_SPAN = 8, 0.9, 5.0
+"""`claim_prefix`：读法至少这么多内容字；和剧本行同长的开头像到这个程度；同样的字在轨里**在屏**的首末（最早的起点到最晚的终点）不超过这么多秒。"""
+
+
+def claim_prefix(script: list[SA.Entry], subs, cand, sub_hit: list[int], sub_extra: list[list[int]],
+                 heads: frozenset[str], cn: list[str], ends: list[float] | None = None) -> int:
+    """第三遍，**打字机半截**：前两遍都没认上任何行的 cue，某种保留末行的读法（内容归一后 ≥ `PREFIX_MIN` 字）
+    是窗里**恰好一条**带内台词的开头（和那行同长的开头相似 ≥ `PREFIX_SIM`），而那行**到这时还没人认领**，就认它；
+    同一行有几条这样的 cue 时给读到字最多的那条。就地改 `sub_hit` / `Entry.matched`，返回认了几行。
+
+    为什么（2026-10-05，匹配后漏行逐条追查 + 摆帧）：gi2 2:15 前后玩家连点跳过对白，整句只在屏上停了不到半秒，2 fps 的采样只采到打字中途，
+    「もし仕事の日の天気が毎日こんなに」对整句「…キュートだったら、最高なのに。」只有 0.68、「観察よ。スチームバード新聞に助」对 75 字的整句 0.34。
+    第一版放在主认领里、对所有行开放，gi2 / zzz 新出的可疑改写一多半是认错的：任务追踪里的地名「エピクレシス歌劇場」、
+    「メロピデ要塞の原始胎海噴出」恰好是某句台词的开头，论坛帖子列表的预览行是帖子正文的开头。所以收紧成三条：
+    ①只认**别处都没认上**的带内台词（只补漏，不和正常认领抢）；②读法要**保留 cue 的末行**（打字中的是最后一行）；
+    ③同样的字在整条轨里**在屏**的首末（最早的起点到最晚的终点，`ends` 给 cue 的终点）不超过 `PREFIX_MAX_SPAN`——打字中途的字一闪就变，常驻的地名、任务名一挂几十秒。
+    ⚠ 只按各条 cue 的起点量（10-05 第一版）的话，一条挂 20 s 的常驻字只有一个起点、跨度是 0，照样放行：
+    gi-s1 531 s「ガイドノート」菜单里静止的列表项「クルースニク晶鉱」就这样认成了一句台词（10-06 验收 peer 摆帧）。没给 `ends` 时退回只看起点。
+    相似度照旧按整行记（`sim_of`），所以这类认领会进"可疑改写"——改写幅度确实大。"""
+    def tails(raw: str) -> list[str]:
+        ls, _ = strip_heads(raw, heads)
+        return list(dict.fromkeys(c for c in (GS.cnorm(" ".join(ls[i:])) for i in range(min(4, len(ls))))
+                                  if len(c) >= PREFIX_MIN))
+    seen: dict[str, list[float]] = {}
+    tl = []
+    for si, (t, raw, _) in enumerate(subs):
+        tl.append(tails(raw))
+        te = max(t, ends[si]) if ends is not None else t
+        for c in tl[-1]:
+            lo, hi = seen.get(c, (t, te))
+            seen[c] = [min(lo, t), max(hi, te)]
+    sm = SequenceMatcher(None, autojunk=False)
+    best: dict[int, tuple[int, int]] = {}                 # 行 -> (读到的字数, cue)
+    for si, (t, _, _) in enumerate(subs):
+        if sub_hit[si] >= 0 or sub_extra[si]:
+            continue
+        cs = [c for c in tl[si] if seen[c][1] - seen[c][0] <= PREFIX_MAX_SPAN]
+        got: dict[int, int] = {}
+        for c in cs:
+            sm.set_seq1(c)
+            for i in cand(t):
+                if not band(script[i]) or len(cn[i]) <= len(c):
+                    continue
+                sm.set_seq2(cn[i][:len(c)])
+                if sm.quick_ratio() >= PREFIX_SIM and sm.ratio() >= PREFIX_SIM:
+                    got[i] = max(got.get(i, 0), len(c))
+        if len(got) == 1:
+            (i, n), = got.items()
+            if script[i].matched < 0 and n > best.get(i, (0, -1))[0]:
+                best[i] = (n, si)
+    for i, (_, si) in best.items():
+        sub_hit[si] = i
+        script[i].matched = si
+    return len(best)
+
+
+INFIX_MIN, INFIX_IN, INFIX_COVER, INFIX_MAX_SPAN = 12, 0.9, 0.5, 30.0
+"""`claim_infix`：读法至少这么多内容字（`cnorm` 之后）；读法的字按顺序落在剧本行里的比例；读法占剧本行的比例；同样的字在轨里在屏的首末不超过这么多秒。"""
+
+
+def claim_infix(script: list[SA.Entry], subs, cand, sub_hit: list[int], sub_extra: list[list[int]],
+                heads: frozenset[str], cn: list[str], ends: list[float] | None = None, main: list[bool] | None = None) -> int:
+    """第四遍，**读到的是剧本行中间或后半的一大段**：前三遍都没认上任何行、在主轨上的 cue，某种保留末行的读法（内容归一后 ≥ `INFIX_MIN` 字）
+    有 ≥ `INFIX_IN` 的字按顺序落在窗里**恰好一条**带内台词里、占那一行 ≥ `INFIX_COVER`，而那行**到这时还没人认领**，就认它；
+    同一行有几条这样的 cue 时给读到字最多的那条。就地改 `sub_hit` / `Entry.matched`，返回认了几行。
+
+    为什么（检测器三场修复计划 U5，owner 2026-10-10）：游戏版本和文本包不同的句子——gi1 0:52:27 屏上是「うん、何頭かいる中でも、トトは一番親切で優しい子なんだよ。」，
+    文本包那一行前面多一句「ううん、この子たちは「クビナガライノ」っていうの。」——整行相似 0.74 差在 `fuzzy` 门下，整行包含方向反了，打字机半截要读法是开头，
+    三遍都认不上，6 s 里只有名牌、没有正文。门和打字机半截那一遍同构（只补漏、恰好一条、保留末行），数"恰好一条"时已被认领的带内行也算进去，
+    同一句重显的读数不会去认另一条没人认的行。挡常驻文字的门比打字机半截松（owner 10-10）：显完的整句要挂好几秒，在屏首末 ≤ `INFIX_MAX_SPAN`，
+    再加 cue 在主轨上（`main`，按 cue 的来源，和回显判定同一份；没给的——`game_align` 命令行、`--feed main`——当在主轨上）。
+    读法是那一行**开头**的（和同长的开头像到 `PREFIX_SIM`）不归这一遍：那是打字机半截的形状，它的在屏门更严（菜单里挂 20 s 的列表项恰好是某句台词的开头，gi-s1 531 s）；
+    那一行照样算"恰好一条"的候选，一个读法既是 A 的开头又落在 B 里时不认（挡歧义）。"""
+    def tails(raw: str) -> list[str]:
+        ls, _ = strip_heads(raw, heads)
+        return list(dict.fromkeys(c for c in (GS.cnorm(" ".join(ls[i:])) for i in range(min(4, len(ls))))
+                                  if len(c) >= INFIX_MIN))
+    seen: dict[str, list[float]] = {}
+    tl = []
+    for si, (t, raw, _) in enumerate(subs):
+        tl.append(tails(raw))
+        te = max(t, ends[si]) if ends is not None else t
+        for c in tl[-1]:
+            lo, hi = seen.get(c, (t, te))
+            seen[c] = [min(lo, t), max(hi, te)]
+    sm = SequenceMatcher(None, autojunk=False)
+    best: dict[int, tuple[int, int]] = {}                 # 行 -> (读到的字数, cue)
+    for si, (t, _, _) in enumerate(subs):
+        if sub_hit[si] >= 0 or sub_extra[si] or (main is not None and not main[si]):
+            continue
+        cs = [c for c in tl[si] if seen[c][1] - seen[c][0] <= INFIX_MAX_SPAN]
+        got: dict[int, int] = {}
+        for c in cs:
+            for i in cand(t):
+                if not band(script[i]) or len(cn[i]) <= len(c) or len(c) < INFIX_COVER * len(cn[i]):
+                    continue
+                if GS.contained(c, cn[i]) < INFIX_IN:
+                    continue
+                sm.set_seqs(c, cn[i][:len(c)])
+                # 开头的形状归打字机半截：照样算一个候选（挡歧义），只是这一遍不认它（-1）
+                got[i] = -1 if sm.ratio() >= PREFIX_SIM or got.get(i) == -1 else max(got.get(i, 0), len(c))
+        if len(got) == 1:
+            (i, n), = got.items()
+            if n > 0 and script[i].matched < 0 and n > best.get(i, (0, -1))[0]:
+                best[i] = (n, si)
+    for i, (_, si) in best.items():
+        sub_hit[si] = i
+        script[i].matched = si
+    return len(best)
+
+
+def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float, ends: list[float] | None = None,
+        main: list[bool] | None = None) -> dict:
     """**按时间圈候选**的对齐：cue 在 t 秒，只和"t 落在它可认领时段里"的剧本行比
     （时段由 gamescript 从 obs 定，见 `gamescript.sequence`）；精确相等优先，否则取相似度
     最高的（≥ fuzzy）；平手时先给还没被认领的行、再按序列先后。
@@ -327,9 +491,11 @@ def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float) -> dict
         return sorted({i for i in bins.get(int(t // BIN), ())
                        if any(lo <= t <= hi for lo, hi in windows[i])})
     sn = [SA.norm(e.text) for e in script]
+    cn = [GS.cnorm(e.text) for e in script]
     sm = SequenceMatcher(None)
-    heads = head_lines(subs)
-    n_exact = n_fuzzy = n_none = 0
+    sm2 = SequenceMatcher(None, autojunk=False)            # 改认更长的行用（`superset_hit`）
+    heads = head_lines(subs, band_lines(script))
+    n_exact = n_fuzzy = n_none = n_super = 0
     sub_hit: list[int] = []
     for si, (t, raw, _) in enumerate(subs):
         vs = variants(raw, heads)
@@ -349,7 +515,11 @@ def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float) -> dict
             # 第二行、把一条漏抹平。这和 hit_delta 的多重集口径一致（同文本行按条数算），接受；
             # 再先给该在字幕带的行（见上）
             hit = min(exact, key=lambda i: (script[i].matched >= 0, not band(script[i]), i))
-            n_exact += 1
+            sup = superset_hit(hit, vs, cnd, sn, cn, sm2)
+            if sup >= 0:                   # 记成模糊：认的那行和任何读法都不逐字相等
+                hit, n_super, n_fuzzy = sup, n_super + 1, n_fuzzy + 1
+            else:
+                n_exact += 1
         else:
             # 剪枝不改结果：两个 quick 比值都是 ratio 的上界（同 script_align）。
             # 这里剪的是 `< best_s`，script_align 是 `<= best_s`——**别"统一"**：那边平手不换，
@@ -376,17 +546,22 @@ def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float) -> dict
             script[hit].matched = si
     sub_extra = claim_contained(script, subs, cand, sub_hit, heads)
     n_contain = sum(1 for h, ex in zip(sub_hit, sub_extra) if h < 0 and ex)
+    n_prefix = claim_prefix(script, subs, cand, sub_hit, sub_extra, heads, cn, ends)
+    n_infix = claim_infix(script, subs, cand, sub_hit, sub_extra, heads, cn, ends, main)
+    n_fuzzy, n_none = n_fuzzy + n_prefix + n_infix, n_none - n_prefix - n_infix
     return {"subs": len(subs), "exact": n_exact, "fuzzy": n_fuzzy, "contain": n_contain,
+            "superset": n_super, "prefix": n_prefix, "infix": n_infix,         # 这三种都已算在 fuzzy 里
             "unmatched_subs": n_none - n_contain, "jumps": 0,
             "sub_hit": sub_hit, "sub_extra": sub_extra, "heads": heads}
 
 
-def score(ref: Ref, script: list[SA.Entry], subs, fuzzy: float) -> dict:
+def score(ref: Ref, script: list[SA.Entry], subs, fuzzy: float, ends: list[float] | None = None,
+          main: list[bool] | None = None) -> dict:
     """`run` + 把变体组折成一个条目：组里任何一种说法被认领，就记在代表行上
     （`via`：代表行 key -> 实际被认领的那一行）；`sub_hit` 里指向变体的也改指代表行，
     免得同一句话的两种说法各被一条 cue 认领时，重复认领数不出来。
     `script` 可以是 `ref.script` 的深拷贝（两臂各量各的，不互相覆盖 `matched`）。"""
-    st = run(script, ref.windows, subs, fuzzy)
+    st = run(script, ref.windows, subs, fuzzy, ends, main)
     idx = {e.key: i for i, e in enumerate(script)}
     via: dict[str, SA.Entry] = {}
     for e in script:
@@ -483,7 +658,7 @@ def main() -> int:
         print("  ⚠ 文本包：上游快照的完整性检查没过或没做")
     subs_path, tp = resolve(a.subs)
     subs = read_cues(subs_path)
-    st = score(ref, script, subs, a.fuzzy)
+    st = score(ref, script, subs, a.fuzzy, read_ends(subs_path))
     n_empty = st["subs"] - st["exact"] - st["fuzzy"] - st["contain"] - st["unmatched_subs"]
     print(f"轨 {subs_path.name}"
           + (f"（build_tracks git_head {tp['git_head']}，代码指纹 {tp['code_fp']}）" if tp else "")
@@ -494,11 +669,12 @@ def main() -> int:
           + (f"、归一化后为空 {n_empty}" if n_empty else ""))
 
     dial = [e for e in script if band(e)]
-    excl = Counter(e.kind for e in script if not band(e))
-    excl["Duplicate"] = sum(1 for u in doc["units"] for ln in u["lines"] if ln["kind"] == "Duplicate")
+    # 排出分母的按"处境，没有就按类型"分栏（处境盖过类型：没播段里的黑屏旁白记在 OutOfSpan 栏）
+    excl = Counter(e.status or e.kind for e in script if not band(e))
+    excl["Duplicate"] = sum(1 for u in doc["units"] for ln in u["lines"] if ln["status"] == "Duplicate")
     excl = +excl
     # 变体被认领是预期内的（记在代表行上），不算"排出分母的却被命中"
-    excl_hit = Counter(e.kind for e in script if not band(e) and e.matched >= 0 and e.kind != "Variant")
+    excl_hit = Counter(e.status or e.kind for e in script if not band(e) and e.matched >= 0 and e.status != "Variant")
     hit = [e for e in dial if e.matched >= 0]
     print()
     print(f"剧本侧：**该上屏的 {len(dial)} 条**（另有 "
@@ -584,7 +760,7 @@ def main() -> int:
         vs_path, vp = resolve(a.vs)
         subs_b = read_cues(vs_path)
         script_b = copy.deepcopy(script)       # B 臂量自己那份，A 的 matched 原样留给下面写 JSON
-        st_b = score(ref, script_b, subs_b, a.fuzzy)
+        st_b = score(ref, script_b, subs_b, a.fuzzy, read_ends(vs_path))
         hb = hitset(script_b)
         gained, lost = hb - ha, ha - hb
         g = Counter(evalkit.triviality(t) for t in gained.elements())

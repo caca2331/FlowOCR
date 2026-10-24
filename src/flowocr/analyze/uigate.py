@@ -278,6 +278,12 @@ def is_nameplate(m: dict) -> bool:
             and NP_DY[0] <= m["dy_line"] <= NP_DY[1] and 0.6 <= (m.get("hr") or 0) <= 4.0)
 
 
+def np_window(t0: int, lo: int, win_us: int) -> int:
+    """名牌分窗的窗号：从 `lo`（这批 run 里最早的起点）起每 `win_us` 一窗，按 run 的起点归窗。
+    `pick_nameplates` 分窗和 `build_tracks.ui_footprints` 认"名牌标在哪几个窗"用的是同一个约定，只写这一份。"""
+    return (t0 - lo) // win_us
+
+
 def pick_nameplates(items: list[Item], win_us: int = 120_000_000,
                     dur_ratio: float = 0.8, max_churn: float = 0.8,
                     min_cover: float = 0.5, iou_thr: float = 0.6,
@@ -322,7 +328,7 @@ def pick_nameplates(items: list[Item], win_us: int = 120_000_000,
     lo = min(i.t0 for i in items)
     by_win: dict[int, list[Item]] = {}
     for i in items:
-        by_win.setdefault((i.t0 - lo) // win_us, []).append(i)
+        by_win.setdefault(np_window(i.t0, lo, win_us), []).append(i)
     out: list[Item] = []
     def natural(its: list[Item]) -> list[Item]:
         return [it for it in its if not it.clipped] or its

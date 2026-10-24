@@ -1,10 +1,13 @@
-"""rec 的"打包"方式里**不碰模型的那部分**：近宽分组、异步池挑批、CTC 贪心解码。
+"""rec 的"打包"方式里**不碰模型的那部分**：按宽分组、异步池挑批、CTC 贪心解码。
 
 放共享层是为了守卫够得着（audit-4 C8）：管线（`predict_bucketed`）和守卫用的是同一份。
 只依赖 numpy。
 
-**近宽分桶**（fps-and-rec-budget 报告）：目标宽相差不超过 `ratio` 的裁剪批在一起，批内会被补到最大宽——
-补的零不多，文本变化应该有限，但批能更大。`ratio = 0` 就是现有的同宽分桶。
+**分组键**是后端报的形状宽（`OrtRec.shape_w`：张量宽向上取到 320 的倍数），后端不报时用目标宽本身。
+同一个形状宽的裁剪本来就补到同一个张量宽，所以一组就是一次 `session.run`。
+以前还有一个近宽分桶旋钮（`--rec-near`：目标宽相差不超过 R 的并成一批、补到批内最大宽），
+那是 Paddle rec 按精确宽送时凑批用的；ORT 的 320 网格已经把同一档里的裁剪补到同宽，跨档并了后端也得拆开，
+它在 ORT 上是空操作，2026-10-10 删了（defaults.md 的「rec 按形状宽分组」一节）。
 （当时还探过**横向拼接**——几个裁剪拼成一条长图一次送、按横坐标把字符分回各段；它的排布和切回函数只服务探针，
 2026-10 随 Paddle 探针一起删了。）
 """
@@ -15,47 +18,44 @@ import numpy as np
 from flowocr.extract.recprep import REC_MAX_W, rec_target_w  # noqa: F401  张量宽的公式只有一份（recprep 文件头）
 
 
-def predict_bucketed(rec, crops: list, cap: int, ratio: float = 0.0) -> tuple[list, int]:
-    """**分桶**送 rec（`run_ocr2 --rec-bucket` / `--rec-near`）：目标宽相差不超过 `ratio` 的裁剪一批，
-    每批至多 `cap` 个。`ratio = 0` 是**同宽**分桶：`ToBatch.__pad_imgs` 无事可做，
-    每个样本的输入张量和逐框送时逐位相同（实测 1373/1373）。
+def group_key(rec, crop) -> int:
+    """一个裁剪的分组键：后端报了 `shape_w` 就是形状宽，否则是目标宽（守卫里的假后端）。
+    同步路（`predict_bucketed`）和异步池（`recpool.RecPool.submit`）都走这一个函数。"""
+    tw = rec_target_w(*crop.shape[:2])
+    shape_w = getattr(rec, "shape_w", None)
+    return shape_w(tw) if shape_w is not None else tw
 
-    `ratio > 0` 时批内小的那些会被**右侧补零到批内最大宽**（`__pad_imgs` 干的），所以**产物会变**——
-    它换来的是批真的能凑起来：q-hsr-s2 五分钟、`--rec-window 8` 之下 2,537 个裁剪按同宽并成
-    **799** 批（平均 3.18），近宽 5% 并成 **639** 批（平均 3.97）——`--rec-window` 和它是一对。
+
+def predict_bucketed(rec, crops: list, cap: int) -> tuple[list, int]:
+    """**分桶**送 rec（`run_ocr2 --rec-bucket`）：分组键（`group_key`）相同的裁剪一批，每批至多 `cap` 个。
+    批维不影响读数（`probe_rec_pad.py` B 组：547 条差 0~1 条）。
 
     返回 `(结果, predict 调用次数)`。**结果长度恒等于 `crops`，缺的位置放 `None`，绝不压缩**：
     某批少返回一条时，压缩会让后面所有框配到前一个框的文本上——而且看不出来。
     `rec` 只要有 `predict(list, batch_size=n)`，守卫拿假对象就能测。
     """
     out: list = [None] * len(crops)
-    widths = [rec_target_w(*c.shape[:2]) for c in crops]
-    # 后端自己会把张量宽收到少数几个形状上时（`OrtRec.shape_w`），**按形状宽分桶**、近宽合并不再生效：
-    # 同形状的本来就该同批，不同形状的并了后端也得拆开。批维不影响读数（`probe_rec_pad.py` B 组：547 条差 0~1 条）
-    shape_w = getattr(rec, "shape_w", None)
-    if shape_w is not None:
-        widths, ratio = [shape_w(w) for w in widths], 0.0
-    groups = group_near(widths, ratio, cap)
+    groups = group_width([group_key(rec, c) for c in crops], cap)
     for g in groups:
         for i, r in zip(g, rec.predict([crops[i] for i in g], batch_size=len(g))):
             out[i] = r
     return out, len(groups)
 
 
-def pick_batch(widths: list[int], ratio: float, cap: int,
+def pick_batch(widths: list[int], cap: int,
                prio: set[int] | frozenset[int] = frozenset()) -> list[int]:
     """从**此刻排着的**请求里挑出下一批（异步消费者用，`src/flowocr/extract/recpool.py`）。
 
-    判据是"**有多少取多少**"（owner 2026-09-19 定的形态）：先按近宽分组（组内封顶 `cap`），
+    判据是"**有多少取多少**"（owner 2026-09-19 定的形态）：先按宽分组（组内封顶 `cap`），
     **取最大的那一组就发**，绝不为了凑满一桶而等——两个桶分别有 2 条和 5 条时，取那 5 条开始，
     而不是等第一个桶长到 cap。
 
     `prio` 是**卡着落盘水位的那些请求**（主线程正等最老那一帧）：给了就改取"优先项最多的那一组"。
     优先项本来就和别的请求一起参与分组，所以这一批仍然是满的——**插队不等于把批打小**。
 
-    返回 `widths` 的下标列表（组内按宽升序）；`widths` 为空时返回空表。
+    返回 `widths` 的下标列表（组内按下标升序）；`widths` 为空时返回空表。
     """
-    groups = group_near(widths, ratio, cap)
+    groups = group_width(widths, cap)
     if not groups:
         return []
     if prio:
@@ -63,17 +63,14 @@ def pick_batch(widths: list[int], ratio: float, cap: int,
     return max(groups, key=len)
 
 
-def group_near(widths: list[int], ratio: float, cap: int) -> list[list[int]]:
-    """按目标宽分组：排序后贪心，组内最大宽 ≤ 最小宽 × (1 + ratio)，每组至多 `cap` 个。
-
-    返回下标列表的列表（组内按宽升序）。`ratio = 0` 退化成**同宽**分桶。
-    """
+def group_width(widths: list[int], cap: int) -> list[list[int]]:
+    """按宽分组：同宽的一组，每组至多 `cap` 个。返回下标列表的列表（组按宽升序、组内按下标升序）。"""
     if cap < 1:
         raise ValueError("cap 至少是 1")
     order = sorted(range(len(widths)), key=lambda i: (widths[i], i))
     groups: list[list[int]] = []
     for i in order:
-        if groups and len(groups[-1]) < cap and widths[i] <= widths[groups[-1][0]] * (1 + ratio):
+        if groups and len(groups[-1]) < cap and widths[i] == widths[groups[-1][0]]:
             groups[-1].append(i)
         else:
             groups.append([i])

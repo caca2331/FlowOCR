@@ -172,10 +172,30 @@ def merge_metas(metas: list[dict], base: dict, *, wall: float, cuts_sec: list[fl
                                   else "mixed:" + ",".join(e or "soft" for e in effs))
     # 推理设备的生效值 / 用的模型文件同一个形状（2026-09-22 接手自查）：父进程不建模型、`base` 里没有，不抄就全丢。
     # `--device auto` 由各段各自解析（各自试推理），可能不一致——不一致时逐段列出来
-    for key in ("device_resolved", "device_fallback", "device_effective", "models"):
+    for key in ("device_resolved", "device_fallback", "device_effective", "models", "det_batch", "backend"):   # det_batch：auto 也是各段按设备解析的；backend：各段接同一个共享服务，照理相同，不同时照样逐段列
         vals = [x.get(key) for x in metas if key in x]
         if vals:
             m[key] = vals[0] if all(v == vals[0] for v in vals) else {"mixed": vals}
+    # TRT 按次退回 CUDA EP 的计数（`_meta.ort.<模型>.trt_oop / trt_err`）是服务端的累计数：按各段实际连的服务（`server`）分组，
+    # 同一个服务取最大（共享服务的回信每段都是整份，相加会重复算），不同服务相加（`--no-ort-share`、接外部地址失败后自己起的）
+    per_srv: dict = {}
+    trt_ort: dict = {}
+    for i, x in enumerate(metas):
+        for tag, st in (x.get("ort") or {}).items():
+            if not isinstance(st, dict):
+                continue
+            got = trt_ort.setdefault(tag, {})
+            srv = per_srv.setdefault((tag, st.get("server") or f"seg{i}"), {})
+            for k in ("trt_oop", "trt_err"):
+                if st.get(k):
+                    srv[k] = max(srv.get(k, 0), st[k])
+            if st.get("trt_err_first") and "trt_err_first" not in got:
+                got["trt_err_first"] = st["trt_err_first"]
+    for (tag, _), srv in per_srv.items():
+        for k, v in srv.items():
+            trt_ort[tag][k] = trt_ort[tag].get(k, 0) + v
+    if any(trt_ort.values()):
+        m["ort"] = {**(m.get("ort") or {}), **{t: v for t, v in trt_ort.items() if v}}
     seams = seam_problems(metas, interval)
     bad = next((x["bad_pts"] for x in metas if x.get("bad_pts")), None)
     overlap = [s for s in seams if "重叠" in s]

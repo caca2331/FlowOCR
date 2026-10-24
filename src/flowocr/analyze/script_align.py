@@ -67,6 +67,7 @@ class Entry:
     src: str
     matched: int = -1          # 对上的字幕下标，-1 = 没对上
     sim: float = 0.0
+    status: str | None = None  # 游戏剧本行在这段视频里的处境（`gamescript.STATUSES`）；顺序剧本没有
 
 
 ASS_TAG = re.compile(r"{[^}]*}")
@@ -208,6 +209,85 @@ def align(script: list[Entry], subs: list[tuple[float, str, str]],
             cursor = hit + 1
     return {"subs": len(subs), "exact": n_exact, "fuzzy": n_fuzzy,
             "unmatched_subs": n_none, "jumps": n_jump, "sub_hit": sub_hit}
+
+
+FILL_SIM, FILL_MIN = 0.5, 3
+"""`text_support`：原始 OCR 的一条 cue 和剧本行**共有的内容字**占这一行的 `FILL_SIM`，或者不少于 `FILL_MIN` 字且占这条 OCR 的 `FILL_SIM`，
+才算"OCR 读到了这一行"。0.5 取参照匹配器（`dev_tools/reference/match_ref.py`）不靠上下文时的门 `SIMILARITY_THRESHOLD`。
+后一半是给**半截**的：打字机只读到句尾「ら 待っててよ。」、同一条 cue 里拼进了 `NO DATA` 这类垃圾——对整行的相似度都低，字却是这一行的；
+`FILL_MIN` 挡住单字碰巧落在行里（`大` 对一句含「大」的台词），同 owner 的三档。"""
+
+
+def _content(t: str) -> str:
+    """比内容用：`norm` 之后按 `gamescript.cnorm` 去掉标点空白、小书写假名并成大写（OCR 最常见的差异是省略号和 `はぁ` / `はあ`）。"""
+    from flowocr.analyze.gamescript import cnorm     # 懒 import：gamescript 带 numpy，只有报填位的才要它
+    return cnorm(norm(t))
+
+
+def supports(ocr: str, line: str, partial: bool = True) -> bool:
+    """这条 OCR 文本算不算读到了这一行，按这一行的内容字数（`_content`）分三档：
+    * ≥ `FILL_MIN` 字：共有的内容字占这一行的 `FILL_SIM`，或 ≥ `FILL_MIN` 字且占这条 OCR 的 `FILL_SIM`（半截读数；`partial=False` 不认这一支，
+      给在很宽的时间窗里搜读数的地方用——窗宽时长行总能撞上几个碎片，miss-detector 计划）；
+    * 1–2 字：这几个字**全在** OCR 里（`「未着」……` 读成 `火花 / 「未着」`、`うん` 前面挂着名牌都算；`ふふ` 读成 `不不` 不算）；
+    * 纯标点：连标点一起比（`norm`），共有的占这一行的 `FILL_SIM`（`…！！！` 读成 `ムアラニ / …!!!` 算）。"""
+    lc, oc = _content(line), _content(ocr)
+    def common(a: str, b: str) -> int:
+        return sum(x.size for x in SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks())
+    if len(lc) >= FILL_MIN:
+        m = common(oc, lc)
+        return m >= FILL_SIM * len(lc) or (partial and m >= FILL_MIN and m >= FILL_SIM * len(oc))
+    if lc:
+        return common(oc, lc) == len(lc)
+    ln = norm(line)
+    return bool(ln) and common(norm(ocr), ln) >= FILL_SIM * len(ln)
+
+
+def text_support(script: list[Entry], sub_hit: list[int], out_cues: list[tuple[float, float, int]],
+                 ocr_cues: list[list[tuple[float, float, str]]]) -> set[int]:
+    """**匹配器输出**上的命中里，哪些剧本行有 OCR 文本支撑：认领它的输出 cue 里至少有一条，时段内（正重叠）有一条原始 OCR cue
+    和这一行共有足够多的内容字（`supports`）。返回这些行在 `script` 里的下标；命中但不在里面的就是**填位**——匹配器按上下文把剧本行填在了
+    没读到这句的 cue 上（垃圾 cue、空档）。
+
+    为什么要分开（2026-09-26 审计 → 2026-10-05 改口径）：匹配后的 `.ass` 文本已被换成剧本原文，游标对齐必然逐字命中；
+    yuka f5 上看 x 那一刀记的 −15 条"命中"，多数是旧臂里匹配器把剧本行填在发饰误读的 `大` / `米` cue 上，
+    挡掉垃圾 cue 填位就没了——不拆开，往主轨里灌垃圾 cue 的改动在这把尺上显得有收益。
+
+    `sub_hit`：`align` 返回的每条输出 cue 认的剧本下标；`out_cues`：每条输出 cue 的 (起, 止, 文件序号)，和 `sub_hit` 一一对应；
+    `ocr_cues`：按文件序号给的原始 OCR cue（起, 止, 文本），即喂给匹配器的那份。"""
+    import bisect
+    starts = [[c[0] for c in f] for f in ocr_cues]
+    longest = [max((c[1] - c[0] for c in f), default=0.0) for f in ocr_cues]
+    cache: dict[tuple[int, int, int], bool] = {}
+    out: set[int] = set()
+    for si, h in enumerate(sub_hit):
+        if h < 0 or h in out:
+            continue
+        s, e, f = out_cues[si]
+        k = bisect.bisect_left(starts[f], e)
+        while k > 0:
+            k -= 1
+            a, b, t = ocr_cues[f][k]
+            if a < s - longest[f]:
+                break
+            if b <= s:
+                continue
+            key = (f, k, h)
+            if key not in cache:
+                cache[key] = supports(t, script[h].text)
+            if cache[key]:
+                out.add(h)
+                break
+    return out
+
+
+def read_timed(paths: list[Path]) -> list[tuple[float, float, int]]:
+    """和 `read_subs(paths)` 一条对一条的 (起, 止, 文件序号)：`text_support` 的 `out_cues`。"""
+    return [(c.start, c.end, f) for f, p in enumerate(paths) for c in srtio.read_subs([p])]
+
+
+def read_ocr(paths: list[Path]) -> list[list[tuple[float, float, str]]]:
+    """原始 OCR（喂给匹配器的那份）按文件读成 (起, 止, 文本)、按起点排：`text_support` 的 `ocr_cues`。"""
+    return [sorted((c.start, c.end, c.text(" ")) for c in srtio.read_subs([p])) for p in paths]
 
 
 def align_unordered(script: list[Entry], subs: list[tuple[float, str, str]],
@@ -403,6 +483,10 @@ def main() -> int:
                     help="OCR 的**原始**输出（未经匹配器）。给了就把疑似真漏再拆一刀："
                          "原始 OCR 里读到过的 = 匹配器丢的，没读到过的 = OCR 丢的。"
                          "两件事的修法完全不同，合成一个『漏条率』就没法定位")
+    ap.add_argument("--fill-ocr", nargs="+", default=None,
+                    help="喂给匹配器的那份 OCR（和 --subs 一个文件对一个，同顺序）。给了就把命中拆成"
+                         "『有 OCR 文本支撑』和『填位』（匹配器按上下文填在没读到这句的 cue 上），"
+                         "JSON 多出 dialogue_hit_text / dialogue_fill。量匹配器输出时要给（text_support）")
     ap.add_argument("--text-quality", action="store_true",
                     help="在配上的那些对上，报逐字相同率和省略号召回。"
                          "命中率只说『锚没锚上』，这两个数说『读得有多像』——"
@@ -508,6 +592,16 @@ def main() -> int:
             else f"（另有 {n_other} 条是选项/Toast/命令，不计）")
     print(f"剧本侧：**该上屏的对话类 {len(dial)} 条**{tail}，"
           f"命中 {len(hit)}（{len(hit)/max(1,len(dial)):.1%}）")
+    hit_text = None
+    if args.fill_ocr:
+        if len(args.fill_ocr) != len(args.subs) or args.same_timeline or args.time_range or args.unordered:
+            raise SystemExit("--fill-ocr 要和 --subs 一个文件对一个，且不和 --same-timeline / --time-range / --unordered 一起用")
+        ok = text_support(script, st["sub_hit"], read_timed([Path(x) for x in args.subs]),
+                          read_ocr([Path(x) for x in args.fill_ocr]))
+        idx = {id(e): i for i, e in enumerate(script)}
+        hit_text = [e for e in hit if idx[id(e)] in ok]
+        print(f"  其中**有 OCR 文本支撑的** {len(hit_text)}（{len(hit_text)/max(1,len(dial)):.1%}），"
+              f"填位 {len(hit) - len(hit_text)}（匹配器按上下文填在没读到这句的 cue 上，`text_support`）")
 
     gr = gap_report(dial, args.branch_run)
     runs, long_runs, short = gr["runs"], gr["long_runs"], gr["short"]
@@ -621,6 +715,8 @@ def main() -> int:
             "subs": st["subs"], "exact": st["exact"], "fuzzy": st["fuzzy"],
             "unmatched_subs": st["unmatched_subs"],
             "dialogue_hit": len(hit),
+            **({"dialogue_hit_text": len(hit_text), "dialogue_fill": len(hit) - len(hit_text)}
+               if hit_text is not None else {}),
             "gap_long_runs": len(long_runs), "gap_long_entries": n_long,
             "gap_short_places": len(short), "gap_short_entries": n_short,
             "branch_run": args.branch_run,

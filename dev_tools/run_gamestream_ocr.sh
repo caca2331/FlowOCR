@@ -34,7 +34,7 @@ SRC="$ARCHIVE/gamestream"
 # 默认值一翻，旧产物就不再算"已完成"。
 run () {   # run <标签> <视频路径>
   out="out/gamestream/$1.jsonl"
-  local args=("$2" --out "$out" --progress-every 2000)
+  local args=("$2" --out "$out" --quality high --progress-every 2000)   # 开发一律 high（owner 2026-10-05）
   if why=$("$PY" -m flowocr.extract.ocr_complete "$out" --argv "${args[@]}"); then
     echo "[skip] $out 已完成（同一组生效参数）"
     [ -n "$why" ] && echo "  $why"     # 代码指纹不同时 ocr_complete 会说话，别吞掉

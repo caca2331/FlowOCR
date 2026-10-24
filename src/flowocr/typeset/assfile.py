@@ -211,6 +211,37 @@ def first_tag(text: str, name: str, lead_only: bool = False) -> str | None:
     return None
 
 
+COLOR_RE = re.compile(r"\\1?c(?:&H([0-9A-Fa-f]+)&?)?\s*")
+"""顶层的主色 tag（`\\1c&HBBGGRR&` / `\\c&H…&`；没有值的是回到样式的颜色）。`\\clip` 不算（整个 tag 匹配）。"""
+
+
+def head_color(text: str) -> str | None:
+    """正文开头那个 tag 块里最后生效的主色（BBGGRR，大写）；没有是 None。"""
+    parts = blocks(text)
+    if not parts or parts[0][0] != "tags":
+        return None
+    got = [m[1] for t in split_tags(parts[0][1]) if (m := COLOR_RE.fullmatch(t)) and m[1]]
+    return got[-1].upper().zfill(6)[-6:] if got else None
+
+
+def recolor_inline(text: str, base: str | None, head: bool = True) -> str:
+    """行内（`head` 时跳过开头那个 tag 块）没有值的主色 tag（回到样式的颜色，剧本样式的闭标签就写成它，`richtext.to_ass`）
+    换成 `base`（这一行实际的字色，BBGGRR；None 不换）。有值的不动，`\\t(…)` 里面的不碰。"""
+    out = []
+    for i, (kind, s) in enumerate(blocks(text)):
+        if kind != "tags" or (head and i == 0):
+            out.append(s if kind == "text" else "{" + s + "}")
+            continue
+        tags = []
+        for t in split_tags(s):
+            m = COLOR_RE.fullmatch(t)
+            if m and not m[1] and base:
+                t = "\\1c&H%s&" % base
+            tags.append(t)
+        out.append("{" + "".join(tags) + "}")
+    return "".join(out)
+
+
 def numbers(s: str) -> list[float]:
     """`"1,2"`（tag 的参数）或 `"1 2"`（`fo` 里的数值列表）→ [1.0, 2.0]。"""
     return [float(x) for x in re.split(r"[,\s]+", s.strip()) if x]

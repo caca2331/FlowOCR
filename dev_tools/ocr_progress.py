@@ -28,6 +28,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))   # 正式包（没装 flowocr 的 venv 里也能跑）
+from flowocr import provenance  # noqa: E402
+
 TAIL_BYTES = 65536
 
 
@@ -82,7 +85,7 @@ def report(path: Path) -> None:
     bits = [f"{path.name}: {size/1e6:.1f} MB"]
     if frame is not None and fps:
         done = frame / fps
-        total = _duration_sec(video) if video else None
+        total = _duration_sec(str(provenance.local(video))) if video else None
         if total:
             pct = 100 * done / total
             # 速率按"从文件第一次落盘到现在"估，比日志里的滚动估计粗，但够用

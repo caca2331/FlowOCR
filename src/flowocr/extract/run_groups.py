@@ -6,7 +6,7 @@
 之后各组各自建轨（阶段二）、各自输出（阶段三）。
 
 **共用的是什么**（落地结构，方案的首版）：每组一个管线进程（组之间的事件状态天然隔离），
-det 和 rec 各走**一个**共享 ORT 服务——模型和显存一份（同 `--workers`，`run_ocr2.start_ort_services`）；
+det 和 rec 走**同一个**共享 ORT 服务——模型和显存一份，几组的请求按 批 × 宽 准入（同 `--workers`，`run_ocr2.start_ort_services`，defaults §1.42）；
 `--share-decode`（默认开）时解码也只有一份：一个广播解码进程（`decode_proc.hub_serve`）按分片解一遍、同一份采样帧给各组、
 辅助流按组各一条有界队列转给各组的回抠进程。为什么值得（方案）：两组各自分片解 = 4 个 ffmpeg 上下文，det / rec 推理被分时
 拖慢约 1.5 倍；各自不分片则供帧跟不上——共用一份分片解码两头都要。
@@ -168,6 +168,17 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(ns.outdir)
     out.mkdir(parents=True, exist_ok=True)
     base = [ns.video, "--start", repr(ns.start), "--end", repr(ns.end), "--regions", ns.regions, *rest]
+    import os
+    from flowocr.extract.supervisor import OCR_LANG_ENV, probe_lang, wants_auto
+    if wants_auto(rest) and not os.environ.get(OCR_LANG_ENV):
+        # --ocr-lang auto：起共用服务之前按**各组范围的并集**判一次，各组（和整批改软解的重跑）都读这一份；
+        # 各组子进程经过的监督者见到已有结果就不再探
+        got = probe_lang([*base, "--out", str(out / "_")], child_env(dict(os.environ)), ("--probe-all-groups",))
+        if got is None:
+            return 2
+        os.environ[OCR_LANG_ENV] = got
+        import atexit
+        atexit.register(lambda: Path(got).unlink(missing_ok=True))     # 这一批跑完删（各组、整批重跑都读完了）
     cmds = {g: [sys.executable, "-m", "flowocr.extract.run_ocr2", *per_group(base, g), "--region-group", g,
                 "--out", str(out / f"{g}.jsonl")] for g in names}
     t0 = time.time()

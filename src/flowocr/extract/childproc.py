@@ -116,3 +116,17 @@ def connect():
             conn.send(msg)
 
     return conn, send
+
+
+def attach_shm(name: str):
+    """挂接**别的进程建的**共享内存段（建的那一方负责 unlink）。
+
+    POSIX 上 CPython 3.12 的 `SharedMemory(name=…)` 挂接也会把段登记进本进程的 `resource_tracker`，本进程一退，
+    tracker 就把段 unlink 掉、还打 "leaked shared_memory" 警告，建的那一方再 unlink 时找不到（2026-10-17 WSL 上的 Linux 试跑）。
+    所以挂上就撤掉登记（3.13 起是 `track=False`；项目锁在 3.12）。Windows 不登记，原样挂接。"""
+    from multiprocessing import resource_tracker, shared_memory
+
+    shm = shared_memory.SharedMemory(name=name)
+    if sys.platform != "win32":
+        resource_tracker.unregister(shm._name, "shared_memory")
+    return shm

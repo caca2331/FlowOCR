@@ -2,30 +2,39 @@
 
 方案：script-fx 计划（owner 2026-09-27）。这里**只投影**，不重新判断（artifacts.md 第 1 条）：
 
-* 对齐方式是阶段 2 判好的 `regions[].align`；matched 各层盖哪些块是 `scriptmatch.overlay_items` 判好的；
+* 对齐方式是阶段 2 判好的 `regions[].align`；matched 各层盖哪些块是 `scriptmatch.overlay_items` 判好的，
+  画哪些按产物里匹配器声明的组和用户的 `show` / `hide` 算（显示协议，`matchedio.visible`）；
 * tracks 取哪些事件、哪些是常驻 UI，按**轨**取（`tracksio.cue_lines`，UI 的权威清单 `ui_lines` 是逐轨的）；
 * 效果（打字机 / 淡入淡出）的判定在这里做一次，写进字幕稿（淡入淡出是 `\\fad`，打字机是 Effect 里 `fo` 的 `tw`），阶段 4 不回读阶段 2。
 
 条目（`Item`）= 一组同起同止的行。来源两个：
 
-* `tracks_items`：**一个事件一条**，每个事件只画一次。不按 cue 出：默认的 `--srt-mode segment` 把一条常驻行
-  切进好几条 2 秒的 cue，按 cue 出会画好几遍（底板叠成不透明、打字机从头放好几次）；
+* `tracks_items`：**一条 cue 一条**（一句一条，cue-shape 计划的 a）：cue 里的行按 `tracksio.cue_rows` 拼好，行间 `\\N`；
+  名牌、常驻 UI、在动的、挂在几条 cue 里的事件照旧一事件一条——挂在几条 cue 里的按句画会画好几遍（底板叠成不透明、打字机从头放好几次）。
+  每个事件只画一次。一条里各行出现得不一样早时，阶段 3 写逐行时刻 `rowt`，阶段 4 按行显字（`row_times`）；
 * `project_items`：一个匹配条目一条，译文按原文行数重分（`overlay_lines`）。
 
 一条条目写成字幕稿里的一行（源行）：Style 按角色、Actor 是区域号、Effect 是阶段 4 要的其余参数 `fo:…`
-（原文框、打字机时长、轨迹、`was`…，格式见 artifacts.md 的字幕稿一节）；正文是一个 tag 块（`\\an` `\\pos` `\\fs` `\\fad`）+ 纯文字。
+（原文框、打字机时长、轨迹、`was`…，格式见 artifacts.md 的字幕稿一节）；正文是一个 tag 块（`\\an` `\\pos` `\\fs` `\\fad`）+ 纯文字，
+剧本带样式（`style=on`，默认）时字中间另有剧本的粗体 / 斜体 / 下划线 / 删除线 / 字色标签（`flowocr.richtext`），
+带 Ruby（`ruby=on`，默认）时另有 Ruby 的注释块 `{ruby:读音}正文{/ruby}`（渲染器不画；阶段 4 把它画成正文上方的小字，`flowocr.typeset.ruby`）。
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 
+from flowocr import placeholders
 from flowocr import provenance
+from flowocr import richtext
+from flowocr import textfold
 from flowocr.artifacts import matchedio, tracksio
-from flowocr.artifacts.matchedio import LAYERS
 from flowocr.output import export, layout
 from flowocr.typeset import assfile
 
@@ -37,8 +46,15 @@ STYLES = ("Body", "Extra", "Name", "Choice", "Offmain", "Panel", "UI")
 条目在不在主轨另由 `fo` 参数 `off` 记（dev 按它改字色）。"""
 
 PREVIEW_BOX = "&H20101010"
+STYLE_FILL = "&H00FFFFFF"
+"""字幕稿各样式的主色（白）。阶段 4 认它：样式的主色还是它，才算没被人改过、底板取色可以自动改字色。"""
 """预览底框的颜色（`BorderStyle=3` 用 OutlineColour 画框）：近黑、α 0x20。只供预览，阶段 4 的生成行不用它。"""
 
+STYLE_MODES = ("on", "off")
+"""`style` 选项：剧本里的行内样式（粗体 / 斜体 / 下划线 / 删除线 / 字色，`flowocr.richtext`）带不带进字幕稿和叠加 ASS。默认带；SRT 一律不带（owner 2026-10-23）。"""
+RUBY_MODES = ("on", "off")
+"""`ruby` 选项：剧本里的 Ruby（读音、语义注释）写不写进字幕稿（注释块 `{ruby:读音}正文{/ruby}`，`richtext.to_ass`）。默认写；
+和 `style` 各管各的；SRT 一律不带（owner 2026-10-23）。"""
 TYPEWRITER_MODES = ("off", "on", "dim")
 """打字机效果：`on` 检出了就逐字显出；`dim` 全字出现之前整句半透明（审计时刻用，阶段 4 的选项）；`off` 不做。"""
 
@@ -51,6 +67,12 @@ FADE_IN_MAX_US = 300_000
 不一定是淡入：整段判不清时它常常是打字过程（gi-s2 回抠产物上 0.4–1.2 s），画成那么长的淡入，字会一直发虚。
 主轨上量到的真淡出多数 ≤ 2 帧、最长约 15 帧（text-effects 报告），这个上限盖得住。
 ⚠ owner 2026-09-25：有点绝对，待观察（followups 清单）。"""
+
+ROW_END_TOL_US = 100_000
+"""句条目里的行要**一起消失**：终点和这一句多数行的终点差得超过这么多的事件不进句条目、单独一条——ASS 的一条 Dialogue 只有一个终点，
+混进一条晚消失的（水族馆那个图标 `福` 比台词多挂 0.25 s）会把整句一起拖长。同一句的几行在对话框关掉的同一帧消失，回抠后差不过几帧。
+用绝对时长、不挂采样间隔：要比的是回抠后的终点（原生帧精度），挂在 0.5 s 的采样间隔上就放过了 `福` 这种；没回抠的产物上同一句各行
+本来就落在同一个采样点，这个门碰不到。"""
 
 INSTANT_MAX_SPREAD = 1.0
 """回抠的整段判定 `instant` 有两种来源（`refine_boundaries`）：每字生长的中位时长不到一帧（字确实没有生长），
@@ -80,24 +102,108 @@ class Item:
     row_h: int = 0                             # block：原文行高（字号从它换算）
     layer: str = ""                            # matched 的层（body / extra / …）；tracks 的条目是空
     key: str | None = None                     # matched：剧本行的键（跨阶段 2 重跑仍然稳定）
+    row_events: list[list[dict]] = field(default_factory=list)   # tracks 的句条目：每行的事件（`rows` 同序），取逐行时刻用
+    row_leads: list[list[dict]] = field(default_factory=list)    # 每行的半截行（cue 的 `partial`）：只贡献首字时刻，不进 `events`
+    source: str | None = None                  # matched 的译文条目：没按原文行数重分过的剧本原句（SRT 出它，`srt_text`）
+    spans: bool = False                        # tracks：跨句常驻（事件挂在这条轨的几条 cue 里）——字幕稿照画，SRT 不出（`srt_blocks`）
+    echo: str | None = None                    # matched 的 body / extra：回显判定的形态（`matchedio.ECHOES`）——叠加照画，SRT 默认不出两种（`srt_blocks`）
+    echo_of: list | None = None                # 同上：主那次认领 [记录, slot]
+    claim: list | None = None                  # 同上：这个条目是哪次认领 [记录, slot]（slot −1 = ref）
+    styled: str | None = None                  # matched 的译文条目：带样式 / Ruby 的剧本原句（`richtext` 的规范写法，`style` / `ruby` 关掉的那种已剥掉，占位已标），
+                                               # 剩下没有标签是 None。
+                                               # `lines` / `source` 照旧是纯文字（量字宽、断行都按它），写正文时才把样式投回去（`styled_lines`）
 
 
-def overlay_lines(text: str, rows: int) -> list[str]:
-    """译文分成**恰好** `rows` 行（和原字幕逐行对位，底板才能逐行画）：剧本自带换行数正好就照它，
-    否则把整句按字数均分。`rows ≤ 1` 时剧本换行照留。"""
+NO_START = "，。、！？；：,.!?;:)）」』】〕〉》…・·ー"
+"""不放行首的（避头）：句读、右括号右引号、省略号、长音。"""
+NO_END = "（(「『【〔〈《"
+"""不放行尾的（避尾）：左括号左引号。"""
+BREAK_AFTER = "，。、！？；：,.!?;:」』）)…"
+"""断在它后面最自然的字。"""
+SNAP, SNAP_FRAC = 2.0, 0.35
+"""断点离按比例算出的位置不超过 max(`SNAP`, 每行平均字宽 × `SNAP_FRAC`) 时，就近挪到标点后面：宁可比例差一点，也断在句读处
+（gi2 摆字幕稿：窗口只有 2 个字时「…传说中的使 / 者，」「…是我的 / 下属，」都断在词中间；放到每行三成半，三句都落到逗号后）。"""
+QUOTE_SNAP = 6.0
+"""断点落在「」『』《》（）里面（多半是一个专名，「人间百 / 态」）时，这么多个字宽以内能挪到括号外就挪。"""
+OPEN, CLOSE = "「『《（(【〔〈", "」』》）)】〕〉"
+HOLD = 0xF0000
+"""`overlay_lines` 里把占位的标记、Ruby 的正文暂换成的字（补充私用区，正文里不会有）。"""
+
+
+def cw(c: str) -> float:
+    """一个字的宽度权重：全角（含宽度不定的引号、省略号）1，其余 0.5。"""
+    return 1.0 if unicodedata.east_asian_width(c) in "WFA" else 0.5
+
+
+def overlay_lines(text: str, widths: list[float], styled: str | None = None) -> list[str]:
+    """译文分成**和原文框一样多**的行（逐行对位，底板才能逐行画），`widths` 是原文各行框的宽。
+    剧本自带的换行数正好等于行数就照它（作者的断法）；否则接起来（两边是拉丁字母就补空格），**按原文各行的宽度比例**分字数——
+    原文第一行长、第二行短，译文也前长后短（原来是按字数均分，2026-10-05 owner 提的）：
+    断点离按比例算出的位置 `SNAP` 个字以内有标点就挪到标点后面，避头（`NO_START` 不放行首）、避尾（`NO_END` 不放行尾），
+    拉丁文只在空格处断。字太少分不出这么多行时少出几行（阶段 4 整块画）。行数 ≤ 1 时剧本换行照留。
+    占位的标记（`` [`编号:值] ``，`flowocr.placeholders`）当一个字、不拆开，宽按值算（阶段 4 换成值以后的长度）。
+    Ruby 的正文（`styled` 是 `text` 带标签的那份，`<ruby=…>` 包着的字，`flowocr.richtext`）同样当一个字（读音对着整段正文的中心画，拆开就对不上了）：
+    行界落在它前面或后面、哪边离按比例算的位置近取哪边；它里面的剧本换行去掉。"""
+    rows = len(widths)
+    held: list[str] = []
+
+    def hold(x: str) -> str:
+        held.append(x)
+        return chr(HOLD + len(held) - 1)
+
+    def marks(x: str) -> str:
+        return placeholders.MARK_RE.sub(lambda m: hold(m.group(0)), x)
+    parts, at = [], 0
+    for a, b in richtext.ruby_spans(styled) if styled and richtext.plain(styled) == text else ():
+        parts += [marks(text[at:a]), hold(richtext.BREAKS.sub("", text[a:b]).replace("\n", ""))]
+        at = b
+    text = "".join(parts) + marks(text[at:])
+
+    def back(x: str) -> str:
+        return "".join(held[ord(c) - HOLD] if HOLD <= ord(c) < HOLD + len(held) else c for c in x) if held else x
     ls = [x for x in text.replace("\\N", "\n").split("\n") if x.strip()] or [text]
     if rows <= 1 or len(ls) == rows:
-        return ls
-    s = "".join(ls)
-    k = -(-len(s) // rows)
-    return [s[i:i + k] for i in range(0, len(s), k)]
-
-
-def main_regions(doc: dict) -> set[int]:
-    main = tracksio.main_track(doc)
-    if not main:
-        return set()
-    return set(main.get("regions") or ([main["region"]] if "region" in main else []))
+        return [back(x) for x in ls]
+    s = ""
+    for x in ls:
+        x = x.strip()
+        s += (" " if s and s[-1].isascii() and s[-1].isalnum() and x[:1].isascii() and x[:1].isalnum() else "") + x
+    w = [sum(cw(v) for v in placeholders.MARK_RE.sub(lambda m: m.group(2), held[ord(c) - HOLD]))
+         if HOLD <= ord(c) < HOLD + len(held) else cw(c) for c in s]
+    total, tot_w = sum(w), sum(max(0.0, v) for v in widths) or float(rows)
+    pos = [0.0]                                       # pos[i]：第 i 个字之前的累计宽
+    for v in w:
+        pos.append(pos[-1] + v)
+    latin = sum(c.isascii() and c.isalpha() for c in s) > len(s) / 2
+    depth, d = [0], 0                                   # depth[i]：第 i 个字之前，在几层括号里面
+    for c in s:
+        d = d + 1 if c in OPEN else max(0, d - 1) if c in CLOSE else d
+        depth.append(d)
+    cuts, acc = [], 0.0
+    snap = max(SNAP, SNAP_FRAC * total / rows)
+    for v in widths[:-1]:
+        acc += max(0.0, v)
+        target = total * acc / tot_w
+        lo = cuts[-1] + 1 if cuts else 1
+        cand = [i for i in range(lo, len(s)) if (s[i - 1] == " " or s[i] == " ") or not latin]
+        if not cand:
+            break
+        best = min(cand, key=lambda i: abs(pos[i] - target))
+        near = [i for i in cand if abs(pos[i] - target) <= snap and s[i - 1] in BREAK_AFTER and depth[i] == 0]
+        outside = [i for i in cand if abs(pos[i] - target) <= QUOTE_SNAP and depth[i] == 0]
+        if near:
+            best = min(near, key=lambda i: abs(pos[i] - target))
+        elif depth[best] and outside:
+            best = min(outside, key=lambda i: abs(pos[i] - target))
+        while best < len(s) and s[best] in NO_START:         # 避头：标点挂在上一行末尾
+            best += 1
+        while best - 1 > lo and s[best - 1] in NO_END:       # 避尾：左括号挪到下一行
+            best -= 1
+        if best >= len(s) or (cuts and best <= cuts[-1]):
+            break
+        cuts.append(best)
+    out = [back(s[a:b].strip()) for a, b in zip([0, *cuts], [*cuts, len(s)])]
+    return [x for x in out if x]
 
 
 def region_align(doc: dict) -> dict[int, str]:
@@ -112,82 +218,149 @@ def need_align(doc: dict, where: str) -> None:
                          "这份产物早于对齐判据，重跑 build_tracks（只是阶段 2，不重跑 OCR）")
 
 
-def tracks_items(doc: dict, keep: str) -> list[Item]:
-    """tracks → 条目：**一个事件一条、只画一次**，按轨挑事件（UI 的作用域跟着轨走）。
+def tracks_items(doc: dict, keep: str, per_event: bool = False) -> list[Item]:
+    """tracks → 条目：**一条 cue 一条**（一句一条），每个事件只画一次（cue-shape 计划的 a）。
 
-    * `keep="main"`：主轨的 cue 过一遍 `cue_lines`（和 `srt_main` 同一个行集）+ 名牌轨的事件；
-    * `keep="all"`：全部区域轨，UI 事件也取（`drop_filtered=False`），按**那条区域轨自己的** `ui_lines`
-      和全局的 `ui_footprint` 标成 UI；振り仮名（`ruby` 标）也取、按 UI 标（`dev` 画成 UI 的样子，查注音判据靠它）。
-      主轨和名牌轨都是区域轨的另一种投影，不再走。
-    都按事件 id 去重（跨轨、跨 cue）。"""
-    picked: dict[int, bool] = {}
-    cue_of: dict[int, str] = {}
+    * `keep="main"`：主轨的 cue 过一遍 `cue_lines`（和阶段 2 的主轨 SRT 同一个行集）+ 名牌轨的事件；
+    * `keep="all"`：全部区域轨，UI 事件也取（`drop_filtered=False`），按**那条区域轨自己的** `ui_lines`、
+      全局的 `ui_footprint`、cue 上藏的杂行（`hide`）标成 UI；振り仮名（`ruby` 标）也取、按 UI 标。主轨和名牌轨都是区域轨的另一种投影，不再走。
+    * 一条 cue 里的正文事件按 `tracksio.rows_of_events` 拼成行、合成一个条目；起止 = 这些事件和它们的半截行（cue 的 `partial`）的最早起点 / 最晚终点，
+      夹在 cue 里。半截行只贡献所在行的首字时刻（`row_leads`），不进 `events`——挂进去会被 `typing_events` 当成更早的事件、把接上它的整行当碎片扔掉。
+    * 照旧一事件一条的：名牌（`Name`）、UI、在动的（有轨迹）、在这条轨上挂在几条 cue 里的（按句画会画好几遍）。
+    * `per_event=True`：全部一事件一条（`ocr_items` 用：matched 的认领按事件算，它按单个事件扣面板、补画 OCR 原文）。"""
     if keep == "main":
         main = tracksio.main_track(doc)
         if main is None:
             raise ValueError("这份产物没有主轨（provenance.main_track 为空），`default` 没有可叠的")
-        for tr in [main, *(t for t in doc["tracks"] if t["kind"] == "nameplate")]:
-            for cue in tr["cues"]:
-                for e in tracksio.cue_lines(doc, tr, cue):
-                    picked.setdefault(e["id"], False)
-                    cue_of.setdefault(e["id"], cue["id"])
+        trs, drop = [main, *(t for t in doc["tracks"] if t["kind"] == "nameplate")], True
     else:
-        for tr in doc["tracks"]:
-            if tr["kind"] != "region":
-                continue
-            ui = set(tr.get("ui_lines") or ())
-            for cue in tr["cues"]:
-                for e in tracksio.cue_lines(doc, tr, cue, drop_filtered=False):
-                    flagged = (e["text"].strip() in ui
-                               or bool({"ui_footprint", "ruby"} & set(e.get("flags") or ())))
-                    picked[e["id"]] = picked.get(e["id"], False) or flagged
-                    cue_of.setdefault(e["id"], cue["id"])
-    mains, aligns = main_regions(doc), region_align(doc)
-    out = []
-    for eid in sorted(picked):
-        e = doc["events"][eid]
+        trs, drop = [t for t in doc["tracks"] if t["kind"] == "region"], False
+    mains, aligns = tracksio.main_regions(doc), region_align(doc)
+    # "挂在几条 cue 里 = 跨句常驻"只在切分是一句一条时成立：`--cue-join off`（或没记这个参数的旧产物）下，同一句被 ▼ 闪烁切成几条，
+    # 那一行 run 也挂在几条 cue 里——标成 spans 会把真台词从 SRT 里整行丢掉（验收 peer 实测 off 臂少 105 条）
+    pargs = (doc.get("provenance") or {}).get("args") or {}
+    joined = pargs.get("cue_join") == "on" and pargs.get("srt_mode", "segment") == "segment"   # 同 build_tracks：合并只在 segment 切分下做
+    done: set[int] = set()
+    out: list[Item] = []
+
+    def single(e: dict, ui: bool, cue_id: str, spans: bool = False) -> Item:
         moving = len(e.get("boxes") or []) >= 2
-        out.append(Item(e["t_start"], e["t_end"], [list(e["box"])], [e["text"]],
-                        "name" if "nameplate" in (e.get("flags") or []) else "line",
-                        events=[e], region=e["region"], main=e["region"] in mains if mains else True,
-                        ui=picked[eid], align="center" if moving else aligns.get(e["region"], "center"),
-                        boxes=e["boxes"] if moving else None, cue=cue_of[eid]))
+        return Item(e["t_start"], e["t_end"], [list(e["box"])], [e["text"]],
+                    "name" if "nameplate" in (e.get("flags") or []) else "line",
+                    events=[e], region=e["region"], main=tracksio.in_main(e, mains) if mains else True,
+                    ui=ui, align="center" if moving else aligns.get(e["region"], "center"),
+                    boxes=e["boxes"] if moving else None, cue=cue_id, spans=spans)
+
+    for tr in trs:
+        ui_text = set(tr.get("ui_lines") or ())
+        hung = Counter(i for c in tr["cues"] for i in c["events"])
+        for cue in tr["cues"]:
+            hide = set(cue.get("hide") or ())
+            group = []
+            for e in tracksio.cue_lines(doc, tr, cue, drop_filtered=drop):
+                if e["id"] in done:
+                    continue
+                flags = set(e.get("flags") or ())
+                ui = not drop and (e["text"].strip() in ui_text or bool({"ui_footprint", "ruby"} & flags) or e["id"] in hide)
+                if (per_event or ui or "nameplate" in flags or len(e.get("boxes") or []) >= 2 or hung[e["id"]] > 1
+                        or tr["kind"] == "nameplate"):
+                    out.append(single(e, ui, cue["id"], spans=joined and not per_event and hung[e["id"]] > 1))
+                else:
+                    group.append(e)
+                done.add(e["id"])
+            leads = [doc["events"][i] for i in cue.get("partial") or ()]
+            if not group:
+                for ld in leads:                  # 没有句条目可挂：半截行照原样单独画（它真在屏上显示过）
+                    if ld["id"] not in done:
+                        out.append(single(ld, False, cue["id"]))
+                        done.add(ld["id"])
+                continue
+            ends = sorted(e["t_end"] for e in group)
+            k = max(range(len(ends)), key=lambda i: (sum(1 for x in ends if ends[i] <= x <= ends[i] + ROW_END_TOL_US), ends[i]))
+            lo = ends[k]
+            for e in [e for e in group if not lo <= e["t_end"] <= lo + ROW_END_TOL_US]:      # 不和这一句一起消失的：单独一条
+                out.append(single(e, False, cue["id"]))
+            group = [e for e in group if lo <= e["t_end"] <= lo + ROW_END_TOL_US]
+            rows = tracksio.rows_of_events(group)
+            # 半截行只在它正好在这一行出现时消失（± 一个采样间隔）才算这一行的首字：隔了几秒才打出来的（wuwa 广告横幅），
+            # 拿半截行的起点会把这一行的首字往前拉、把整句的打字机节奏拖长
+            row_leads = [[ld for ld in leads if tracksio.same_row(ld["box"], r["box"])
+                          and abs(min(e["t_start"] for e in r["events"]) - ld["t_end"]) <= doc["frame_us"]] for r in rows]
+            # 没挂到任何一行上的半截行（回抠之后和后续之间隔开了：绝区零 244 s 打到一半黑场 0.8 s 再整句出来），
+            # 它是真在屏上单独显示过的一段，照原样单独画，不藏
+            used = {id(ld) for rl in row_leads for ld in rl}
+            for ld in leads:
+                if id(ld) not in used and ld["id"] not in done:
+                    # 只画到同一处的那行出现之前：同文本的重复读数（长的被藏、短的当代表）后半段和代表重叠，画两遍底板会叠深
+                    later = [min(e["t_start"] for e in r["events"]) for r in rows
+                             if tracksio.same_row(ld["box"], r["box"]) and min(e["t_start"] for e in r["events"]) > ld["t_start"]]
+                    it = single(ld, False, cue["id"])
+                    if later:
+                        it = replace(it, end_us=min(it.end_us, min(later)))
+                    out.append(it)
+                    done.add(ld["id"])
+            s0 = min(e["t_start"] for e in group + [ld for rl in row_leads for ld in rl])
+            e0 = max(e["t_end"] for e in group)
+            s0, e0 = max(s0, cue.get("t_start", s0)), min(e0, cue.get("t_end", e0))
+            region = rows[0]["events"][0]["region"]
+            out.append(Item(s0, max(s0, e0), [r["box"] for r in rows], [r["text"] for r in rows], "line",
+                            events=group, region=region, main=tracksio.in_main(rows[0]["events"][0], mains) if mains else True,
+                            align=aligns.get(region, "center"), cue=cue["id"],
+                            row_events=[r["events"] for r in rows], row_leads=row_leads))
+    out.sort(key=lambda it: (it.start_us, min(e["id"] for e in it.events)))
     return out
 
 
-def project_items(items: list[dict], doc: dict, lang: str, layers, used: set[int] | None = None) -> list[Item]:
-    """matched → 条目：**投影**，按层和语言把 `overlay_items` 判好的条目摆成 `Item`，不判断任何东西。
-    这一层没有 `lang` 的译文就不叠（画面原样）。区域取条目第一个事件的；对齐取那个区域的，多行用公共轴。
-    `used` 给了就把真画出来的条目用到的事件 id 记进去（`unmatched_items` 用）。"""
-    mains, aligns = main_regions(doc), region_align(doc)
+def project_items(items: list[dict], doc: dict, lang: str, vis: matchedio.Visible,
+                  marks: placeholders.Marks | None = None, drawn: set[int] | None = None,
+                  bare: set[int] | None = None, style: bool = True, ruby: bool = True) -> list[Item]:
+    """matched → 条目：**投影**，把 `overlay_items` 判好的条目摆成 `Item`，不判断任何东西。
+    画不画（显示协议）：`vis.shows(条目)`（组可见，且不是填位、或填位可见）**且**有 `lang` 的文本——没有就不叠（画面原样）。
+    层（`layer`）只定**怎么画**（`Item` 的种类、样式），不定画不画。区域取条目第一个事件的；对齐取那个区域的，多行用公共轴。
+    `drawn` 给了就记下画出来的条目用到的事件 id；`bare` 给了就记下**可见、但没有 `lang` 文本**的条目的事件 id
+    （`unmatched` 组可见时退回画它们的 OCR 原文，`build_items`）。
+    译文里的占位由 `marks` 标成 `` [`编号:值] ``（阶段 4 换成值；`flowocr.placeholders`）。
+    `style` / `ruby`：剧本带样式 / Ruby 的条目记下带标签的原句（`Item.styled`，关掉的那种剥掉）；阅读面板（`block`）不带。"""
+    marks = marks if marks is not None else placeholders.Marks()
+    mains, aligns = tracksio.main_regions(doc), region_align(doc)
     out = []
     for it in items:
-        item = _project_one(it, doc, lang, layers, mains, aligns)
+        if not vis.shows(it):
+            continue
+        item = _project_one(it, doc, lang, mains, aligns, marks, style, ruby)
         if item is None:
+            if bare is not None:
+                bare.update(it.get("events") or ())
             continue
         out.append(item)
-        if used is not None:
-            used.update(it.get("events") or ())
+        if drawn is not None:
+            drawn.update(it.get("events") or ())
     return out
 
 
-def _project_one(it: dict, doc: dict, lang: str, layers, mains, aligns) -> Item | None:
-    """一个 matched 条目 → `Item`；不在要的层里、或没有 `lang` 的译文就是 None（不叠）。"""
-    if it["layer"] not in layers:
-        return None
+def _project_one(it: dict, doc: dict, lang: str, mains, aligns, marks: placeholders.Marks,
+                 style: bool = True, ruby: bool = True) -> Item | None:
+    """一个 matched 条目 → `Item`；没有 `lang` 的文本就是 None（不叠）。"""
     evs = [doc["events"][i] for i in it.get("events") or []]
     reg = evs[0]["region"] if evs else -1
-    kw = dict(region=reg, main=reg in mains if mains else True, align=aligns.get(reg, "center"), translated=True,
-              layer=it["layer"], key=it.get("key"))
+    kw = dict(region=reg, main=(tracksio.in_main(evs[0], mains) if evs else False) if mains else True, align=aligns.get(reg, "center"), translated=True,
+              layer=it["layer"], key=it.get("key"), echo=it.get("echo"), echo_of=it.get("echo_of"), claim=it.get("claim"))
     if it["layer"] == "panel":
         if not it["paras"].get(lang):
             return None
-        return Item(it["start_us"], it["end_us"], it["rows"], it["paras"][lang], "block", row_h=it["row_h"], **kw)
-    text = it.get(lang)
-    if not text:
+        return Item(it["start_us"], it["end_us"], it["rows"], [marks.mark(p) for p in it["paras"][lang]],
+                    "block", row_h=it["row_h"], **kw)
+    rich = (style or ruby) and bool(it.get(f"{lang}_rich"))   # 只有带样式的那份才按规范写法读；纯文字里字面的 `<b>` 照原样是字
+    raw = matchedio.text_of(it, lang, rich)
+    if rich:
+        raw = richtext.select(raw, style, ruby)                # 关掉的那种先剥掉（Ruby 的读音里的占位不标、不进图例）
+    styled = marks.mark(raw)                                   # 占位只标一次（`Marks` 记着各编号出现了几处），纯文字从它删标签得到
+    if not styled:
         return None
+    text = richtext.plain(styled) if rich else styled
+    kw["styled"] = styled if styled != text else None
     if it["layer"] in ("body", "extra"):
-        return Item(it["start_us"], it["end_us"], it["rows"], overlay_lines(text, len(it["rows"])), "line",
+        return Item(it["start_us"], it["end_us"], it["rows"], overlay_lines(text, [r[2] - r[0] for r in it["rows"]], kw["styled"]), "line", source=text,
                     events=evs, **kw)
     return Item(it["start_us"], it["end_us"], it["rows"], [text], it["layer"], **kw)   # choice / offmain / name：一块一行，不做打字机 / 淡入淡出
 
@@ -196,15 +369,16 @@ PANEL_COVER = 0.8
 """补画 OCR 原文时，框有这么多落在一块已画的阅读面板（`block`）里的事件，**面板在屏的那段时间**不画：面板条目不记它盖住的事件。"""
 
 
-def unmatched_items(doc: dict, used: set[int], blocks: list[Item] = ()) -> list[Item]:
-    """tracks 里没被任何已画出的 matched 条目用到的事件，照 tracks 的画法叠 OCR 原文（全部区域轨，UI 照标）。
-    全部保留（`keep=all`）渲染 matched 时用：没认领上剧本的行、认领了但没这个语种译文的行、关掉的层都还在画面上，
-    看得出匹配漏了什么（owner 2026-09-25）。已画的阅读面板底下的事件只扣掉面板在屏的时段（面板条目不记事件，按框和时间判），
-    面板前后照画；扣剩不到一个采样间隔的碎段不画——面板的起止只有采样级精度，那一截在它的误差里。"""
+def ocr_items(doc: dict, ids: set[int], blocks: list[Item] = ()) -> list[Item]:
+    """tracks 里 `ids` 这些事件照 tracks 的画法叠 OCR 原文（全部区域轨的视图，一事件一条，UI 照标）。
+    matched 的 `unmatched` / `unfed` 组可见时用（`build_items`）：没画成译文的字还在画面上，看得出匹配漏了什么（owner 2026-09-25）。
+    已画的阅读面板（`blocks`）底下的事件只扣掉面板在屏的时段（面板条目不记事件，按框和时间判），面板不画就不扣；
+    面板前后照画；扣剩不到一个采样间隔的碎段不画——面板的起止只有采样级精度，那一截在它的误差里。
+    不在任何区域轨 cue 里的事件这个视图本来就不画（`tracks_items`）。"""
     out = []
-    for x in tracks_items(doc, "all"):
+    for x in tracks_items(doc, "all", per_event=True):
         e = x.events[0]
-        if e["id"] in used:
+        if e["id"] not in ids:
             continue
         b = e["box"]
         a = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
@@ -239,10 +413,6 @@ def native_frame_us(doc: dict) -> int:
 FRAGMENT_COVER = 0.9
 """框有这么多落在同一条目里**更早出现**的另一个事件框内的事件，算那一行的碎片（`typing_events`）。"""
 
-SLOW_TW_FACTOR, SLOW_TW_MIN_ITEMS, SLOW_TW_MIN_CHARS = 3.0, 5, 8
-"""打字机字速（毫秒 / 字）比这份字幕稿里**主轨**打字机条目的中位数慢这么多倍的，渲染时列出来报警（owner 2026-09-25：
-明显慢于主轨上其他打字机的，先当成出了问题去查）。只比主轨上至少这么多字的条目：两三个字的碎片、注音跟着正文一起显出，
-折成每字毫秒天然偏大，不说明问题；够格的条目不到这么多条就不算中位数、不报。"""
 
 
 def typing_events(events: list[dict]) -> list[dict]:
@@ -263,10 +433,45 @@ def typing_events(events: list[dict]) -> list[dict]:
             if not any(o is not f and o["t_start"] < f["t_start"] and inside(f, o) for o in events)]
 
 
-def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True) -> tuple[int, int, int]:
+TAIL_IN = 0.8
+"""重读（`effect_events`）：它的字按顺序落在先出现那个事件的字里的比例至少这么多。"""
+
+
+def _full_at(e: dict) -> int:
+    return e.get("t_full") or e.get("t_full_sampled") or e["t_start"]
+
+
+def _contained(q: str, c: str) -> float:
+    """q 的字有多少按顺序落在 c 里（匹配块总长 / q 的字数），同 `gamescript.contained`。"""
+    return sum(b.size for b in SequenceMatcher(None, q, c, autojunk=False).get_matching_blocks()) / max(1, len(q))
+
+
+def is_reread(f: dict, o: dict, step: int) -> bool:
+    """f 是 o 的**重读**：o 先出现、f 在 o 全字之后才出现、o 在 f 出现时已经消失（差不出一个采样间隔），
+    且 f 的字几乎都按顺序落在 o 里（`TAIL_IN`）。台词框退场时整体下移，建轨的几何门接不上，最后一帧每行另起一个
+    `n_obs` 1 的事件（zzz 7520.0 s：框下移 14–17 px、「ちょちょちょ」读成「ちょちょちよ」）；拿它的全字时刻会把打字机拖到句尾。
+    要 o 已经消失：同时在屏的短第二行（gi1「てるの。」整行的字恰好都在第一行里）不是重读。去完标点为空的读数不算。"""
+    fb = textfold.bare(f["text"])
+    return (bool(fb) and o["t_start"] < f["t_start"] and f["t_start"] >= _full_at(o)
+            and o["t_end"] <= f["t_start"] + step and _contained(fb, textfold.bare(o["text"])) >= TAIL_IN)
+
+
+def effect_events(events: list[dict], step: int, pool: list[dict] | None = None) -> list[dict]:
+    """算效果时刻用的事件：`typing_events`（去掉 det 切出来的碎片），再去掉**重读**（`is_reread`，对照 `pool`——整条的事件，
+    默认就是 `events`；按行算时传整条，重读的原事件可以在别的行）。一行会被拿空时这一行不去重读（`LEVEL / LEVEL` 这类同字多行）。
+    只给效果时刻（打字机、淡入淡出、逐行显出、底板跟长）和时间疑点的字数用；条目的成员、起止和文字不变。"""
+    core = typing_events(events)
+    pool = typing_events(pool) if pool is not None else core
+    kept = [f for f in core if not any(o is not f and is_reread(f, o, step) for o in pool)]
+    return kept or core
+
+
+def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True, pool: list[dict] | None = None) -> tuple[int, int, int]:
     """(打字机时长, 淡入, 淡出)，单位 µs；不做的是 0。只有不动的 `line` 才做。
 
-    * 时刻只从 `typing_events` 取（一行被 det 切出来的碎片不算）。
+    * 显出的时刻（打字机、淡入）只从 `effect_events` 取（一行被 det 切出来的碎片、退场那一帧的重读不算；`pool` 是判重读用的整条事件，按行算时传）；
+      淡出看的是这句字**最后**什么时候开始消失，从 `typing_events` 取（只去碎片）：对话记录滚动时同一行在新位置被重新读出、也满足重读的形状，
+      排掉的话淡出从第一段读数的消失算起，hsr 1:51:29 记录面板上的一句拉成 36 s 的淡出。
     * 打字机：条目的事件被回抠过（带 `t_full_how`）就只认回抠的 `t_full`；整段素材判成 `instant`、而且是
       "字确实没有生长"那种（离散度 ≤ `INSTANT_MAX_SPREAD`）才不做，判不清的、没判定（样本 < 8）的按逐条的门走；没被回抠的（没回抠的产物、或 `--labels` / `--regions` 没挑到的区域）
       用采样级的 `t_full_sampled`。按事件判、不按整份产物判：只回抠了部分区域时，其余区域照样有采样级的效果。
@@ -279,8 +484,8 @@ def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True) ->
     if it.kind != "line" or it.boxes or not it.events:
         return 0, 0, 0
     s, e = it.start_us, it.end_us
-    refined = "text_effect" in doc and any("t_full_how" in ev for ev in it.events)
-    core = typing_events(it.events)
+    refined = refined_of(it, doc)
+    core = effect_events(it.events, int(doc["frame_us"]), pool)
 
     def last(key):
         v = [ev[key] for ev in core if ev.get(key) is not None]
@@ -300,11 +505,126 @@ def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True) ->
         fs = last("t_full_sampled")
         if fs is not None and fs - s >= TW_MIN_FRAMES * doc["frame_us"]:
             tw = fs - s
-    fend = None if any(ev.get("t_end_how") == "open" for ev in core) else last("t_full_end")
+    tail = typing_events(it.events)
+    fend = (None if any(ev.get("t_end_how") == "open" for ev in tail)
+            else min(max(v), e) if (v := [ev["t_full_end"] for ev in tail if ev.get("t_full_end") is not None]) else None)
     fout = e - fend if fend is not None and e - fend >= frame_us else 0
     # 淡入也要 ≥ 2 个原生帧：即时出现的字回抠给的全字时刻晚一两帧，不该变成一个 1–2 帧的 \fad
     fin = full - s if tw == 0 and full is not None and not unmeasured and full - s >= TW_MIN_FRAMES * frame_us else 0
     return tw, min(fin, FADE_IN_MAX_US), fout
+
+
+def row_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True) -> list[tuple[int, int]] | None:
+    """句条目的逐行时刻 `(首字, 全字)`，毫秒、相对条目起点（阶段 4 按行显字，`fo` 的 `rowt`）。打不打字**按行判**：
+    每行单独套 `effect_times` 的整套门（素材判"字没有生长"、回抠按原生帧 / 采样级按采样间隔、≥ `TW_MIN_FRAMES`），
+    不打字的行写成全字 = 首字。首字取这一行的事件和半截行（`row_leads`）里最早的起点，用事件自己的时刻（不像 `grow` 往前放一个采样间隔）。
+    只有一行、在动的、或各行首字都在条目起点一个采样间隔之内的不写（整条的 `tw` 就够了，和 matched 一样）。"""
+    if it.kind != "line" or it.boxes or len(it.rows) < 2 or len(it.row_events) != len(it.rows):
+        return None
+    firsts = [min(e["t_start"] for e in evs + leads) for evs, leads in zip(it.row_events, it.row_leads or [[]] * len(it.rows))]
+    if all(f - it.start_us < doc["frame_us"] for f in firsts):
+        return None
+    out = []
+    for f, evs, row, line in zip(firsts, it.row_events, it.rows, it.lines):
+        tw = effect_times(replace(it, start_us=f, rows=[row], lines=[line], events=evs, row_events=[], row_leads=[]),
+                          doc, frame_us, typewriter, it.events)[0]
+        a = max(0, (f - it.start_us) // 1000)
+        out.append((a, min(a + tw // 1000, (it.end_us - it.start_us) // 1000)))
+    return out
+
+
+def effect_modes(o: dict) -> tuple[bool, bool]:
+    """`typewriter`（off / on / dim，dim 在阶段 3 等于 on）、`fade`（off / on）两个选项 → (判打字机, 判淡入淡出)；写错了报错。
+    `render_script` 和时间疑点检测（`timing_check`）共用，两边对选项的读法一致。"""
+    typewriter, fade = str(o.get("typewriter", "on")), str(o.get("fade", "on"))
+    if typewriter not in TYPEWRITER_MODES:
+        raise ValueError(f"typewriter 只能取 {list(TYPEWRITER_MODES)}：{typewriter!r}")
+    if fade not in ("off", "on"):
+        raise ValueError(f"fade 只能是 off / on：{fade!r}")
+    return typewriter != "off", fade == "on"
+
+
+def item_effects(it: Item, doc: dict, frame_us: int, typewriter: bool = True, fade: bool = True
+                 ) -> tuple[int, int, int, list[tuple[int, int]] | None]:
+    """字幕稿里这一条实际写的效果：(打字机时长, 淡入, 淡出, 逐行时刻)，前三个是 µs，逐行时刻同 `row_times`。
+    `export_script` 和时间疑点检测（`timing_check`）都走这里，两边看到的是同一组时刻。
+
+    有逐行时刻时按行显字：整条的打字机时长是最后一行打完的时刻（一行都不打字就是 0）；淡入只在条目起点、只看第一行，有行在打字就不做。"""
+    if it.kind == "block":
+        return 0, 0, 0, None
+    tw_us, fin, fout = effect_times(it, doc, frame_us, typewriter)
+    rowt = row_times(it, doc, frame_us, typewriter)
+    if rowt is not None:
+        typed = [(a, b) for a, b in rowt if b > a]
+        tw_us = max(b for _, b in typed) * 1000 if typed else 0
+        fin = 0 if typed else effect_times(replace(it, rows=it.rows[:1], lines=it.lines[:1], events=it.row_events[0],
+                                                   row_events=[], row_leads=[]), doc, frame_us, typewriter, it.events)[1]
+    if not fade:
+        fin = fout = 0
+    return tw_us, fin, fout, rowt
+
+
+def refined_of(it: Item, doc: dict) -> bool:
+    """条目的事件被回抠过（带 `t_full_how`）：全字时刻只认回抠的 `t_full`，否则用采样级的 `t_full_sampled`。"""
+    return "text_effect" in doc and any("t_full_how" in ev for ev in it.events)
+
+
+def grow_times(it: Item, doc: dict, tw_us: int) -> list[tuple[int, int]] | None:
+    """打字机条目每一行原文的（首字出现, 全字出现），毫秒、相对条目起点：阶段 4 让底板跟着原文长（`fo` 的 `grow`）。
+    和 `effect_times` 同一批事件（`effect_events`）、同一个全字时刻的键（`refined_of`），夹到 `[0, tw]` 里——
+    各行全字的最大值不超过整条的 `tw`，原文不会长得比打字机节奏还慢。事件按纵向重叠归到 `it.rows` 的行，每行取最早的首字、最晚的全字；
+    一行没量到全字的按首字算（整行在首字时就盖上，宁多勿露）；一行没分到事件的，在前后两行之间按框宽比例补。没做打字机的是 None。
+    **采样级的时刻往前放一个采样间隔**：没回抠的首字 / 全字只知道在这个采样点之前出现，真实时刻最多早一个间隔，按它画原文会露出来一截
+    （gi2 摆帧：第二行原文比 `t_start` 早约 0.5 s 出现）；回抠过的（`t_full_how` 的 `first` / `full` 量到了）是原生帧精度，照用。"""
+    if tw_us <= 0 or not it.rows:
+        return None
+    refined = refined_of(it, doc)
+    key = "t_full" if refined else "t_full_sampled"
+    tw, s0, step = tw_us // 1000, it.start_us, int(doc["frame_us"])
+    n = len(it.rows)
+    first: list[int | None] = [None] * n
+    full: list[int | None] = [None] * n
+
+    def clamp(us: int) -> int:
+        return min(tw, max(0, (us - s0) // 1000))
+    for ev in effect_events(it.events, step):
+        b = ev["box"]
+        ov = [min(b[3], r[3]) - max(b[1], r[1]) for r in it.rows]
+        i = max(range(n), key=lambda k: (ov[k], -abs((b[1] + b[3]) - (it.rows[k][1] + it.rows[k][3]))))
+        how = (ev.get("t_full_how") or {}) if refined else {}
+        st = clamp(ev["t_start"] - (0 if how.get("first", "none") != "none" else step))
+        first[i] = st if first[i] is None else min(first[i], st)
+        if ev.get(key) is not None:
+            f = clamp(ev[key] - (0 if how.get("full", "none") != "none" else step))
+            full[i] = f if full[i] is None else max(full[i], f)
+    for i, leads in enumerate(it.row_leads[:n]):          # 半截行：只贡献这一行的首字（cue 的 partial，见 tracks_items）
+        for ld in leads:
+            how = (ld.get("t_full_how") or {}) if refined else {}
+            st = clamp(ld["t_start"] - (0 if how.get("first", "none") != "none" else step))
+            first[i] = st if first[i] is None else min(first[i], st)
+    segs: list[tuple[int, int] | None] = [None if a is None else (a, max(a, b if b is not None else a))
+                                         for a, b in zip(first, full)]
+    i = 0
+    while i < n:
+        if segs[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < n and segs[j] is None:
+            j += 1
+        a = segs[i - 1][1] if i > 0 else 0
+        b = max(a, segs[j][0] if j < n else tw)
+        ws = [max(0.0, r[2] - r[0]) for r in it.rows[i:j]]
+        tot, acc = sum(ws) or 1.0, 0.0
+        for k, w in zip(range(i, j), ws):
+            segs[k] = (round(a + (b - a) * acc / tot), round(a + (b - a) * (acc + w) / tot))
+            acc += w
+        i = j
+    return segs
+
+
+def grow_param(segs: list[tuple[int, int]] | None) -> str | None:
+    return "|".join(f"{s}+{f}" for s, f in segs) if segs else None
 
 
 def effect_why(it: Item, doc: dict, tw: int, fin: int, fout: int) -> str | None:
@@ -320,19 +640,6 @@ def effect_why(it: Item, doc: dict, tw: int, fin: int, fout: int) -> str | None:
     parts = [f"打字机 {tw / 1e6:.2f}s" if tw else "", f"淡入 {fin / 1e6:.2f}s" if fin else "",
              f"淡出 {fout / 1e6:.2f}s" if fout else ""]
     return "；".join(p for p in parts if p) + f"（{src}）" if any(parts) else f"无效果（{src}）"
-
-
-def slow_typewriters(speeds: list[tuple[float, int]], label: str = "") -> list[tuple[float, int]]:
-    """字速比打字机条目中位数慢 `SLOW_TW_FACTOR` 倍的（毫秒 / 字，起点 µs）。有就打一行报警、逐条列出时刻：
-    这种多半不是原文打得慢，而是时刻被别的东西拖长了（碎片、错认领），要去查。"""
-    if len(speeds) < SLOW_TW_MIN_ITEMS:
-        return []
-    med = sorted(v for v, _ in speeds)[len(speeds) // 2]
-    slow = sorted(((v, t) for v, t in speeds if v > SLOW_TW_FACTOR * med), key=lambda x: x[1])
-    if slow:
-        where = "、".join(f"{t / 1e6:.1f} s（{v:.0f} ms/字）" for v, t in slow[:12]) + ("…" if len(slow) > 12 else "")
-        print(f"⚠ {label + '：' if label else ''}打字机偏慢 {len(slow)} 条（中位数 {med:.0f} ms/字，超过 {SLOW_TW_FACTOR:g} 倍）：{where}——先当成出了问题去查")
-    return slow
 
 
 # ---- 写字幕稿 ----
@@ -372,7 +679,8 @@ def view_rows(it: Item, H: int) -> list[list[float]]:
 
 
 def draft_line(it: Item, size: int, W: int, H: int, widths: dict, tw_us: int, fin: int, fout: int, why: str | None,
-               font: str = export.FONT_CN) -> str:
+               font: str = export.FONT_CN, grow: list[tuple[int, int]] | None = None,
+               rowt: list[tuple[int, int]] | None = None) -> str:
     """一个条目 → 字幕稿里的一行源行：正文是一个主流 tag 块 + 纯文字（行间 `\\N`），阶段 4 的参数 `fo:…` 放在 Effect 字段——
     正文里没有参数，改字的时候碰不到（owner 2026-09-27 看 Aegisub 里的字幕稿后定：正文尽量是纯文字、便于编辑；参数放 Effect）。"""
     t0, t1 = export.ass_time(it.start_us, True), export.ass_time(it.end_us, False)
@@ -405,18 +713,28 @@ def draft_line(it: Item, size: int, W: int, H: int, widths: dict, tw_us: int, fi
     cap = sum(len([s for s in ln.split("\n") if s.strip()]) or 1 for ln in it.lines) if not it.translated else len(it.rows)
     fo.update({"fit": "tr" if it.translated else "src", "rows": True, "plate": True,
                "cap": cap if cap != len(it.rows) else None,
-               "path": path_param(it.boxes) if it.boxes else None, "tw": tw_us // 1000 or None,
+               "path": path_param(it.boxes) if it.boxes else None, "tw": tw_us // 1000 or None, "grow": grow_param(grow), "rowt": grow_param(rowt),
                "off": not it.main, "why": why, "was": f"{owned}|fs:{size}|an:{layout.ANCHOR[it.align]}"})
     fad = "\\fad(%d,%d)" % (fin // 1000, fout // 1000) if fin or fout else ""
     head = "{\\an%d%s\\fs%d%s}" % (layout.ANCHOR[it.align], where, size, fad)
-    body = "\\N".join(export.ass_text(ln) for ln in it.lines)
+    styled = styled_lines(it, it.lines)
+    body = richtext.to_ass("\n".join(styled), export.ass_text) if styled else "\\N".join(export.ass_text(ln) for ln in it.lines)
     return f"Dialogue: 0,{t0},{t1},{style_of(it)},{actor},0,0,0,{assfile.encode_fo(fo)},{head}{body}"
+
+
+def styled_lines(it: Item, lines: list[str]) -> list[str] | None:
+    """把条目带样式的原句投回 `lines`（纯文字的行，`overlay_lines` 重分过的）：每行插进规范写法的标签，
+    样式的标签跨行时各行不成对（整条一起转成 ASS），Ruby 不跨行（`overlay_lines` 不拆它）。没有样式、或行里的字和原句对不上（用户扩展改过行）是 None，照纯文字写。"""
+    if not it.styled:
+        return None
+    got = richtext.project(it.styled, "\n".join(lines))
+    return got.split("\n") if got is not None else None
 
 
 def style_lines(font: str = export.FONT_CN) -> list[str]:
     """字幕稿的样式：一个角色一个，参数相同。`BorderStyle=3` 出预览底框（各渲染器都认，框用 OutlineColour、外扩 `OVERLAY_PAD`）；
     次要色全透明、阴影 0：人要自己调某一行的打字机节奏时写 `\\k` 族 tag，预览就是逐字显出（`\\ko` 藏不住阴影，第 0 步探针量过）。"""
-    return [f"Style: {s},{font},48,&H00FFFFFF,&HFF000000,{PREVIEW_BOX},&H00000000,"
+    return [f"Style: {s},{font},48,{STYLE_FILL},&HFF000000,{PREVIEW_BOX},&H00000000,"
             f"0,0,0,0,100,100,0,0,3,{layout.OVERLAY_PAD},0,5,0,0,0,1" for s in STYLES]
 
 
@@ -440,28 +758,48 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
                                              [sizes[i] for i in choice])):
         sizes[i] = s
     lines_out, n = [], Counter()
-    speeds: list[tuple[float, int]] = []                     # 主轨打字机条目的（毫秒 / 字，起点），见 slow_typewriters
     for it, size in zip(items, sizes):
         n[it.kind] += 1
-        tw_us, fin, fout = effect_times(it, doc, frame_us, typewriter) if it.kind != "block" else (0, 0, 0)
-        if not fade:
-            fin = fout = 0
+        got = "\n".join(styled_lines(it, it.lines) or ()) if it.kind != "block" else ""
+        n["styled"] += richtext.select(got, ruby=False) != richtext.plain(got)
+        n["ruby"] += len(richtext.ruby_spans(got))
+        tw_us, fin, fout, rowt = item_effects(it, doc, frame_us, typewriter, fade)
         n["typewriter"] += tw_us > 0
         n["fade"] += bool(fin or fout)
         if it.kind != "block":
             n[f"align_{it.align}"] += 1
-        n_chars = sum(len(ln) for ln in it.lines)
-        if tw_us > 0 and it.main and n_chars >= SLOW_TW_MIN_CHARS:
-            speeds.append((tw_us / 1000 / (n_chars - 1), it.start_us))
+        n["rowt"] += rowt is not None
+        # 有逐行时刻时，底板的原文那部分也逐行起盖：grow 按整条的时长夹（一行都不打字时 tw 是 0）
+        grow = (grow_times(it, doc, tw_us if rowt is None else max(1, it.end_us - it.start_us))
+                if it.kind != "block" else None)
         lines_out.append(draft_line(it, size, W, H, widths, tw_us, fin, fout,
-                                    effect_why(it, doc, tw_us, fin, fout) if why else None, font))
+                                    effect_why(it, doc, tw_us, fin, fout) if why else None, font, grow, rowt))
     head = {"FlowOCR Script": FORMAT_VERSION, **(info or {})}
     Path(path).write_text(export.ass_doc(W, H, style_lines(font), lines_out, info=head), encoding="utf-8")
-    n["typewriter_slow"] = len(slow_typewriters(speeds, Path(path).name))
     return n, widths
 
 
 KEEPS = ("main", "all")
+"""tracks 产物取哪些条目：`main` 主轨 + 名牌轨，`all` 全部区域轨。匹配产物没有这个选项，改按组选（`matched_visible`）。"""
+MATCHED_GONE = ("keep", "layers")
+"""匹配产物上去掉的选项（显示协议，owner 2026-10-07）：画哪些按匹配器声明的组和 `show` / `hide` 算，传了这两个就报错。"""
+
+
+def matched_visible(document: dict, options: dict | None) -> matchedio.Visible:
+    """匹配产物这次渲染的可见集合：`show` / `hide`（逗号分隔）交给 `matchedio.visible`，`MATCHED_GONE` 传了就报 `ValueError`。
+    所有吃匹配产物的内置预设都过这一处（叠加、`script`、`default_srt` 经 `build_items`，`matched_srt` 直接调）。"""
+    o = options or {}
+    gone = [k for k in MATCHED_GONE if k in o]
+    if gone:
+        raise ValueError(f"匹配产物没有 {' / '.join(gone)} 选项了：画哪些改用 show / hide 按组选"
+                         f"（这份产物的组：{', '.join(document['display']['groups'])}；另有 fill = 填位、all = 全部组加填位）")
+    return matchedio.visible(document, o.get("show"), o.get("hide"))
+
+
+def visible_note(document: dict, vis: matchedio.Visible) -> str:
+    """可见集合写给人看的一句（字幕稿的 `FlowOCR Note`、渲染时的打印）：可见的组按产物声明的顺序，填位画不画。"""
+    groups = [g for g in document["display"]["groups"] if g in vis.groups]
+    return f"可见的组 {','.join(groups) or '（无）'}，填位{'画' if vis.fill else '不画'}"
 
 
 def events_fingerprint(doc: dict) -> str:
@@ -471,38 +809,32 @@ def events_fingerprint(doc: dict) -> str:
     return hashlib.sha256(blob).hexdigest()[:12]
 
 
-def render_script(document: dict, output_dir, options: dict | None, suffix: str = ""
-                  ) -> tuple[Path, Counter, list[Item], dict]:
-    """阶段 3 的实现：吃 tracks（叠 OCR 原文）或 matched（叠剧本译文），写一份字幕稿。
+def build_items(document: dict, options: dict | None, align: bool = True,
+                marks: placeholders.Marks | None = None) -> tuple[list[Item], dict, str, str, str]:
+    """按预设的选项构造条目，不写文件：返回 `(条目, tracks 产物, 文件名前缀 base, 说明, 来源)`。
+    matched 译文里的占位标成 `` [`编号:值] ``；要图例、要打提示就传一个 `placeholders.Marks(document.get("fills"), lang)` 进来，用完它记着编号。`render_script` 写字幕稿、
+    `default_srt` 写 SRT 都走这里，所以两者一条对一条。`align=False` 不查 `regions[].align`（SRT 用不到对齐，较早的产物照样能出）。
 
     options（字符串，`render --opt` 原样给的）：
-    * `keep`：`main`（默认：tracks 主轨 + 名牌轨；matched 的 `body` / `extra` / `name`）/ `all`（全部区域轨、全部层，
-      matched 另把没叠译文的事件照 tracks 画 OCR 原文，见 `unmatched_items`）；
-    * `why`：`on` 把效果判定的依据写进每行的 `fo`（dev 审计用）；
-    * `typewriter`（off / on / dim，dim 在这里等于 on）、`fade`（off / on）：off 就不判、不写；
-    * matched 还有 `lang`（jp，默认）/ `cn`、`layers`（逗号分隔，默认随 `keep`）、
-      `tracks`（产它的那份 `*-tracks.json`，默认按 `provenance.subs` 找）；
-    * `name`：文件名（默认 `<tag>[-<lang>]-<suffix>.script.ass`，`suffix` 默认是 `keep`；叠加预设给的是预设名）。"""
+    * tracks：`keep`（`main` 默认 / `all`）；
+    * matched：`show` / `hide`（逗号分隔的组名、`fill`，`show` 另认 `all`；显示协议，`matched_visible`）、`lang`（jp 默认 / cn）、
+      `tracks`（产它的那份 `*-tracks.json`，默认按 `provenance.subs` 找）、`style`（`on` 默认 / `off`：剧本里的粗体 / 斜体 / 下划线 /
+      删除线 / 字色带不带，`STYLE_MODES`）、`ruby`（`on` 默认 / `off`：剧本里的 Ruby 写不写成标记，`RUBY_MODES`）——tracks 上没有剧本，
+      这两个取值照核、不起作用。`keep` / `layers` 传了就报错。
+
+    matched 的条目：可见、有 `lang` 文本的叠加条目（`project_items`），再加 OCR 原文（`ocr_items`）——
+    `unmatched` 组可见时画 `matchedio.fed_rest` 给的 unmatched 事件和**可见、但没有 `lang` 文本**的条目的事件（已被画出的条目用到的除外），
+    `unfed` 组可见时画 unfed 事件。"""
     o = dict(options or {})
-    keep = str(o.get("keep", "main"))
-    if keep not in KEEPS:
-        raise ValueError(f"keep 只能取 {list(KEEPS)}：{keep!r}")
-    typewriter = str(o.get("typewriter", "on"))
-    if typewriter not in TYPEWRITER_MODES:
-        raise ValueError(f"typewriter 只能取 {list(TYPEWRITER_MODES)}：{typewriter!r}")
-    fade = str(o.get("fade", "on"))
-    if fade not in ("off", "on"):
-        raise ValueError(f"fade 只能是 off / on：{fade!r}")
-    why = str(o.get("why", "off"))
-    if why not in ("off", "on"):
-        raise ValueError(f"why 只能是 off / on：{why!r}")
-    layers = (tuple(x for x in str(o["layers"]).split(",") if x) if o.get("layers")
-              else ("body", "extra", "name") if keep == "main" else LAYERS)
-    if not set(layers) <= set(LAYERS):
-        raise ValueError(f"layers 只能取 {','.join(LAYERS)} 里的：{o.get('layers')}")
-    out = Path(output_dir)
+    style = str(o.get("style", "on"))
+    if style not in STYLE_MODES:
+        raise ValueError(f"style 只能是 {' / '.join(STYLE_MODES)}：{style!r}")
+    ruby = str(o.get("ruby", "on"))
+    if ruby not in RUBY_MODES:
+        raise ValueError(f"ruby 只能是 {' / '.join(RUBY_MODES)}：{ruby!r}")
     if document.get("schema") == matchedio.SCHEMA:
         matchedio.validate(document, need_overlay=True)
+        vis = matched_visible(document, o)
         lang = str(o.get("lang", "jp"))
         if lang not in ("jp", "cn"):
             raise ValueError(f"lang 只能是 jp / cn：{lang!r}")
@@ -510,32 +842,114 @@ def render_script(document: dict, output_dir, options: dict | None, suffix: str 
         if not tracks or not Path(tracks).is_file():
             raise FileNotFoundError(
                 f"找不到这份匹配产物对应的 tracks（provenance.subs = {matchedio.tracks_path(document)!r}）；"
-                f"叠加要它的框和画面尺寸，用 options['tracks'] 指过去")
+                f"叠加和 SRT 都要它的事件和时刻，用 options['tracks'] 指过去")
         doc = tracksio.load(Path(tracks))
-        need_align(doc, tracks)
-        used: set[int] = set()
-        items = project_items(document["overlay"]["items"], doc, lang, layers, used)
-        note = f"剧本译文 {lang}，层 {','.join(layers)}"
-        if keep == "all":
-            rest = unmatched_items(doc, used, [it for it in items if it.kind == "block"])
-            items += rest
-            note += f"，另 {len(rest)} 个没叠译文的事件画 OCR 原文"
+        if align:
+            need_align(doc, tracks)
+        drawn: set[int] = set()
+        bare: set[int] = set()
+        marks = marks if marks is not None else placeholders.Marks(document.get("fills"), lang)
+        items = project_items(document["overlay"]["items"], doc, lang, vis, marks, drawn, bare, style == "on", ruby == "on")
+        unmatched, unfed = matchedio.fed_rest(document, doc)
+        raw = {"unmatched": unmatched + sorted(bare - drawn), "unfed": unfed}
+        ocr = {i for g, ids in raw.items() if g in vis.groups for i in ids}
+        note = f"剧本译文 {lang}，{visible_note(document, vis)}"
+        if ocr:
+            items += ocr_items(doc, ocr, [it for it in items if it.kind == "block"])
+            note += "，另画 OCR 原文：" + "、".join(f"{g} {len(ids)} 个事件" for g, ids in raw.items() if g in vis.groups)
         tag = doc.get("tag") or Path(tracks).stem.removesuffix("-refined").removesuffix("-tracks")
-        base = f"{tag}-{lang}"
-        source = f"{tag} {matchedio.SCHEMA}"
-    else:
-        doc = document
+        return items, doc, f"{tag}-{lang}", note, f"{tag} {matchedio.SCHEMA}"
+    bad = [k for k in ("show", "hide", "layers") if k in o]
+    if bad:
+        raise ValueError(f"tracks 产物没有 {' / '.join(bad)} 选项（show / hide 按匹配器声明的组选，只对匹配产物）；取哪些用 keep=main|all")
+    keep = str(o.get("keep", "main"))
+    if keep not in KEEPS:
+        raise ValueError(f"keep 只能取 {list(KEEPS)}：{keep!r}")
+    doc = document
+    if align:
         need_align(doc, str(doc.get("tag") or "这份 tracks"))
-        items = tracks_items(doc, keep)
-        base = str(doc.get("tag") or "tracks")
-        note = f"OCR 原文，{'主轨 + 名牌' if keep == 'main' else '全部区域轨'}"
-        source = f"{base} {tracksio.SCHEMA}"
+    base = str(doc.get("tag") or "tracks")
+    note = f"OCR 原文，{'主轨 + 名牌' if keep == 'main' else '全部区域轨'}"
+    return tracks_items(doc, keep), doc, base, note, f"{base} {tracksio.SCHEMA}"
+
+
+def render_script(document: dict, output_dir, options: dict | None, suffix: str = ""
+                  ) -> tuple[Path, Counter, list[Item], dict]:
+    """阶段 3 的实现：吃 tracks（叠 OCR 原文）或 matched（叠剧本译文），写一份字幕稿。
+
+    options（字符串，`render --opt` 原样给的）：
+    * `keep`（tracks）/ `show` / `hide` / `lang` / `tracks` / `style` / `ruby`（matched）：取哪些条目、带不带剧本的样式和 Ruby，见 `build_items`；
+    * `why`：`on` 把效果判定的依据写进每行的 `fo`（dev 审计用）；
+    * `typewriter`（off / on / dim，dim 在这里等于 on）、`fade`（off / on）：off 就不判、不写；
+    * `name`：文件名（默认 `<tag>[-<lang>]-<suffix>.script.ass`；叠加预设给的 `suffix` 是预设名，不给时 tracks 是 `keep`，
+      matched 是 `all`（`show` 里有 `all`）或 `main`）。"""
+    o = dict(options or {})
+    if not suffix:
+        suffix = (("all" if "all" in matchedio.names(o.get("show")) else "main") if document.get("schema") == matchedio.SCHEMA
+                  else str(o.get("keep", "main")))
+    typewriter, fade = effect_modes(o)
+    why = str(o.get("why", "off"))
+    if why not in ("off", "on"):
+        raise ValueError(f"why 只能是 off / on：{why!r}")
+    marks = placeholders.Marks(document.get("fills"), str(o.get("lang", "jp")))
+    items, doc, base, note, source = build_items(document, o, marks=marks)
+    out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    p = out / str(o.get("name") or f"{base}-{suffix or keep}.script.ass")
+    p = out / str(o.get("name") or f"{base}-{suffix}.script.ass")
     info = {"FlowOCR Source": f"{source} events-sha256:{events_fingerprint(doc)}",
-            "FlowOCR Code": provenance.git_head(), "FlowOCR Note": note}
-    n, widths = export_script(p, items, doc, typewriter != "off", fade == "on", why == "on", info)
+            "FlowOCR Code": provenance.git_head(), "FlowOCR Note": note, **marks.legend()}
+    if (doc.get("provenance") or {}).get("video"):
+        info["FlowOCR Video"] = doc["provenance"]["video"]          # 阶段 4 的底板取色读它（已是 portable 的写法）
+    n, widths = export_script(p, items, doc, typewriter, fade, why == "on", info)
     kinds = "、".join(f"{k} {n[k]}" for k in ("line", "name", "choice", "offmain", "block") if n[k])
     aligns = "、".join(f"{a} {n['align_' + a]}" for a in tracksio.ALIGNS if n["align_" + a])
-    print(f"-> {p}（字幕稿，{len(items)} 条：{kinds}；对齐 {aligns}；打字机 {n['typewriter']} 条、淡入淡出 {n['fade']} 条）")
+    styled = (f"、剧本样式 {n['styled']} 条" if n["styled"] else "") + (f"、Ruby {n['ruby']} 处" if n["ruby"] else "")
+    print(f"-> {p}（字幕稿，{len(items)} 条：{kinds}；对齐 {aligns}；打字机 {n['typewriter']} 条、淡入淡出 {n['fade']} 条{styled}；{note}）")
+    from flowocr.output import timing_check             # 它 import 本模块，放这里免得循环
+    sus = timing_check.check(items, doc, typewriter, fade)
+    n["timing_suspects"] = len(sus)
+    if sus:
+        # 选项照这次实际生效的给（预设会替用户加 show=all / keep=all），照抄就是同一组条目
+        opts = "".join(f" --opt {subprocess.list2cmdline([f'{k}={o[k]}'])}" for k in timing_check.OPTS if k in o)
+        print(f"⚠ {timing_check.report(sus, timing_check.span_hours(items), show=0).splitlines()[0]}"
+              f"——逐条看：python -m flowocr.output.timing_check <这份产物>{opts}")
+    marks.say("字幕稿")
     return p, n, items, widths
+
+
+# ---- 阶段 3 的 SRT（`default_srt`）----
+
+SRT_STYLES = ("Body", "Extra", "Choice", "Offmain")
+"""进 SRT 的条目（按字幕稿的样式）：正文。名牌、常驻 UI、阅读面板不进（owner 2026-10-05：SRT 是轻量、符合直觉的主轨 sidecar）。"""
+
+
+def srt_text(it: Item) -> list[str]:
+    """一个条目在 SRT 里的正文，一行一行（SRT 的标准换行）：tracks 的条目是拼好的可见行（事件本身带的换行也拆开）；
+    matched 的译文出剧本原句、按剧本自带的换行分行（`overlay_lines` 为叠加按原文行数重分过的行会把一个词拆开）。
+    空行剔掉：SRT 按空行分块，正文里一个空行就把这条截断。SRT 是基础输出，不带剧本样式（`Item.styled` 不用，owner 2026-10-23）。"""
+    raw = it.source if it.translated and it.source is not None else "\n".join(it.lines)
+    return [ln.strip() for ln in raw.replace("\\N", "\n").replace("\\n", "\n").split("\n") if ln.strip()]
+
+
+def srt_start_full(it: Item) -> int:
+    """`start=full` 的起点：进条目的正文行（不含半截行）全字出现的最晚时刻，夹在条目里（同 `export.cue_start` 的理由：
+    取最早的会退回首字出现）；没有全字时刻的照首字。"""
+    fulls = [e["t_full"] for e in it.events if e.get("t_full") is not None]
+    return max(it.start_us, min(max(fulls), it.end_us - 1)) if fulls else it.start_us
+
+
+def srt_blocks(items: list[Item], text=srt_text, start: str = "first", echo: str = "drop") -> list[tuple[int, int, list[str]]]:
+    """一批条目 → SRT 的块：一个正文条目（`SRT_STYLES`）一条 cue，起止是条目的起止（`start="full"` 换成全字出现）。
+    matched 的同时回显 / 记录面板回显（`matchedio.SRT_DROP_ECHOES`）默认不出：用途 2 要一句一条（owner 2026-10-06）；`echo="keep"` 放回来，叠加照画。
+    只在**主那次认领确实有条目出进这份 SRT** 时才去（同 `matchedio.record_kept` 的思路）：主可能是一条没有叠加条目的 `extra`
+    （事件全被主认领占了），或它不可见（显示协议，`build_items`），这时去掉回显这一句就一次都不出——去回显叠在可见性之后。
+    跨句常驻的（`spans`：事件挂在这条轨的几条 cue 里）不出——没打名牌标的名牌 / 称号、轮换的横幅、日志面板这类挂一整场的行，
+    在 SRT 里会成一条叠在句子上的长 cue（21 臂里 48 条、最长 89.5 s）；只对同句合并过的产物标（`tracks_items` 的 `joined`）；判据只看结构（挂在几条 cue 里），不看文本长短，
+    字幕稿和叠加照画（owner 2026-10-05）。`text` 是可换的规则（`Item -> 行`），用户预设可以换成拼成一行、加说话人前缀之类。
+    其余时间重叠的条目就是重叠的 cue，不合并。"""
+    matchedio.echo_kept({}, echo)                    # 核取值
+    shown = [(it, lines) for it in sorted(items, key=lambda x: (x.start_us, x.end_us))
+             if style_of(it) in SRT_STYLES and not it.spans and (lines := text(it))]
+    present = {tuple(it.claim) for it, _ in shown if it.claim}
+    return [(srt_start_full(it) if start == "full" else it.start_us, it.end_us, lines) for it, lines in shown
+            if matchedio.echo_kept({"echo": it.echo}, echo) or not (it.echo_of and tuple(it.echo_of) in present)]

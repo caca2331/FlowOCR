@@ -93,7 +93,6 @@ def main() -> int:
         print(f"  {names[k]:<24}{coef[k]:+.2f}")
 
     # 参照：同一批留出对上各条缝合臂的准确率
-    from flowocr.analyze import slot_lines
     from flowocr.analyze import slot_modes
     by_tag: dict[str, list[int]] = {}
     for k, (tag, _, _) in enumerate(mte):
@@ -109,7 +108,7 @@ def main() -> int:
         L = CL.load(tag)
         asg = {name: SP.assignment(L, CL.stitch(L, **over)) for name, over in SP.ARMS.items()}
         asg["modes"] = SP.assignment(L, slot_modes.stitch(L))
-        got = slot_lines.assign(L)
+        got = SP.pipeline_assign(L, "lines")          # 管线里 `--cluster lines` 的分组
         asg["lines"] = {(r.t_start, r.t_end, r.text, tuple(round(v) for v in r.box)): got[i] for i, r in enumerate(L.runs)}
         for k in ks:
             v = SP.verdicts(asg, docs[mte[k][1]])

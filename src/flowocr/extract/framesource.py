@@ -192,6 +192,10 @@ class HwaccelMismatch(RuntimeError):
     """硬解交付的帧和容器 pts 对不上（**不是**素材自己的缺口）。`run_ocr2` 见到它就整段改软解重跑一次。"""
 
 
+class SinkClosed(RuntimeError):
+    """辅助流的 sink 拒收像素（块已失败 / 取消、分片已收摊）。`AuxReader` 把它记进 `refused`，不记成"pts 和帧对不上"。"""
+
+
 def pts_frame(t_us: int, idx: int, src_fps: float) -> int:
     """写进 obs 的那个 `frame`：**这一帧的 pts 说它是第几帧**。**判据只有这一份。**
 
@@ -738,6 +742,7 @@ class AuxReader:
             raise ValueError("不等距的辅助流网格要按 pts 编号（给 pts_q）")
         self.pts_q, self.src_fps = pts_q, src_fps
         self.misaligned = ""          # 非空 = 辅路 pts 和帧对不上、提前停了（原因写这里，run_ocr2 记进 _meta.edge）
+        self.refused = ""             # 非空 = sink 拒收（`SinkClosed`：下游已失败 / 取消），提前停了
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.bind(("127.0.0.1", 0))
         self.srv.listen(1)
@@ -747,6 +752,9 @@ class AuxReader:
         self.cpu_sec = 0.0
         self.stopped_early = False
         self.th = threading.Thread(target=self._run, daemon=True, name="aux-reader")
+        self._life = threading.Lock()
+        self._cancelled = threading.Event()
+        self._conn = None
 
     def start(self) -> "AuxReader":
         self.th.start()
@@ -756,11 +764,22 @@ class AuxReader:
         import numpy as np
 
         nbytes = self.Ws * self.Hs
-        conn = None
+        conn = f = None
         c0 = time.thread_time()
         try:
-            self.srv.settimeout(60)
-            conn, _ = self.srv.accept()
+            self.srv.settimeout(0.2)
+            deadline = time.monotonic() + 60
+            while not self._cancelled.is_set():
+                try:
+                    conn, _ = self.srv.accept()
+                    break
+                except socket.timeout:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("辅助流 60 s 内未连接")
+            with self._life:
+                if self._cancelled.is_set():
+                    return
+                self._conn = conn
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
             f = conn.makefile("rb")
             prev_key = -1
@@ -797,11 +816,20 @@ class AuxReader:
                 self.sink.push(key, np.frombuffer(buf, np.uint8).reshape(self.Hs, self.Ws))
                 self.sent += 1
                 self.last_key = key
-        except OSError:
+        except SinkClosed as exc:
             self.stopped_early = True
+            self.refused = str(exc)
+        except (OSError, RuntimeError) as exc:
+            self.stopped_early = True
+            if not self._cancelled.is_set() and isinstance(exc, RuntimeError):
+                self.misaligned = repr(exc)
         finally:
             self.cpu_sec = time.thread_time() - c0
             self.sink.close()
+            with self._life:
+                self._conn = None
+            if f is not None:
+                f.close()
             for s in (conn, self.srv):
                 try:
                     if s is not None:
@@ -811,6 +839,19 @@ class AuxReader:
 
     def join(self, timeout: float = 30.0) -> None:
         self.th.join(timeout)
+
+    def abort(self) -> None:
+        """取消接入、像素、PTS 和 sink 等待；读线程负责最终关闭连接。"""
+        with self._life:
+            self._cancelled.set()
+            if self._conn is not None:
+                try:
+                    self._conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        if self.pts_q is not None:
+            self.pts_q.put(QUEUE_SENTINEL)
+        self.sink.close()
 
 
 class FfmpegFullRate:
@@ -953,6 +994,9 @@ class FfmpegSource:
         self.stopped_early = False
         self.advanced = 0
         self.proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._cancelled = False
         self.stderr_tail: list[str] = []
         # **采样格核对**（2026-09-20）。帧身份一律是 **pts 帧号**（`round(t * src_fps)`）；
         # 对着采样网格记两件事（`grid_step`）：
@@ -987,55 +1031,68 @@ class FfmpegSource:
         cv2 = self._cv2
         # 起点用 `start_idx / src_fps`——这正是 `cap.set(POS_FRAMES, i)` 的语义
         # （实测：它本身就是按 `i / src_fps` 做的时间 seek），两条路落点一致。
-        aux = None
-        if self.aux_cfg:
-            c = self.aux_cfg
-            Ws, Hs = ((int(self.W * c["scale"] / 2) * 2, int(self.H * c["scale"] / 2) * 2) if c["scale"] < 1.0
-                      else (self.W, self.H))
-            ag = AuxGrid.from_list(c["grid"])
-            n_aux = ag.n_frames(self.start_idx, self.end_idx)
-            if c.get("remote") is not None:
-                # 辅助流收在**另一个进程**里（`--edge-proc`，edge_proc.EdgeProxy）：ffmpeg 直接 connect 过去，
-                # 这边只把 stderr 里的辅路 pts 逐行转发（`pts_put`）
-                url = c["remote"].url
-            else:
-                aux_pts_q: Queue = Queue()
-                self.aux = AuxReader(start_idx=self.start_idx, n_frames=n_aux, step=ag.step, width=Ws, height=Hs,
-                                     sink=c["sink"], pts_q=aux_pts_q, src_fps=self.src_fps).start()
-                url = self.aux.url
-            # `w`/`h` 是给 `scale_cuda` 的（硬解那条路），表达式它不吃；软解那条仍按比例算，两边同一组数
-            aux = {"grid": c["grid"], "scale": c["scale"], "n_frames": n_aux, "url": url,
-                   "w": Ws, "h": Hs}
-        cmd = build_ffmpeg_cmd(self.video, grid=self.grid,
-                               start_sec=self.start_idx / self.src_fps,
-                               n_out=self.n_out, pix=self.pix, aux=aux, hwaccel=self.hwaccel,
-                               select_by=self.select_by, src_fps=self.src_fps,
-                               preroll_ticks=self.preroll_ticks,
-                               block=(self.start_idx, self.end_idx, self.block_seek) if self.block else None)
-        nbytes = self.frame_bytes
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, bufsize=nbytes * 2)
-        stderr = self.proc.stderr
+        with self._proc_lock:
+            if self._cancelled:
+                return
+            aux = None
+            if self.aux_cfg:
+                c = self.aux_cfg
+                Ws, Hs = ((int(self.W * c["scale"] / 2) * 2, int(self.H * c["scale"] / 2) * 2) if c["scale"] < 1.0
+                          else (self.W, self.H))
+                ag = AuxGrid.from_list(c["grid"])
+                n_aux = ag.n_frames(self.start_idx, self.end_idx)
+                if c.get("remote") is not None:
+                    # 辅助流收在**另一个进程**里（`--edge-proc`，edge_proc.EdgeProxy）：ffmpeg 直接 connect 过去，
+                    # 这边只把 stderr 里的辅路 pts 逐行转发（`pts_put`）
+                    url = c["remote"].url
+                else:
+                    aux_pts_q: Queue = Queue()
+                    self.aux = AuxReader(start_idx=self.start_idx, n_frames=n_aux, step=ag.step, width=Ws, height=Hs,
+                                         sink=c["sink"], pts_q=aux_pts_q, src_fps=self.src_fps).start()
+                    url = self.aux.url
+                # `w`/`h` 是给 `scale_cuda` 的（硬解那条路），表达式它不吃；软解那条仍按比例算，两边同一组数
+                aux = {"grid": c["grid"], "scale": c["scale"], "n_frames": n_aux, "url": url,
+                       "w": Ws, "h": Hs}
+            cmd = build_ffmpeg_cmd(self.video, grid=self.grid,
+                                   start_sec=self.start_idx / self.src_fps,
+                                   n_out=self.n_out, pix=self.pix, aux=aux, hwaccel=self.hwaccel,
+                                   select_by=self.select_by, src_fps=self.src_fps,
+                                   preroll_ticks=self.preroll_ticks,
+                                   block=(self.start_idx, self.end_idx, self.block_seek) if self.block else None)
+            nbytes = self.frame_bytes
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, bufsize=nbytes * 2)
+            proc = self.proc
+            stderr = proc.stderr
         pts_q: Queue = Queue()
 
         aux_q = self.aux.pts_q if self.aux is not None else None
         if self.aux_cfg and self.aux_cfg.get("remote") is not None:
             aux_q = _Forward(self.aux_cfg["remote"].pts_put)
 
+        drain_errors = []
+
         def drain() -> None:
             # **stderr 必须一直读**：不读满了管道就死锁，而 pts 也在里面。
             # 两路的 showinfo 是命名实例，按前缀分流：主路 -> pts_q、辅路 -> AuxReader 的队列
-            for raw in stderr:                        # type: ignore[union-attr]
-                for line in raw.decode("utf-8", "replace").split("\r"):   # 进度行用 \r 结尾，别让它粘住下一行
-                    got = parse_showinfo(line)
-                    if got is not None:
-                        (aux_q if got[0] == "aux" and aux_q is not None else pts_q).put((got[1], got[2]))
-                    elif "pts_time" not in line and line.strip():
-                        self.stderr_tail.append(line.rstrip())
-                        del self.stderr_tail[:-8]
-            pts_q.put(QUEUE_SENTINEL)
-            if aux_q is not None:
-                aux_q.put(QUEUE_SENTINEL)
+            try:
+                for raw in stderr:                        # type: ignore[union-attr]
+                    for line in raw.decode("utf-8", "replace").split("\r"):   # 进度行用 \r 结尾，别让它粘住下一行
+                        got = parse_showinfo(line)
+                        if got is not None:
+                            (aux_q if got[0] == "aux" and aux_q is not None else pts_q).put((got[1], got[2]))
+                        elif "pts_time" not in line and line.strip():
+                            self.stderr_tail.append(line.rstrip())
+                            del self.stderr_tail[:-8]
+            except BaseException as exc:
+                drain_errors.append(exc)
+            finally:
+                pts_q.put(QUEUE_SENTINEL)
+                if aux_q is not None:
+                    try:
+                        aux_q.put(QUEUE_SENTINEL)
+                    except BaseException as exc:
+                        drain_errors.append(exc)
 
         th = threading.Thread(target=drain, daemon=True)
         th.start()
@@ -1046,7 +1103,14 @@ class FfmpegSource:
         prev_idx: int | None = None
         while n < self.n_out:
             t_rd = time.perf_counter()
-            buf = self.proc.stdout.read(nbytes)       # type: ignore[union-attr]
+            try:
+                if self._cancelled:
+                    break
+                buf = proc.stdout.read(nbytes)       # type: ignore[union-attr]
+            except (OSError, ValueError):
+                if not self._cancelled:
+                    raise
+                break
             _tl.span("pipe_read", t_rd, a=n)
             if len(buf) < nbytes:
                 self.stopped_early = True
@@ -1116,6 +1180,8 @@ class FfmpegSource:
         th.join(timeout=5)
         if stderr is not None and not stderr.closed:
             stderr.close()              # 线程已经退了，这时候关才安全
+        if drain_errors and not self._cancelled:
+            raise RuntimeError(f"解码 stderr / 辅助 PTS 转发失败：{drain_errors[0]!r}")
 
     def close(self) -> None:
         """**子进程一定要收掉。** 正常跑完是关管道让它自己退；
@@ -1124,19 +1190,44 @@ class FfmpegSource:
         关了 stdout 它会拿到 EPIPE 自己退——万一没退就硬杀。
         漏一个 ffmpeg 在后台读着几个小时的素材，是长任务里最难查的那种问题。
         """
-        proc, self.proc = self.proc, None
-        if proc is None:
-            return
-        try:
-            if proc.stdout and not proc.stdout.closed:
-                proc.stdout.close()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
+        # 句柄一直登记到 wait 完成：取消仍可 kill 唤醒并发的管道 close，
+        # 后来的 close 等第一个回收者完成，不能把“被取走”当成“已退出”。
+        with self._close_lock:
+            with self._proc_lock:
+                proc = self.proc
+            if proc is None:
+                return
+            try:
+                try:
+                    if proc.stdout and not proc.stdout.closed:
+                        proc.stdout.close()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            finally:
+                with self._proc_lock:
+                    if self.proc is proc and proc.poll() is not None:
+                        self.proc = None
+
+    def cancel(self) -> None:
+        """不可逆取消：阻止迟到启动，先杀子进程唤醒读，再回收管道。"""
+        with self._proc_lock:
+            self._cancelled = True
+            proc = self.proc
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+            aux = self.aux
+        if aux is not None:
+            aux.abort()
+        self.close()
+        if aux is not None and aux.th is not threading.current_thread():
+            aux.join(5)
+            if aux.th.is_alive():
+                raise RuntimeError("辅助流取消后读线程未退出")
 
 
 class PrefetchSource:

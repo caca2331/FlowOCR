@@ -41,6 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from flowocr.analyze import build_tracks as bt  # noqa: E402
+from flowocr import textfold  # noqa: E402
 from flowocr.artifacts import evalkit  # noqa: E402
 
 CATS = ("covered", "partial", "differs", "sampled_missed", "fragment", "between_busy", "between", "edge", "moved", "noise_spot")
@@ -77,8 +78,6 @@ def contain(inner: list[float], outer: list[float], pad: float) -> float:
     return (ix1 - ix0) * (iy1 - iy0) / area if area > 0 else 0.0
 
 
-SMALL_KANA = str.maketrans("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ", "あいうえおつやゆよわアイウエオツヤユヨワカケ")
-"""小写假名折成大写：OCR 常把促音 / 拗音读成大字（`ちょっと` / `ちょつと`），这不是缺字。"""
 KEEP = set("っッーゃゅょャュョぁぃぅぇぉァィゥェォ")
 """`evalkit._PUNCT_CHARS` 里把 `っ` / `ッ` / `ー` 当成标点（它数的是"内容字"），这把尺要的是"字有没有读全"，这几个得留着。"""
 
@@ -86,7 +85,7 @@ KEEP = set("っッーゃゅょャュョぁぃぅぇぉァィゥェォ")
 def norm(t: str) -> str:
     """只留内容字（小写假名折成大写、促音 / 长音保留）；没有内容字的（纯标点）留去空白的原文。"""
     c = "".join(ch for ch in t if (ch in KEEP or ch not in evalkit._PUNCT_CHARS) and not ch.isspace())
-    return c.translate(SMALL_KANA) or "".join(t.split())
+    return c.translate(textfold.SMALL_KANA) or "".join(t.split())
 
 
 def compare(a_text: str, b_text: str) -> str:

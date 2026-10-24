@@ -21,6 +21,7 @@ from pathlib import Path
 
 from flowocr.extract import framesource
 from flowocr.provenance import code_fp as _code_fp
+from flowocr.provenance import portable
 
 CODE_FP_FILES = (
     "src/flowocr/extract/ocr_args.py", "src/flowocr/extract/ocr_complete.py", "src/flowocr/extract/ocr_parallel.py",
@@ -38,9 +39,14 @@ CODE_FP_FILES = (
     "src/flowocr/extract/framegrid.py",   # 取哪些帧（采样 / 辅助流的时间网格）：采样帧和证据窗口的帧都是它选的
     "src/flowocr/extract/decode_proc.py",  # --decode-shards：只解码的子进程（帧经共享内存槽过来）
     "src/flowocr/extract/childproc.py",    # 拆进程的共用胶水（起子进程、口令、收尾）
+    "src/flowocr/extract/aux_transport.py",  # 辅助流发送、取消和广播排空协议
     "src/flowocr/extract/decode_shards.py",  # --decode-shards：几路 ffmpeg 分块解、按帧号接缝
     "src/flowocr/extract/ort_server.py",   # 真跑推理的那半在另一个进程里，同样要进指纹
+    "src/flowocr/extract/trt_engine.py",   # TensorRT 后端：profile、建引擎、启动自检、session 池（服务端按文件路径载入）
+    "src/flowocr/trt.py",                  # TensorRT 库在哪、版本对照（`--backend` 的判定读它）
     "src/flowocr/extract/supervisor.py",   # 外层监督者：硬解失败重不重跑、`_meta.hwaccel_fallback` 由它决定
+    "src/flowocr/extract/langprobe.py",    # --ocr-lang auto 判哪种语言（config 只记字面的 auto，换了判法只能靠指纹提示）
+    "src/flowocr/extract/run_groups.py",   # 多组：auto 按各组范围的并集判语言
     "src/flowocr/extract/ffcheck.py",      # 起跑前的 ffmpeg 检查与 `_meta.runtime`（不改读数，但被 run_ocr2 直接 import）
     "src/flowocr/models.py",               # 默认 ONNX 模型是哪一份（钉的提交号）、rec 的 argmax 怎么融
     "src/flowocr/provenance.py",      # 算指纹的代码本身（各级的表都带它，build_tracks 那条注释）
@@ -95,6 +101,7 @@ GPU_UNAVAILABLE_MARKS = (
     "no cuda-capable device", "cuda_error_no_device", "cudaerrornodevice",
     "loadlibrary",                             # Windows 上 CUDA / cuDNN / ORT CUDA EP 的 DLL 加载不了（error 126 / 127）
     "dll load failed",
+    "cannot open shared object file",          # Linux 上同一件事（dlopen 的说法：libcuda.so.1 / libcudnn.so.9 …，没装驱动或缺 CUDA 库）
     "有 cuda ep 却没用上",                      # ort_server：CUDA EP 注册失败、session 回落到 CPU EP（多半同样是库加载不了）
     "没有 cudaexecutionprovider",               # ort_server：这份 onnxruntime 是 CPU 包
 )
@@ -124,8 +131,8 @@ def ort_device(device: str) -> str:
     return "gpu:0" if d == "gpu" else f"gpu:{int(d[4:])}"
 
 
-NON_PRODUCT = frozenset({"out", "progress_every", "record_corr", "refine_ring", "timeline", "trace"})
-SCHEDULING = frozenset({"det_prefetch", "edge_proc", "decode_shards", "decode_block", "front_proc", "det_proc", "det_lookahead"})
+NON_PRODUCT = frozenset({"out", "progress_every", "quality", "record_corr", "refine_ring", "timeline", "trace"})
+SCHEDULING = frozenset({"det_prefetch", "edge_proc", "decode_shards", "decode_block", "front_proc", "det_proc", "det_lookahead", "flush_lag"})
 """**只改"什么时候算"、不改"算出什么"的旋钮**：写进 `config`（所以 `same_arm` 分得开两条臂、
 产物也留着它的追溯），但 `config_differs` **不看**它们——翻它的默认值不该让磁盘上的现成 obs 全部重建。
 
@@ -151,22 +158,33 @@ wuwa-s2 60 s 5,176 行、自选范围时间门 716/716 行，**逐行解析后�
 正因为在这张表里，翻默认不让磁盘上的 obs 重建。
 `front_proc` / `det_proc`（解码 + det / 只有 det 换进程）量过稳态更慢 / ±0%，**2026-09-24 owner 定删掉旋钮**；键留在这里，因为旧产物的 config 里还记着它们、而它们取任何值都不改产物（上面那三段对过），不该因此重建。
 `decode_shards` / `decode_block`（2026-09-24）：全硬解分片对一路，确定性路径 gi-s1 / wuwa 10 分钟 / f3 / f4 缺口三种块位置逐字节相同（decode-buffer）。
+`flush_lag`（2026-10-12）：只推迟落盘、写的内容不变；gi-s2 60 s 确定性路径上窗口 0 和同步窗口 32（推迟写 109 次）各对一次，逐字节相同。
 
 ⚠ 往这里加键的前提比 `ADDED_NOOP` 更硬：`ADDED_NOOP` 只赦免"默认那个值"，
 这里是**这个键取任何值都不改产物**。加之前必须拿 `obs_identical.py` 在至少一段上验过。"""
-NOISE_EQUIV = frozenset({"device", "ort_share", "ort_share_mem", "ort_max_sessions", "rec_pre", "rec_inflight", "ort_warm", "ort_spin"})
+NOISE_EQUIV = frozenset({"device", "ort_share", "ort_share_mem", "ort_max_sessions", "rec_pre", "rec_inflight", "ort_warm", "ort_spin",
+                         "det_batch", "ort_arena_extend", "ort_cublas_ws", "rec_settle", "recover_async", "det_precision", "backend", "trt_precision"})
 """**会改产物、但 owner 定为噪音级、可以互相复用**的旋钮（2026-09-22 owner："GPU 和 CPU 跑出来的读数差异，我定义为噪音级，可以复用"）。
 
 2026-09-23 owner 把口径放宽成一般规则："噪音级的都可直接复用，往后这类都可豁免"——
-**推理资源 / 调度类**的旋钮（谁持有模型、session 池多大、显存共不共用、前处理在哪个进程做、是不是 CUDA Graph 回放）
+**推理资源 / 调度类**的旋钮（谁持有模型、session 池多大、显存共不共用、前处理在哪个进程做）
 算的是同一个模型、同一份输入张量，差别只剩 ORT 自己的逐次抖动（`obs_identical` 验不了 ORT 臂，所以进不了 `SCHEDULING`）。
 于是 `ort_share` / `ort_share_mem` / `ort_max_sessions` / `rec_pre` 从 `ADDED_NOOP` 挪到这里（quick 39,508 行文本 0 改、
-前处理张量逐位相同，decode-buffer）。`rec_inflight`（异步 rec 池同时在途几个请求）同理：结算固定滞后、
-只改批怎么拼。
-**`ort_cuda_graph` 不算**（Codex 审计 09-23 的提醒，我认同）：它**出过真错**——和共用 arena 放一起时类别错 81/200，
-正确与否取决于实现细节而不是运行时抖动；它仍按 `ADDED_NOOP`（0 = 加它之前）进复用判据。
-⚠ **改"算什么"的不算这一类**：复用判据的门（`reuse_*`）、异步 rec 的窗口（`rec_window` / `rec_async` / `rec_knee`，
-读哪一帧会变）、模型、采样，照旧进复用判据——噪音级要有对账撑着，不是"大概差不多"。
+前处理张量逐位相同，decode-buffer）。`rec_inflight`（异步 rec 池同时在途几个请求）同理：只改批怎么拼和结果什么时候回来；
+结算改成"回来就收"之后它会经时序改变读哪些帧，owner 2026-10-11 定这类机器忙闲带来的逐次差异不防、不影响复用，照旧豁免。
+`rec_settle`（2026-10-11，rec-batching 计划）：异步 rec 的结算从固定滞后改成"读数回来就按帧序结算"，旋钮随即删掉、只剩这个键——
+本分支跑出的 obs 里记着 `lag` / `ready`。依据是 owner 同日给的判据（文本差异当噪音，门是漏字幕和时间边界）：quick 六段
+`lag` 对 `ready`（W4，各两轮）疑似漏字幕判断器的覆盖逐条相同、打字机真值逐项相同、事件级独有数和 `ready` 自己两次之间同量级。
+`recover_async`（2026-10-12，rec-reads 计划的 B，默认关）：回补读改成异步成批，只改"什么时候读"；按 owner 10-11 的口径过了两道门就豁免——
+quick 四臂两轮有内容档覆盖逐条相同、打字机真值三段逐项相同（rec-reads 计划第 3 / 4 阶段读数）。
+`det_batch`（owner 2026-10-04 定为噪音级，默认翻成按设备的 auto 时）：det 一批几帧只改拼批，读哪些帧、每帧的输入张量都不变
+（尺寸不一的帧拼不了批，退回逐帧，不补零）。CPU 上批 4 / 批 1 的 obs 逐字节相同（quick 三段整段 20,814 行，含 conf、edge）；
+GPU 上批 1 对批 4 量过框和文本都会动（quick 六段框逐帧相同 81.7%~95.8%，fps-and-rec-budget 报告），owner 把这类差别也定为噪音级，
+所以任何批大小的 obs 互相复用、不重建。
+**`ort_cuda_graph` 不算**（Codex 审计 09-23 的提醒，我认同；旋钮 2026-10-12 已删）：它**出过真错**——和共用 arena 放一起时类别错 81/200，
+正确与否取决于实现细节而不是运行时抖动；旧 obs 里记着非 0 的照旧不复用（`REMOVED_NOOP`）。
+⚠ **改"算什么"的不算这一类**：复用判据的门（`reuse_*`）、同步 / 异步之间（`rec_async`、W=0 对 W>0）、`rec_knee`、模型、采样，
+照旧进复用判据——噪音级要有对账撑着，不是"大概差不多"。异步路径上的窗口大小见 `NOISE_EQUIV_IF`。
 **整个键**豁免——取什么值都不触发重建；只豁免**某几个值**的见 `EQUIV_VALUES`。
 行为同 `SCHEDULING`：写进 `config`（`same_arm` 分得开两条臂、产物留着追溯），`config_differs` **不看**它——
 于是 `--device` 默认从 `gpu` 翻成 `auto` 不让磁盘上的现成 obs 全部重建，退回 CPU 跑出来的产物下次上 GPU 也照样复用。
@@ -175,6 +193,17 @@ NOISE_EQUIV = frozenset({"device", "ort_share", "ort_share_mem", "ort_max_sessio
 GPU / CPU 两条路的差异量级同 ORT 自己的逐次抖动（conf 动 1%~2% 的行、文本基本全同），
 所以**不许**拿它当"逐字节相同"去引。进这张表的门槛是**对账过的噪音级**（owner 2026-09-23 起不必逐个点头，但要在文档里写明依据）。
 实际跑在哪个设备、为什么退回，在 `_meta.device_resolved` / `device_fallback` / `device_effective`。
+
+`ort_arena_extend` / `ort_cublas_ws`（2026-10-05，resource 计划，defaults.md 1.41）：只改 ORT 怎么分显存——共用 arena 怎么扩、cuBLAS 每份工作区多大。
+同模型同输入；工作区变小 cuBLAS 可能换矩阵乘算法，算的还是同一个东西。quick 六段交错两轮（`tmp/ab/res-vram`）：框全同，文本改 2 / 39,507 行、跨 0.5 门 1 行，
+都低于同一臂两次之间的底噪（A/A 跨门 7 行）；主轨六段逐字节相同；打字机真值 gi-s2 / zzz-s1 / yuka-f1 两臂逐项相同。
+
+`det_precision`（2026-10-16 翻成 fp16 默认时，owner 定后端 / 精度的差异按抖动级互相复用、不为复用加按实际精度区分的逻辑）：
+半精度派生图和 fp32 图是同一份权重，quick 六段配对行文本相同 99.64%~99.97%（同臂两轮底噪 99.76%~100%），约 1% 的框挪动、
+跟着翻 HUD 区域标签；两道门（漏字幕有内容档、打字机真值）逐项相同（defaults.md 1.58）。CPU 上开关写 fp16、实际跑 fp32，也照样互相复用。
+`backend` / `trt_precision`（2026-10-16，TRT 后端计划，同一次 owner 定的口径）：TensorRT 引擎和 CUDA EP 算的是同一份 fp32 权重，
+quick 六段 TRT fp32 / fp16 两道门逐项相同，fp32 的文本差异是抖动级、fp16 的确定性变化逐帧判过方向（rec-workload 计划的 fp16 质量审计）。
+实际生效的后端（装没装库、退没退回）在 `_meta.backend`，不进判据。
 
 `det_engine`（现在只是身份串，见 `product_config`）**不在这张表里**：它改框，owner 逐条点头的噪音级只覆盖验证过的那一对模型，见 `NOISE_EQUIV_IF`。"""
 DEFAULT_DET_MODEL = "PP-OCRv6_medium_det"
@@ -190,14 +219,26 @@ def _det_pair_verified(got: dict, want: dict) -> bool:
                for c in (got, want))
 
 
-NOISE_EQUIV_IF = {"det_engine": _det_pair_verified}
+def _async_windows(got: dict, want: dict) -> bool:
+    """两边都走异步 rec 池、窗口都 > 0（缺键按 `ADDED_NOOP` 算，也就是加这两个旋钮之前的同步逐帧）。"""
+    def on(c: dict) -> bool:
+        return bool(c.get("rec_async", ADDED_NOOP["rec_async"])) and int(c.get("rec_window", ADDED_NOOP["rec_window"]) or 0) > 0
+    return on(got) and on(want)
+
+
+NOISE_EQUIV_IF = {"det_engine": _det_pair_verified, "rec_window": _async_windows}
 """**有条件的**噪音级：只在验证过的配置对上互相复用，别的组合照常比。
 
 `det_engine`（2026-09-24，owner 逐条点头——它改框，不在"资源 / 调度类自动豁免"的范围里）：D1（ORT det 并进 rec 服务）翻默认时
 owner 定两种 det 的产物按噪音级互相复用。依据（decode-buffer 末尾，quick 六段 A/B 各两遍）：事件级独有的只有 1~2 字 UI 碎片 /
 HUD 数字，打字机真值与用途 2 四次运行逐项相同——**量的是默认 det 模型 + 官方 ONNX 这一对**。
 第一版把整个键放进 `NOISE_EQUIV`，于是换了 `--det-model` 的两种后端也被判成可复用（Codex 审计 P1），收窄到这一对。
-2026-10 去掉 Paddle 之后 `det_engine` 固定写 `"ort"`（`product_config`），这条留着：磁盘上默认模型的 paddle-det 旧产物照旧按噪音级复用。"""
+2026-10 去掉 Paddle 之后 `det_engine` 固定写 `"ort"`（`product_config`），这条留着：磁盘上默认模型的 paddle-det 旧产物照旧按噪音级复用。
+
+`rec_window`（2026-10-11，owner 同意按 rec-batching 计划的判据）：异步路径上结算是"读数回来就按帧序收"，窗口只是主线程领先结算的上限，
+它和机器忙闲一样只改结果什么时候回来、于是改哪些帧真读。quick 六段上窗口 4 / 8 / 16 / 32 对旧默认（固定滞后、窗口 4）：
+疑似漏字幕判断器的覆盖逐条相同、打字机真值逐项相同（gi-s2 窗口 16 有一条因为多读出一个字配不上真值，是文本差异）、
+事件级独有的只有单字 UI 碎片和图标。**只放行两边都是异步、窗口 > 0 的配对**；同步（窗口 0 或 `--no-rec-async`）和异步之间照旧判不同。"""
 # 下面两个是写进旧 obs `config` 的**身份串**，值一个字都不能变（变了磁盘上的现成产物全部对不上）；它们指向的自转模型
 # 早就不用了（按文件名到模型根找，`paths.resolve_model`）。拆成两段写是给发布检查看的：这不是指向私有目录的指针。
 _OLD = "explore" + "/onnxrt/models/"
@@ -207,6 +248,7 @@ OLD_DET_ONNX = _OLD + "ppocrv6_medium_det.onnx"
 EQUIV_VALUES: dict[str, tuple[frozenset, ...]] = {
     "rec_onnx": (frozenset({"", OLD_REC_ONNX}),),
     "det_onnx": (frozenset({"", OLD_DET_ONNX}),),
+    "reuse_cache_mb": (frozenset({8.0, 32.0}),),
 }
 """**只在某几个值之间**互相复用的键：同一个等价类里的值不算对不上，类外的照常拦。
 
@@ -214,13 +256,21 @@ EQUIV_VALUES: dict[str, tuple[frozenset, ...]] = {
 认可的是**这一批**：旧默认（自转，`rec_onnx` 当时空 = fp16 那份、`det_onnx` 当时是 `OLD_DET_ONNX`）和新默认（空 = 官方，`flowocr.models`）。
 第一版把两个键整个放进了 `NOISE_EQUIV`（Codex 复审 P2，复现属实）：换成**任意**别的模型也不重建，
 新指定的模型可能根本没跑——owner 的话推不出"今后任意模型互相等价"。所以收窄成等价类；**往这里加值要 owner 点头**。
-⚠ 它比的是路径字符串，同名文件换了内容看不出来；用的是哪份文件看 `_meta.models` 的 sha256。"""
+⚠ 它比的是路径字符串，同名文件换了内容看不出来；用的是哪份文件看 `_meta.models` 的 sha256。
+
+`reuse_cache_mb` 的 8 / 32（2026-10-11，rec-reads 计划；owner 暂按两道门豁免复用）：缓存预算只改"缓存满了要不要当场真读"，
+quick 六段两轮交错 8 对 32：疑似漏字幕判断器的覆盖逐条相同、打字机真值逐项相同、事件级多出的只有 UI 碎片和 HUD 数字；
+只认这两个量过的值，别的预算照常判不同。"""
 
 
 def same_value(k: str, a, b) -> bool:
-    """`config_differs` 用：两值相等，或同属 `EQUIV_VALUES[k]` 里的一个等价类。"""
+    """`config_differs` 用：两值相等，或同属 `EQUIV_VALUES[k]` 里的一个等价类。
+    `video` 两边都过 `portable()` 再比：2026-10-06 之前的 obs 记的是绝对路径，之后记 `portable()`（数据根下相对数据根、
+    用户目录下 `~/…`）——同一个文件，不该因此重建。"""
     if a == b:
         return True
+    if k == "video" and isinstance(a, str) and isinstance(b, str):
+        return portable(a) == portable(b)
     return any(a in cls and b in cls for cls in EQUIV_VALUES.get(k, ()))
 
 
@@ -266,23 +316,37 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("video")
     ap.add_argument("--out", required=True)
     # 按时间网格取帧是 2026-09-24 起（`framegrid.TimeGrid`）：原来按 round(60/8) = 8 帧一帧，60 fps 上给 8 实际是 7.5 fps
-    ap.add_argument("--fps", type=float, default=2.0,
-                    help="采样帧率，按时间网格取帧：不要求整除素材帧率，不整除时最高到素材帧率的一半。生效网格记 `_meta.sample_grid`")
+    # 档位只填下面三个参数的默认值（`QUALITY`），显式给的优先；档位名不进 config（复用判据比生效值），`_meta.quality` 按生效值反推
+    ap.add_argument("--quality", choices=tuple(QUALITY), default=None,
+                    help=f"精度档位，决定 --fps / --aux-max-fps / --refine-scale 的默认值（显式给的优先）。"
+                         f"high = 采样 2、辅助流 60、缩放 0.35；default = 辅助流降到 30；fast = 采样 1、辅助流 15、缩放 0.25。不给就是 {DEFAULT_QUALITY}")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="采样帧率，按时间网格取帧：不要求整除素材帧率，不整除时最高到素材帧率的一半。默认按 --quality。生效网格记 `_meta.sample_grid`")
     # auto 是 2026-09-22 起的默认（project-structure 计划）；GPU / CPU 产物 owner 定为噪音级、互相复用（NOISE_EQUIV）
     ap.add_argument("--device", default="auto",
                     help="推理设备，det / rec 两个后端一起听它。auto（默认）= 有可用的 GPU 就用、先试推理一次，"
                          "GPU 不可用（没卡、驱动太旧、架构不支持、库加载不了）就整体退回 CPU、原因写进 `_meta.device_fallback`，"
                          "GPU 可用但试推理出了别的错就报错退出；gpu / gpu:N = 必须 GPU；cpu = 只用 CPU")
+    # TensorRT 后端（owner 2026-10-16 定做成正式后端；TRT 后端计划）：库和引擎由 `flowocr-trt install` 装
+    ap.add_argument("--backend", default="auto", choices=("auto", "cuda", "trt"),
+                    help="GPU 上用哪个推理后端。auto（默认）= 装了 TensorRT 库（`flowocr-trt install`）就用 TensorRT，没装用 CUDA EP；"
+                         "trt = 要 TensorRT，没装库时打一行警告、退回 CUDA EP；cuda = 只用 CUDA EP。自带的 --det-onnx / --rec-onnx 一律走 CUDA EP；"
+                         "--device cpu 时不看这个开关。缺引擎时起服务先建（一两分钟），建不出来、启动自检不过也退回 CUDA EP；"
+                         "实际生效的后端和原因记 `_meta.backend`")
+    ap.add_argument("--trt-precision", default="fp32", choices=("fp32", "fp16"),
+                    help="TensorRT 引擎的精度：fp32（默认，实际走 TF32，和 CUDA EP 一样）/ fp16（再快约 2~3%%，文本有抖动级差异）。"
+                         "det / rec 都从官方 fp32 图建引擎、精度由 TensorRT 自己降")
     # 默认 16（owner 2026-09-21；原 32，owner 09-16）。同形状组 >16 个的只占 0~0.9%（几乎全是菜单页的宽 320 短文本），
     # 而 ORT 每形状一个 session、激活峰值随 批×宽 线性涨——上限减半 = 显存峰值、形状数、共享内存都减半档；
     # 批维不影响读数（一次性探针 probe_rec_pad.py B 组 547 条差 0~1 条，followups-evidence-0921 报告）。
     # 批量 GEMM 的数值会抖：quick 六段上文本改 0.086%、另有少量 conf 跨过 build_tracks 的 0.5 门（fps-and-rec-budget 报告）
     ap.add_argument("--rec-bucket", type=int, default=16, metavar="N",
                     help="把目标宽相同的裁剪批在一起送 rec，每桶最多 N 个（默认 16；0 = 关 = 一个裁剪一次）")
-    # 默认 4（owner 2026-09-16）：快前处理之后批 4 让 det 每帧约 −28%，端到端 quick 六段合计 −6.8%，
-    # 但不逐字节相同（48 帧里 2 帧 poly 细微差）——fps-and-rec-budget 报告
-    ap.add_argument("--det-batch", type=int, default=4, metavar="N",
-                    help="det 攒 N 帧一批送（默认 4；1 = 逐帧）。复用判断和 rec 仍逐帧做")
+    # 默认 auto = GPU 上 4、CPU 上 1（`run_ocr2.det_batch`）。GPU 的 4 是 owner 2026-09-16 定的：快前处理之后批 4 让 det
+    # 每帧约 −28%，端到端 quick 六段合计 −6.8%，但不逐字节相同（48 帧里 2 帧 poly 细微差）——fps-and-rec-budget 报告。
+    # CPU 的 1 是 2026-10-04 定的（defaults §1.35）：CPU 上量到批 1 更快、更省，obs 逐字节相同（机制没单独拆）
+    ap.add_argument("--det-batch", type=_auto_or_int, default="auto", metavar="N|auto",
+                    help="det 攒 N 帧一批送（默认 auto：GPU 4、CPU 1；1 = 逐帧）。复用判断和 rec 仍逐帧做")
     # 默认 1（owner 2026-09-19 从 3 改回来："默认 worker 改到 1，不容易出问题；确认显存时可传 3；等做完 worker 间的资源共享
     # 可以重新放宽要求"——3 个 worker 各开一套模型，显存按份数线性涨）。放行时采样帧和单进程逐帧相同，差别只在每段开头没有
     # 『上一帧』可复用（实测只动切点之后几行闪烁的直播 UI）；quick 三段上 3 个 worker −26%~−47%（flowocr.extract.ocr_parallel）。
@@ -370,14 +434,17 @@ def build_parser() -> argparse.ArgumentParser:
     # 同模型同输入、不改读数（NOISE_EQUIV）
     ap.add_argument("--ort-spin", default="off", choices=("on", "off"),
                     help="ORT 服务里 intra-op 线程池轮空时自旋等待（默认 off；ORT 自己的默认是开）")
+    # 显存（2026-10-05，resource 计划，defaults.md 1.41）：共用 arena 按 2 的幂扩、一次最多 1 GB，扩出来的大块用不满也不还；
+    # 每个 (调用线程, session) 一套 cuBLAS 句柄 + 工作区。两样合起来 ORT 显存 4.34 → 3.12 GB，墙钟噪声档。同模型同输入（NOISE_EQUIV）
+    ap.add_argument("--ort-arena-extend", default="same", choices=("pow2", "same"),
+                    help="ORT 共用 arena 不够时怎么扩：same = 要多少扩多少（默认）；pow2 = ORT 自己的默认（按 2 的幂，一次最多 1 GB）。"
+                         "只对共用 arena（`--ort-share-mem`，默认开）生效")
+    ap.add_argument("--ort-cublas-ws", default=":4096:1", metavar="SPEC|off",
+                    help="ORT 服务进程的 CUBLAS_WORKSPACE_CONFIG（默认 `:4096:1`，每份工作区 4 MB）；off = 不设（cuBLAS 自己的默认）。"
+                         "环境里已有这个变量时以环境的为准，生效的值记 `_meta.ort.<模型>.cublas_ws`")
     ap.add_argument("--ort-server-extra", default="",
                     help="原样追加给 ORT 服务的参数（探针 / A/B 用，如 `--threads 4 --per-shape 0`）。进 config（非空就不复用默认的 obs），"
                          "服务实际收到的整串记 `_meta.ort_server_args`")
-    # 小批次是 kernel 启动受限的：真实裁剪上每次推理 wuwa 12.3 -> 9.2 ms、gi-s2 9.4 -> 6.0 ms（N=4），文本 0 差；
-    # 图 session 用自己的 arena（和共用 arena 放一起会踩显存），显存 +0.25~0.7 GB（decode-buffer）；
-    # 2026-09-26 修好能跑（捕图 / 回放拿服务里的独占闸），但闸吃掉了在途并发：quick 六段墙钟慢约 10%~16%，不采纳（defaults.md 3 节）
-    ap.add_argument("--ort-cuda-graph", type=int, default=0, metavar="N",
-                    help="rec 服务里批 ≤ N（宽 ≤ 960）的形状用 CUDA Graph 回放（默认 0 = 关）。图 session 用自己的显存")
     # server 是 2026-09-23 起的默认：两条送进模型的张量逐位相同（同一份 recprep.batch），差别只在谁抢 GIL（decode-buffer）
     ap.add_argument("--rec-pre", default="server", choices=("server", "client"),
                     help="ORT rec 的前处理在哪做：server（默认）= ORT 服务进程里，管线只送原样的 uint8 裁剪；"
@@ -387,10 +454,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--det-onnx", default="",
                     help="det 用哪份 ONNX（空 = 官方发布的 PP-OCRv6_medium_det_onnx，`flowocr.models`，缺了当场取）。"
                          "自带的要连同它的 inference.yml 放在同一个目录，模型名和前后处理配置从那里读")
+    ap.add_argument("--det-precision", default=None, choices=("fp32", "fp16"),
+                    help="默认 det 模型在 GPU 的 CUDA EP 上用哪种精度（没给 = fp16；给了 --det-onnx 时 fp32；TensorRT 那条路看 --trt-precision）：fp16 = 从官方 fp32 图派生的半精度图"
+                         "（输入输出仍 fp32，`flowocr.models.fp16_path`），det 的核时间约 −31%%，框和文本有字符级抖动（defaults.md 1.58）。"
+                         "CPU 上一律 fp32；显式给 fp16 时不能和 --det-onnx 同给")
     # 2026-09-22 起全用官方模型（原来是自己转的 fp16）；新旧模型的产物 owner 定为噪音级、互相复用（EQUIV_VALUES）
     ap.add_argument("--rec-onnx", default="",
                     help="rec 用哪份 ONNX（空 = 官方发布的 PP-OCRv6_medium_rec_onnx 融进 argmax，fp32；"
                          "`flowocr.models`，缺了当场取）")
+    # 2026-10-05（owner）：默认 rec 的字表没有韩文 / 西里尔字母 / 泰文；点名语言才下对应模型，auto 三个都下、开跑前抽帧判一次（flowocr.extract.langprobe）
+    ap.add_argument("--ocr-lang", choices=OCR_LANGS, default="zh",
+                    help="识别语言。zh（默认）= 现用模型，覆盖简中、繁中、英、日、德、法、西、葡、意、土、印尼；"
+                         "ko / ru / th = 韩 / 俄 / 泰，用到时才下载对应模型（各约 8–13 MB）；"
+                         "auto = **会下载韩、俄、泰三个模型（共约 29 MB）**，开跑前抽帧判语言，判不出用 zh。越南语没有覆盖的官方模型")
     # pts 是 2026-09-20 owner 定的默认（『pts 更正确就按 pts』）。两者只在帧数对不上时有区别：①解码器少交付（NVDEC 在有前摇的 av1 上少 1~3 帧）
     # ——index 会让整条格子静默平移，pts 只是某一格取不到；②素材自己有丢帧缺口（f3/f4）——index 的相位被 `缺口 % stride` 永久顶偏。
     # 无缺口素材上两者逐字节相同。量法和数在 hw-decode-results 报告
@@ -406,6 +482,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--det-lookahead", type=int, default=1, choices=(0, 1),
                     help="det 批的流水：下一批的前处理 + 推理在辅助线程上跑、和这一批的后处理重叠（默认 1 = 开；0 = 关）。"
                          "只在 --det-batch > 1 且走快前处理时生效；代价是多一个线程、帧环多装一批")
+    # gpu-sched 计划 S6 的探针（rec-reads 的 F），10-12 删过一次、为在回补异步之上量大窗口捡回：只改什么时候写、不改写什么（SCHEDULING）
+    ap.add_argument("--flush-lag", type=int, default=0, metavar="N",
+                    help="落盘最多落后在线回抠几个采样点而不等它（0 = 每次结算都等证据挂齐再写）。"
+                         "窗口大时结算成堆，每帧都等会让主线程一口气等完回抠这一堆")
     # 给窗口延迟读那套模拟当输入（inference-runtime 计划）
     ap.add_argument("--trace", default="",
                     help="把复用判据的因果轨迹写到这个 JSONL（逐框：链 uid / 链接类型 / 拦它的门 / 相关系数 / "
@@ -418,14 +498,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pregate", action="store_true",
                     help="把复用判据里最贵的那一块（逐框的静态相关系数）挪到 det 那一层算，产物逐字节相同。"
                          "det 线程有空闲时才划算（--det-prefetch）")
-    # inference-runtime 计划的纯代价曲线、文本代价
-    ap.add_argument("--rec-near", type=float, default=0.0, metavar="R",
-                    help="分桶从同宽放宽到近宽：组内最大目标宽 ≤ 最小 × (1+R)（默认 0 = 同宽）。"
-                         "改产物：批内小的会被补零到批内最大宽。跨帧攒批（--rec-window）之下同宽不容易凑批，两个旋钮是一对")
     # 2026-09-23 默认开（decode-buffer 批次 3）；读还没回来的链走严格像素门，窗口里多读几个框（inference-runtime 计划的策略 B）
     ap.add_argument("--rec-window", type=int, default=None, metavar="N",
-                    help="rec 跨帧攒批：裁剪排进队列，攒够 N 个采样点一次分桶送。默认跟着 --reuse-v2 走：开着 4、关着 0"
+                    help="rec 跨帧攒批：裁剪排进队列，主线程最多领先结算 N−1 个采样点。默认跟着 --reuse-v2 走：开着 4、关着 0"
                          "（0 = 逐帧分桶；1 = 每帧结算，和 0 逐字节相同）。和文本无关的判决照常逐帧做，要文本的那半推迟到结算；"
+                         "异步时读数回来就按帧序结算，同步时攒满 N 个采样点一次分桶送。"
                          "读还没回来的链走 --reuse-corr-digit 的严格门，所以会多读几个框。要 --reuse-v2；帧环会多留 N 个采样点")
     # 2026-09-23 默认开（组批第二步，src/flowocr/extract/recpool.py）
     ap.add_argument("--rec-async", action=argparse.BooleanOptionalAction, default=None,
@@ -437,10 +514,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rec-knee", type=int, default=1, metavar="K",
                     help="异步消费者的膝点驻留：排队不足 K 个裁剪就先不发（默认 1 = 一有空就发），被 --rec-bucket 封顶。只在 --rec-async 时有意义")
     # auto：GPU 上 quick 五段 + wuwa 10 分钟交错两轮 −3.8%（3 是 −5.2%，多出的在噪声里）；CPU 上 det / rec 各自就吃满物理核，
-    # 第二个在途只是来挤（gi-s1 60 s −11%；defaults.md 1.17 节）。结算仍是固定滞后，只改批怎么拼（= ORT 的逐次抖动，NOISE_EQUIV）
+    # 第二个在途只是来挤（gi-s1 60 s −11%；defaults.md 1.17 节）。只改批怎么拼、结果什么时候回来（时序抖动，NOISE_EQUIV）
     ap.add_argument("--rec-inflight", type=_auto_or_int, default="auto", metavar="N|auto",
                     help="异步 rec 池同时在途几个请求（连到同一个 ORT 服务，模型 / 显存仍一份）。"
                          "auto（默认）= GPU 上 2、CPU 上 1；显式给数就照给的。只在 --rec-async 时生效")
+    # rec-reads 计划的 B：回补的二分交给 rec 池推进，主线程不等；只改回补的读什么时候发、什么时候收（经缓存占用改到哪些帧真读）
+    ap.add_argument("--recover-async", action=argparse.BooleanOptionalAction, default=False,
+                    help="回补异步：沿用行读出变化后的二分交给异步 rec 池逐层推进、和普通读拼批，主线程不等它"
+                         "（没做完时那一帧和之后最多 8 批回抠证据扣着不送）。只在 --rec-async 时生效")
     # 三种编码 × 两个解码后端六条臂产物全同，换来 1.05–1.24× 墙钟（vp9 真窗口 5 分钟 1.18×；hw-decode-results 报告）
     ap.add_argument("--prefetch", type=int, default=4,
                     help="解码放到后台线程的有界队列深度（默认 4；0 = 关，串行）。只改什么时候解码、不改解出什么，严格保序；"
@@ -460,7 +541,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--reuse-link-iou", type=float, default=0.3, help="上一帧 IoU 到这个就允许当跨空档链接（--reuse-v2）")
     ap.add_argument("--reuse-link-corr", type=float, default=0.9, help="跨空档链接的相关系数门（--reuse-v2）")
     ap.add_argument("--reuse-mem", type=int, default=16, help="按位置记住结束的链多少个采样点（--reuse-v2）")
-    ap.add_argument("--reuse-cache-mb", type=float, default=8.0, help="回补裁剪缓存的全局上限 MB，超了当场真读（--reuse-v2）")
+    # 8 -> 32（2026-10-11，rec-reads 计划的 A）：8 MB 时缓存满了被迫的真读 98% 读回来文本没变，32 MB 下 quick 六段一次都不再触发、峰值 ≤ 16 MB
+    ap.add_argument("--reuse-cache-mb", type=float, default=32.0, help="回补裁剪缓存的全局上限 MB，超了当场真读（--reuse-v2）")
     # 2026-09-22 默认开（decode-buffer）：修的是打字机中间态被沿用到底（句尾一两个字整框相关系数看不出来，yuka-f5 14954 s 缺句尾 6 秒）
     ap.add_argument("--reuse-confirm", action=argparse.BooleanOptionalAction, default=True,
                     help="链上的文本没被连续两次真读证实之前，像素门走严格门 --reuse-corr-digit（默认开，改产物；只会多读）。"
@@ -482,12 +564,12 @@ def build_parser() -> argparse.ArgumentParser:
     # 0.35 是 owner 2026-09-20 定的（原来 0.5 = 540p，按带宽选的）。成本几乎全在搬运（300 s 窗 540p 时 9.3 GB，是采样流的 5 倍），
     # 约 ∝ 分辨率²：0.35 搬运减半、帧环内存 214 -> 105 MB、OCR 那遍约 −10%，三段打字机真值上全字一个不差、首字 −0~1 条；
     # 0.25 全字三段齐降 2~3 条（hw-decode-results 报告）。1.0 不缩：1080p60 全帧率走管道比 OCR 那遍还慢
-    ap.add_argument("--refine-scale", type=float, default=0.35,
-                    help="辅助流缩到原来的多少（默认 0.35，1080p 素材上约 378p）。再低会丢全字时刻的精度")
+    ap.add_argument("--refine-scale", type=float, default=None,
+                    help="辅助流缩到原来的多少（默认按 --quality：0.35 时 1080p 素材上约 378p）。再低会丢全字时刻的精度")
     # 2026-09-24（owner）；不整除的第二版在 flowocr.extract.framegrid。约束：辅助流 ≥ 高精帧环（decode-buffer 目标设计里的帧环 S，
     # 还没落地）≥ 采样（--fps），现在只拦 < --fps 的值。取代了原来的 --refine-step（已删）
-    ap.add_argument("--aux-max-fps", type=float, default=AUX_MAX_FPS, metavar="FPS",
-                    help="辅助流的帧率上限：素材帧率超过它就按时间网格取帧（默认 60），不要求整除，采样帧一定在辅助流里。"
+    ap.add_argument("--aux-max-fps", type=float, default=None, metavar="FPS",
+                    help="辅助流的帧率上限：素材帧率超过它就按时间网格取帧（默认按 --quality），不要求整除，采样帧一定在辅助流里。"
                          "不能低于 --fps。生效网格记 `_meta.aux_grid`，复用判据比的是生效网格")
     # nvdec：第二路在 CPU 上每帧多 0.9 ms、硬解几乎免费；cuvid 那条是为了避开 scale_cuda 的核函数（nvdec 臂 det 被抢 GPU 慢了 7–8 s）。
     # 不改文本 / 框，但改 edge 证据，所以和别的 fused 参数一样进 config（OPT_IN_FUSED，2026-09-17 审计改的）
@@ -509,8 +591,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="解码分片：N 路硬解 ffmpeg 交替解相邻的时间块（按关键帧切、谁空谁领、按帧号顺序交帧），跑在自己的进程里"
                          "（默认 2；0 / 1 = 不分片）。全硬解时产物逐字节相同。只配 ffmpeg + 按 pts 选帧；"
                          "和 --workers > 1 二选一（自动关、打印原因）；没 GPU 时自动不分片")
-    ap.add_argument("--decode-block", type=float, default=20.0, metavar="秒",
-                    help="解码分片的块长（对齐到关键帧）。块越长每块起进程的开销越摊薄；内存由预取的字节上限封顶，不看块长")
+    ap.add_argument("--decode-block", type=float, default=60.0, metavar="秒",
+                    help="解码分片的块长（对齐到关键帧；默认 60，defaults.md 1.18）。每块起一个 ffmpeg、从前一个关键帧预解，"
+                         "块越长这份开销越摊薄；内存由预取的字节上限封顶，不看块长")
     ap.add_argument("--refine-thr", type=float, default=0.80,
                     help="消失的退回判据：和末次观测帧的相关系数不低于这个就算还在（同 refine_boundaries --thr）")
     # 纯复用等于把'多数投票'换成'首次读数说了算'，读错会一路传下去；定期刷新让下游仍有几个独立读数可投票
@@ -531,8 +614,19 @@ def resolve(args: argparse.Namespace) -> argparse.Namespace:
     * `--refine-fused` 没给（auto）：reuse_v2 开着、解码器是 ffmpeg 就开，否则不开
       （2026-09-20 起 `--hwaccel` 也能开——辅路走 `scale_cuda`）；
     * `--hwaccel` / `--frame-select` 没给：解码器是 ffmpeg 就 `cuda` / `pts`，cv2 就 `''` / `index`；
+    * `--fps` / `--aux-max-fps` / `--refine-scale` 没给：按 `--quality`（没给是 `DEFAULT_QUALITY`）填 `QUALITY` 里那一档的值；
     * `--device` 只校验、归一成小写——`auto` 落到哪个设备要试推理才知道，那是 `run_ocr2` 的事，不在这里猜。"""
     args.device = check_device(args.device)
+    if getattr(args, "rec_onnx", "") and getattr(args, "ocr_lang", "zh") != "zh":
+        raise SystemExit(f"--rec-onnx 和 --ocr-lang {args.ocr_lang} 只能给一个：自带的 rec 模型认哪些字由它自己的字表定")
+    if getattr(args, "det_precision", "fp32") is None:
+        args.det_precision = "fp32" if getattr(args, "det_onnx", "") else "fp16"
+    if getattr(args, "det_onnx", "") and getattr(args, "det_precision", "fp32") != "fp32":
+        raise SystemExit("--det-onnx 和 --det-precision fp16 只能给一个：半精度只从默认 det 模型派生，自带的模型按它本身的精度跑")
+    tier = QUALITY[getattr(args, "quality", None) or DEFAULT_QUALITY]
+    for k, v in tier.items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
     if args.no_reuse:
         args.reuse_v2 = False
     if args.reuse_corr is None:
@@ -540,7 +634,8 @@ def resolve(args: argparse.Namespace) -> argparse.Namespace:
     if args.refresh_every is None:
         args.refresh_every = 32 if args.reuse_v2 else 4
     if args.rec_window is None:
-        # 异步 rec（固定滞后结算，decode-buffer 的"判决不等 rec"）2026-09-23 进默认：窗口要 reuse_v2 的两段式判决
+        # 异步 rec（decode-buffer 的"判决不等 rec"）2026-09-23 进默认：窗口要 reuse_v2 的两段式判决。
+        # 窗口 8 / 16 / 32 量过（2026-10-11，rec-batching 计划）：主线程等 rec 少了，但等 det 等量涨回来、墙钟不降；16 / 32 比 8 还慢、真读也多，留 4
         args.rec_window = 4 if args.reuse_v2 else 0
     if args.rec_async is None:
         args.rec_async = bool(args.rec_window and args.rec_bucket)
@@ -599,8 +694,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def product_config(args: argparse.Namespace) -> dict:
-    """决定产物内容的那组**生效值**（含默认值）。`video` 归一成绝对路径——
-    同一个文件写成 `D:/x` 还是 `D:\\x`、相对还是绝对，不该算两条臂。"""
+    """决定产物内容的那组**生效值**（含默认值）。`video` 先归一成绝对路径（同一个文件写成 `D:/x` 还是 `D:\\x`、
+    相对还是绝对，不该算两条臂），再记成 `portable()`：obs 会被分享，数据根和用户目录下的路径不带出本机目录与用户名
+    （owner 2026-10-06；这两处之外的照旧是绝对路径）。开文件一律走 `provenance.local()`。"""
     cfg = {k: v for k, v in vars(resolve(args)).items() if k not in NON_PRODUCT}
     if not cfg.get("reuse_v2"):
         cfg = {k: v for k, v in cfg.items() if k not in OPT_IN}     # 关着就不写，见 OPT_IN
@@ -608,7 +704,7 @@ def product_config(args: argparse.Namespace) -> dict:
         cfg = {k: v for k, v in cfg.items() if k not in OPT_IN_FUSED}
     if not cfg.get("hwaccel"):
         cfg = {k: v for k, v in cfg.items() if k not in OPT_IN_HW}
-    cfg["video"] = str(Path(cfg["video"]).resolve())
+    cfg["video"] = portable(Path(cfg["video"]).resolve())
     # **推理后端的身份串**（2026-10 去掉 Paddle 之后不再是选项，处理同下面的 `frame_id`）：不写的话这两个键两边都缺、
     # `config_differs` 就不比它们，09-18 之前没有 `rec_engine` 键的 Paddle-rec 旧 obs 会被当成 ORT 产物复用。
     # 旧产物缺键时按 `ADDED_NOOP`（= paddle）算；默认模型的 paddle-det 产物照旧按噪音级复用（`NOISE_EQUIV_IF`）
@@ -641,6 +737,8 @@ REMOVED_NOOP = {
     "rec_batch_size": 0,           # 只有 Paddle rec 认它；0 = 不传
     "rec_model": DEFAULT_REC_MODEL,
     "det_model": DEFAULT_DET_MODEL,
+    "rec_near": 0.0,               # 2026-10-10 删（近宽分桶）：ORT 的形状网格下本来就是空操作，0 = 同宽
+    "ort_cuda_graph": 0,           # 2026-10-12 删（CUDA Graph 录图，两次量过不采纳；defaults.md 3 节）：0 = 没开
 }
 """**已经删掉的**旋钮：产物里记着、而当前的解析器不认识。值是它"没开"时的那个数——
 产物记的正好是这个值，就说明那一趟和现在的默认**行为相同**，不该因此重建。
@@ -651,16 +749,15 @@ REMOVED_NOOP = {
 ⚠ 往这里加键的前提和 `ADDED_NOOP` 一样：那个值必须**真的是空操作**。"""
 
 ADDED_NOOP = {
+    "ocr_lang": "zh",              # 2026-10-05 加，zh = 加它之前的模型；按语言选 rec 时 rec_onnx 仍是空串，不加这个键换语言的 obs 会被当成可复用
     # `ort_share` / `ort_max_sessions` / `rec_pre` / `ort_share_mem` 2026-09-23 挪进了 NOISE_EQUIV（owner：噪音级都复用）
-    "ort_cuda_graph": 0,           # 2026-09-23 加，0 = 加它之前的行为（出过真错，不进 NOISE_EQUIV）
-    "ort_server_extra": "",        # 2026-09-25 加，空 = 加它之前的行为（它能透传 --cuda-graph-batch 这类改读数的，所以非空不赦免）
+    "ort_server_extra": "",        # 2026-09-25 加，空 = 加它之前的行为（它能透传 --cudnn-conv-search 这类改读数的，所以非空不赦免）
     "regions": "",                 # 2026-09-23 加，空 = 全屏（加它之前的行为）
     "region_crop": False,          # 2026-09-24 加，关 = det 看整帧（加它之前的行为）
     "ort_batch_ladder": "",
     "pregate": False,
     "rec_async": False,
     "rec_knee": 16,
-    "rec_near": 0.0,
     "rec_window": 0,
     # `det_prefetch` 2026-09-20 从这里挪走了：它进了 `SCHEDULING`，`config_differs` 根本不看它，
     # 留在这儿只会让人以为"只有 0 才赦免"（实际是任何值都不改产物）。
@@ -686,7 +783,31 @@ ADDED_NOOP = {
 
 
 AUX_MAX_FPS = 60.0
-"""辅助流默认最多收这么多帧 / 秒（`--aux-max-fps`）。60 fps 及以下的素材每帧都收（和加旋钮之前一样）。"""
+"""加 `--aux-max-fps` 之前的行为：辅助流最多收这么多帧 / 秒，60 fps 及以下的素材每帧都收。旧产物没有这个键时按它算；`high` 档也是它。"""
+
+OCR_LANGS = ("zh", "ko", "ru", "th", "auto")
+"""`--ocr-lang` 的取值（`flowocr.models.LANG_REC` 加 `auto`）。"""
+
+QUALITY = {
+    "high": {"fps": 2.0, "aux_max_fps": AUX_MAX_FPS, "refine_scale": 0.35},
+    "default": {"fps": 2.0, "aux_max_fps": 30.0, "refine_scale": 0.35},
+    "fast": {"fps": 1.0, "aux_max_fps": 15.0, "refine_scale": 0.25},
+}
+"""精度档位（`--quality`，owner 2026-10-05）：只决定这三个参数的默认值。`high` 是档位之前的生产配置，开发和基线一律用它；
+`default` 辅助流降到 30 fps；`fast` 采样 1 fps、辅助流 15 fps、缩放 0.25（owner 2026-10-05 量完定的采样 1，见 defaults.md 的档位一节）。
+依据和代价见 defaults.md。"""
+
+DEFAULT_QUALITY = "default"
+"""不给 `--quality` 时的档位（owner 2026-10-05 翻的：采纳规则第 1 条改成允许合理的取舍）。开发驱动都显式钉 `high`。"""
+
+
+def quality_of(args: argparse.Namespace) -> str:
+    """按**生效值**反推的档位（写 `_meta.quality`，只作追溯）：三个参数正好等于某一档就是它，否则 `custom`；
+    回抠没开（辅助流参数不生效）也算 `custom`——显式改过某个参数时不会把档位名误记成没改的那档。"""
+    if not getattr(args, "refine_fused", False):
+        return "custom"
+    got = {k: getattr(args, k) for k in QUALITY["high"]}
+    return next((name for name, v in QUALITY.items() if v == got), "custom")
 
 EFFECTIVE_CHECKED = frozenset({"aux_max_fps", "refine_step"})
 """`config_differs` **不直接比**的键：它们对产物的作用要结合素材本身才定得下来，由 `ocr_complete.obs_reusable`

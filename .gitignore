@@ -13,6 +13,9 @@
 !/explore/p1-seqmatch/
 /explore/p1-seqmatch/*
 !/explore/p1-seqmatch/*.py
+!/explore/naninovel-matcher/
+/explore/naninovel-matcher/*
+!/explore/naninovel-matcher/*.py
 !/explore/onnxrt/
 /explore/onnxrt/*
 !/explore/onnxrt/*.py
@@ -35,12 +38,27 @@
 !/explore/drop-paddle-oracle/
 /explore/drop-paddle-oracle/*
 !/explore/drop-paddle-oracle/*.py
+!/explore/extract-efficiency/
+/explore/extract-efficiency/*
+!/explore/extract-efficiency/*.py
+!/explore/extract-efficiency/README.md
+!/explore/extract-efficiency/pyproject.toml
+!/explore/extract-efficiency/bootstrap_hook/
+!/explore/extract-efficiency/retry_observation/
+# ↑ 效率探索：只跟踪脚本与说明；冻结证据 JSON / zip / 源码快照只留本地（2026-10-04 合并前剥离）
+!/explore/plate-color/
+/explore/plate-color/*
+!/explore/plate-color/*.py
+!/explore/plate-color/README.md
+!/explore/plate-color/evidence/
+# ↑ 底板 / 字色原型：脚本、说明，加重跑得不回来的人工判读和测时（evidence/，2026-10-23）；out/plate-color/ 已删
 
 # 产物与临时文件
 /out/
 /tmp/
 # 官方 ONNX 模型（`python -m flowocr.models fetch` 取到数据根的 models/）
 /models/
+/trt/
 # 游戏文本包（game-text-data 的 `gametext <游戏> bundle` 出的 zip，私下拿到后放这里；flowocr.paths.gametext_root）
 /gametext/
 
@@ -71,4 +89,4 @@ __pycache__/
 /dist/
 
 # 维护者的私有补充：追踪但发布时剥离（项目约定；全局 ignore 的 *.local.md 在这里放行）
-!CLAUDE.local.md
+!/AGENTS.local.md

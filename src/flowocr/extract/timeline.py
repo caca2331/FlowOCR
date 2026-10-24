@@ -8,7 +8,7 @@
   超了之后的丢掉、`_meta.dropped` 记丢了几条——整片要看时间线就开一个窗口跑，别开整片。
 * **跨进程对得上**：时刻一律 `time.perf_counter()`——Windows 上是系统级的 QPC，各进程同一根轴；
   每份文件头上另记一对 `(time.time(), perf_counter())` 锚点，换平台时按锚点对齐。
-* 子进程（`--edge-proc` 的回抠进程、`--decode-shards` 的只解码进程）从环境变量 `FLOWOCR_TIMELINE` 认出开着，
+* 子进程（`--edge-proc` 的回抠进程、`--decode-shards` 的只解码进程、ORT 推理服务）从环境变量 `FLOWOCR_TIMELINE` 认出开着，
   各写 `<路径>.<角色>.jsonl`；管线进程写 `<路径>` 本身。
 """
 from __future__ import annotations
@@ -70,15 +70,18 @@ def _add(e: tuple) -> None:
 
 
 def dump() -> str | None:
-    """落盘（JSONL：头一行 `_meta`，之后一行一条）。没开就什么都不做。返回写到哪了。"""
+    """落盘（JSONL：头一行 `_meta`，之后一行一条）。没开就什么都不做。返回写到哪了。
+    先写 `.part` 再换名：进程在写的半中间被杀时，留下的是上一次的完整一份，不是半截。"""
     if _ev is None or not _path:
         return None
     ev = list(_ev)
-    with open(_path, "w", encoding="utf-8") as f:
+    part = _path + ".part"
+    with open(part, "w", encoding="utf-8") as f:
         f.write(json.dumps({"_meta": {"role": _role, "pid": os.getpid(),
                                       "anchor": [time.time(), time.perf_counter()], "n": len(ev),
                                       "dropped": _dropped}}) + "\n")
         for k, th, t0, t1, a in ev:
             f.write(json.dumps({"k": k, "th": th, "t0": round(t0, 6), "t1": round(t1, 6), "a": a},
                                ensure_ascii=False) + "\n")
+    os.replace(part, _path)
     return _path

@@ -48,10 +48,15 @@
 
 ## 文本清洗（只影响匹配，不改语料）
 
-`{M#…}{F#…}` 按视频的主角性别二选一（**从 obs 投票定**，两种写法各算一遍、看哪种读得上）；
-`{NICKNAME}` / `{REALNAME[…]}` / `{PLAYERAVATAR#…}` 这类玩家相关的占位删掉（屏幕上是
-玩家起的名字，库里没有）；`<color>` 等标签删掉；`{RUBY#[S]…}` 是注音（小字在正文上方），
-删掉；`\\n` 是条内换行，写成 `\\N`（和《魔裁》剧本同一口径，`script_align` 认它）。
+`{M#…}{F#…}` 按视频的主角性别二选一（**从 obs 投票定**，两种写法各算一遍、看哪种读得上）；原神按性别取的称谓 / 句尾
+`{PLAYERAVATAR#SEXPRO[甲（为男时）|乙（为女时）]}` / `{MATEAVATAR#SEXPRO[…]}` 读包时查称谓表改写成同样的写法（`sexpro`，包里没有表才留成占位）；
+`<color>` 等标签删掉（译文和原文模板另存一份带样式的，`clean(rich=True)`，见下）；`{RUBY#[S]…}` 是注音（小字在正文上方），删掉（带样式的那份留着，见下）；剩下的花括号是占位（`{NICKNAME}` / `{REALNAME[…]}` 这类，
+屏幕上是玩家起的名字或运行时的值，库里没有；包里没有称谓表时 `{PLAYERAVATAR#…}` 也在其中）：用来匹配的原文里删掉、跟着它落单的标点一起收拾
+（`flowocr.placeholders.drop`），译文和原文模板里原样留着（`clean(keep=True)`，阶段 3 标出来、阶段 4 填值或删掉）；`\\n` 是条内换行，写成 `\\N`（和《魔裁》剧本同一口径，`script_align` 认它）。
+
+样式：粗体 / 斜体 / 下划线 / 删除线 / 字色和 Ruby（`flowocr.richtext`）在译文和原文模板之外另存一份 `cn_rich` / `jp_rich`（和不带样式的那份不同时才有），
+阶段 3 按预设的 `style` / `ruby` 选项投成字幕稿的 ASS 标签和 Ruby 标记（SRT 不带）；字号、对齐和别的标签不带。匹配只看不带样式的那几份。
+三款游戏的 Ruby 写法各不同，`ruby_rich` 先换成 Unity 的 `<ruby="读音">正文</ruby>`。
 
 用法：
     python -m flowocr.analyze.gamescript out/gamestream/gi-s2.jsonl --out out/gametext/gi-s2-ref.json
@@ -75,18 +80,27 @@ from pathlib import Path
 import numpy as np
 
 from flowocr import paths  # noqa: E402
+from flowocr import placeholders as PH  # noqa: E402
+from flowocr import richtext  # noqa: E402
+from flowocr import textfold  # noqa: E402
 from flowocr.analyze import gtdbundle  # noqa: E402
 
-CODE_FP_FILES = ("src/flowocr/analyze/gamescript.py", "src/flowocr/analyze/gtdbundle.py", "src/flowocr/paths.py")
+CODE_FP_FILES = ("src/flowocr/analyze/gamescript.py", "src/flowocr/analyze/gtdbundle.py", "src/flowocr/paths.py",
+                 "src/flowocr/placeholders.py", "src/flowocr/richtext.py", "src/flowocr/textfold.py")
 """产剧本的代码（本文件 + 它 import 的本地模块，仓库相对路径；`paths` 是 shim，记真实现），
 `build_tracks.code_fp` 按内容算指纹。"""
-SCHEMA = "flowocr-gameref/4"
+SCHEMA = "flowocr-gameref/6"
 """/2（2026-09-11，audit-6）：锚点带 `unique`、绝区零变体组折成 `Variant` + `variant_of`、
 provenance 带 `integrity_warnings`。/3（同日）：锚点带框位置 `y` / `in_band`、新类型 `OffBand`、
 `stats.band`。/4（2026-09-25，发布前）：库改成读文本包，provenance 的 `db` / `upstream` / `extractor` /
 `integrity_warnings` 合成一个 `gametext`（带内容指纹，`gtdbundle.Bundle.provenance`）。
+/5（2026-10-05）：行的 `cn` 里保留占位（`{NICKNAME}` 等花括号，阶段 3 标出来、阶段 4 填值或删掉，`flowocr.placeholders`），
+原文里有占位的行另带 `jp_tpl`（留着占位的原文：日文输出用它，匹配器拿它从 OCR 原文里读名字）；`text` 照旧删掉占位。
+/6（2026-10-07）：行的 `kind` 只放库里来的类型，这段视频里的处境（没播、没走的分支、变体、重演拷贝、不在字幕带）
+另放 `status`（`STATUSES`；之前直接写进 `kind`、盖掉类型）；`stats.kinds` 按类型数，另加 `stats.statuses`。
 旧剧本不做兼容，`game_align` 见到就让你重跑。
-/4 之内加的**可选**顶层 `terms`（2026-09-26，`term_table`）：文本包有短名词表时才有，读的一方缺了照常工作，所以没升版本。"""
+/4 之内加的**可选**顶层 `terms`（2026-09-26，`term_table`）：文本包有短名词表时才有，读的一方缺了照常工作，所以没升版本。
+/5 之内加的**可选**顶层 `textjoins`（2026-10-05，`used_textjoins`）：星铁剧本行用到的 `{TEXTJOIN#n}` 的候选，同理没升版本。"""
 
 GAMES = {
     # 游戏 -> {loader 要读的表（文本包清单里的 `table`）: 认得的内容契约主版本}。语种按标准码取 `ja` / `zh-Hans`，
@@ -127,39 +141,52 @@ _BUNDLES: dict[str, "gtdbundle.Bundle"] = {}
 TAG_GAME = {"gi": "genshin", "hsr": "starrail", "zzz": "zzz"}
 """视频标签前缀 -> 游戏（`data/index.md` F 节的命名）。鸣潮没有库。"""
 
-NON_BAND_KINDS = {"Choice", "BlackScreen", "Unwalked", "Ambiguous", "OutOfSpan", "Duplicate",
-                  "Loose", "ReminderUI", "Variant", "OffBand"}
-"""不进用途 2 分母的条目类型（**用途 2 = 字幕带**；前两类在屏幕上，是用途 1 的分母）：
+NON_BAND_KINDS = frozenset({"Choice", "BlackScreen", "Loose", "ReminderUI"})
+"""本来就不在字幕带的**类型**（`kind`：库里来的，一行一个，不随视频变；**用途 2 = 字幕带**，前两类在屏幕上，是用途 1 的分母）：
 
 * `Choice`：走选项 UI。原神里**玩家的非独白台词一律是选项按钮**，只有一个选项时也是
   （摆帧确认：gi1 148 s 的 `ナタ人って、見たことないしね。` 在右侧对话按钮上）；
   括号独白 `（…）` 才进字幕带。gi1 实测玩家行被主轨命中 10 条，9 条是括号独白；
   剩下那条 `カチーナ！ムアラニ！` 是例外（非独白却上了字幕带），这条判据会把它排出分母。
 * `BlackScreen`：原神黑屏旁白（屏幕正中），不在字幕带。
-* `Unwalked` / `Ambiguous`：分支没走到 / 判不了（见模块说明）。
-* `OutOfSpan`：单元里没在这段视频里播的那几截——**第一条之前、最后一条之后**没被 obs
-  锚住的行（切片从对话中间开始、玩家中途离开，同 `script_align --span-ref` 的道理），
-  以及中间一长段零锚点、两头锚点隔了几个小时的（`unplayed`）。
-* `Duplicate`：库里同一段对话常有几份拷贝（换条件的重演版本，gi2 的 402513 / 402701
-  共 59 行相同）。后一份里和前面单元重复的行，若 obs 里这段文字只上屏过一次，就不计，
-  而且**连对齐序列都不进**（`sequence`）——只排出分母的话，对齐会去认领后面那份拷贝
-  （gi1 实测 41/49 被命中），原件反被记成漏。
 * `Loose`：绝区零的散条目（`loose_*`：漫画过场、AutoEvent、教程、UI…）。上屏形态不知道
   （漫画气泡、弹窗都不是字幕带），所以只参与检索和对齐——cue 读到它就不算"对不上剧本"——
-  不进分母。例外是摆帧确认在字幕带的 `CN` / `TL` 两类（`LOOSE_BAND_HEADS`），按连号成组、进分母。
+  不进分母。例外是摆帧确认在字幕带的 `CN` / `TL` 两类（`LOOSE_BAND_HEADS`），按连号成组、记 `Talk`、进分母。
 * `ReminderUI`：原神语音字幕（`reminders_*`）里 style 不是 `Normal` 的（`Banner` / `WhiteMessage` /
   `CombatChat`…）。`Normal` 的记 `Reminder`、**进分母**：摆帧 gi1 6678 s 的
   `カチーナ / ありがとう、ムアラニちゃん。` 就在底部字幕带、带名牌，主轨命中 gi1 57/64、gi2 14/20；
   `Banner` 摆帧 gi1 7456 s 在画面上方横幅，gi1 / gi2 主轨命中 0/4、0/8（obs 全读到过），
   `WhiteMessage` 0/4。其余 style 没见过上屏，保守地不进分母。
+
+其余类型（原神的上游角色 `NPC` / `PLAYER`…、`Reminder`、星铁 / 绝区零的 `Talk`）是台词。"""
+
+STATUSES = ("OutOfSpan", "Unwalked", "Ambiguous", "Variant", "Duplicate", "OffBand")
+"""行在**这段视频里的处境**（`status`；没有处境是 None）。有处境的行一律不进分母，类型照旧留在 `kind` 里
+（没播段里的黑屏旁白仍是 `BlackScreen`）。按 `build` 里判的先后排列，单值：几种同时成立时**后判的覆盖先判的**——
+`OutOfSpan` / 分支两种先判（选项不判），再折变体（`Variant`），再判重演拷贝（`Duplicate`，可以盖掉前面任一种），
+最后判 `OffBand`（只判还没有处境、类型也在带内的行）。
+
+* `OutOfSpan`：单元里没在这段视频里播的那几截——**第一条之前、最后一条之后**没被 obs
+  锚住的行（切片从对话中间开始、玩家中途离开，同 `script_align --span-ref` 的道理），
+  以及中间一长段零锚点、两头锚点隔了几个小时的（`unplayed`）。
+* `Unwalked` / `Ambiguous`：分支没走到 / 判不了（见模块说明）。
 * `Variant`：绝区零变体组里代表行以外的那种说法（`fold_variants`）。它参与对齐，被认领时
   **记在代表行上**——一组只算一个分母条目，任一种说法命中就算命中。
-* `OffBand`：上面这些都没排掉、obs 也读到过（唯一查询），但锚住它的框**没有一个**落在字幕带里
-  （`band_of` / `mark_offband`）。上面几类是库的结构判的，这一类是**位置**判的，判得出库里没有结构的：
+* `Duplicate`：库里同一段对话常有几份拷贝（换条件的重演版本，gi2 的 402513 / 402701
+  共 59 行相同）。后一份里和前面单元重复的行，若 obs 里这段文字只上屏过一次，就不计，
+  而且**连对齐序列都不进**（`sequence`）——只排出分母的话，对齐会去认领后面那份拷贝
+  （gi1 实测 41/49 被命中），原件反被记成漏。
+* `OffBand`：类型在带内、没有别的处境、obs 也读到过（唯一查询），但锚住它的框**没有一个**落在字幕带里
+  （`band_of` / `mark_offband`）。类型是库的结构判的，这一类是**位置**判的，判得出库里没有结构的：
   绝区零的选项按钮、居中旁白、头顶气泡（上游没有分支和说话人），原神 / 星铁结构判据漏掉的。
   拿已有的结构判据核过位置判据（2026-09-11 四场整片）：原神 / 星铁的 `Choice` 146/158、75/76、61/67
   落在带外，`BlackScreen` 21/29、6/6，`ReminderUI` 9/9、4/5；主轨命中的行被判出带外的 4 / 0 / 0 / 2 条
   （绝区零居中的选项、原神一条居中的独白，都进了主轨）。没锚点的行没有位置证据，照旧留在分母里。"""
+
+
+def in_band(kind: str, status: str | None) -> bool:
+    """这一行进不进用途 2 的分母（该在字幕带）：类型在带内，而且在这段视频里没有处境。"""
+    return status is None and kind not in NON_BAND_KINDS
 
 
 # ---------------------------------------------------------------- 读库
@@ -202,7 +229,7 @@ def paired(game: str, stem: str):
 @dataclass
 class Line:
     key: str
-    kind: str                    # 本工具的分类（决定进不进分母）
+    kind: str                    # 类型（`NON_BAND_KINDS` 的说明）；这段视频里的处境在输出行的 `status` 上
     role: str                    # 上游的角色 / 载体（原样，用来校准分母）
     speaker: str | None
     raw: str                     # 上游原文（含占位 / 标签）
@@ -266,8 +293,10 @@ def branch_kind(memberships: list[tuple[str, str]], walked: dict[str, set]) -> s
 
 def load_genshin() -> list[Unit]:
     units: dict[int, Unit] = {}
+    pron = pronoun_table("genshin")
+    sx = (lambda t, lang: sexpro(t, pron[lang])) if pron else (lambda t, lang: t)   # noqa: E731
     for q, qc in paired("genshin", "quests"):
-        cn_of = {d["dialog_id"]: d["text"] for d in qc["dialog"]}
+        cn_of = {d["dialog_id"]: sx(d["text"], "zh-Hans") for d in qc["dialog"]}
         spk_of = {d["dialog_id"]: d.get("speaker") for d in qc["dialog"]}
         talks: dict[int, list[dict]] = defaultdict(list)
         for d in q["dialog"]:
@@ -294,7 +323,7 @@ def load_genshin() -> list[Unit]:
                 else:
                     kind = role
                 lines[d["dialog_id"]] = Line(key=f"gi:{d['dialog_id']}", kind=kind, role=role,
-                                             speaker=d.get("speaker"), raw=d["text"] or "",
+                                             speaker=d.get("speaker"), raw=sx(d["text"] or "", "ja"),
                                              cn=cn_of.get(d["dialog_id"]), speaker_cn=spk_of.get(d["dialog_id"]))
             nexts = {i: [n for n in (d.get("next") or []) if n in by] for i, d in by.items()}
             for x, ms in exclusive_members(nexts).items():
@@ -308,7 +337,7 @@ def load_genshin() -> list[Unit]:
             note_value("genshin.reminders.lines[].style", l["style"])
         lines = [Line(key=f"gi:rem:{l['reminder_id']}",
                       kind="Reminder" if l["style"] == "Normal" else "ReminderUI",
-                      role=l["style"] or "?", speaker=l["speaker"], raw=l["text"], cn=c["text"],
+                      role=l["style"] or "?", speaker=l["speaker"], raw=sx(l["text"], "ja"), cn=sx(c["text"], "zh-Hans"),
                       speaker_cn=c.get("speaker"))
                  for l, c in zip(r["lines"], rc["lines"], strict=True) if l["text"]]
         if lines:
@@ -496,37 +525,101 @@ LOADERS = {"genshin": load_genshin, "starrail": load_starrail, "zzz": load_zzz}
 # ---------------------------------------------------------------- 清洗与归一
 
 GENDER_RE = re.compile(r"\{([MF])#([^{}]*)\}")
-RUBY_RE = re.compile(r"\{RUBY#\[[^\]]*\][^{}]*\}")
+RUBY_RE = re.compile(r"\{RUBY#\[[^\]]*\][^{}]*\}|\{RUBY_[BE]#(?:[^{}]|\{[^{}]*\})*\}|<rt>[^<>]*</rt>")
+"""注音：原神 `{RUBY#[S]注音}`，星铁 `{RUBY_B#注音}正文{RUBY_E#}`（删掉两个花括号正好剩正文），绝区零 `<ruby><rt>注音</rt>正文</ruby>`
+（删掉 `<rt>…</rt>`，剩下的两个标签照别的标签删）。星铁的注音里可以嵌一个占位（`{RUBY_B#{TEXTJOIN#254}}`），注音整个删，所以允许嵌一层花括号。"""
+GI_RUBY_RE = re.compile(r"\{RUBY#\[([DS])\]([^{}]*)\}")
+"""原神的注音标的是读音的**水平中心**、不是范围（2026-10-23 查清，game-style 计划）：`[D]` 中心在标记所在的字缝，`[S]` 中心是标记前面那个字。
+换成中心相同的最小范围：`X{RUBY#[D]读音}Y` → X、Y 两个字，`X{RUBY#[S]读音}` → X（`_gi_ruby`）。"""
+SR_RUBY_RE = re.compile(r"\{RUBY_B#((?:[^{}]|\{[^{}]*\})*)\}(.*?)\{RUBY_E#\}", re.S)
+ZZZ_RUBY_RE = re.compile(r"<ruby>\s*<rt>([^<>]*)</rt>(.*?)</ruby>", re.S)
+HIDDEN_RE = re.compile(r"<[^<>]*>|\{(?:[^{}]|\{[^{}]*\})*\}")
+"""不是看得见的字的：标签和花括号（占位、排版写法）。"""
 LAYOUT_RE = re.compile(r"\{LAYOUT_([A-Z]+)#([^{}]*)\}")
 PC_LAYOUTS = ("KEYBOARD", "PC")
 """绝区零教程提示按平台给几种写法；这批直播都是 PC，留键盘那一种（没有就留 FALLBACK）。"""
-PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
-"""性别写法 / 注音 / 平台写法先处理掉之后，剩下的花括号全删：多数是玩家相关的占位
-（`{NICKNAME}` / `{REALNAME[…]}` / `{PLAYERAVATAR#SEXPRO[…]}`），星铁的
-`{RUBY_B#注音}正文{RUBY_E#}` 删掉两个花括号正好剩正文。**会丢字的**是少数运行时取值：
-原神 `{ABYSSWAR#…}`（21 处以内）、星铁 `{TEXTJOIN#…}`（142）、绝区零 `{NPC_…}`（25）。"""
+PLACEHOLDER_RE = PH.PLACEHOLDER_RE
+"""性别写法 / 注音 / 平台写法 / 不断行空格 / 图标字先处理掉之后，剩下的花括号都是占位：多数是玩家相关的
+（`{NICKNAME}` / `{REALNAME[…]}`；`{PLAYERAVATAR#SEXPRO[…]}` 只在包里没有称谓表时还在），少数是运行时取值：
+原神 `{ABYSSWAR#…}`（21 处以内）、星铁 `{TEXTJOIN#…}`（142）、绝区零 `{NPC_…}`（25）。匹配用的原文里全删，译文和原文模板里留着。"""
 TAG_RE = re.compile(r"<[^<>]*>")
-
-
+NBSP_RE = re.compile(r"\{NON_BREAK_SPACE\}")
+"""排版写法，不是占位：不断行的空格（原神日文 30 处，`近くて{NON_BREAK_SPACE}遠い`）。"""
+ICON_RE = re.compile(r"\{REGEX#UNICODE\[[0-9A-Fa-f]+\]\}")
+"""排版写法，不是占位：嵌在台词里的图标字（原神 7.1.0 中、日文各 21 处，`{REGEX#UNICODE[E001]}`），游戏字体里的私用区字形，字幕里画不出来，删掉。"""
 def _layout(t: str) -> str:
     keep = next((p for p in PC_LAYOUTS if f"{{LAYOUT_{p}#" in t), "FALLBACK")
     return LAYOUT_RE.sub(lambda m: m.group(2) if m.group(1) == keep else "", t)
 
 
-def clean(raw: str, gender: str) -> str:
-    """上游原文 -> 屏幕上会出现的文字（`\\N` 表示条内换行）。"""
+def _gi_ruby(t: str) -> str:
+    """原神的注音（`GI_RUBY_RE`）换成 Unity 的 `<ruby="读音">正文</ruby>`：`[D]` 包住标记两边各一个字，`[S]` 包住前面那个字。
+    两边的字要看得见：不是空白、不在花括号里（占位、排版写法），中间隔着的标签跳过（`<b>漢</b>{RUBY#[D]…}字` 照样是「漢字」，
+    交叉的样式由 `from_unity` 拆开），已经归了前一处注音的不能再用。`[D]` 右边没有字（句尾）当 `[S]`、左边没有字只包右边那个，
+    `[S]` 左边没有字（句首）这处注音丢掉。"""
+    ms = list(GI_RUBY_RE.finditer(t))
+    if not ms:
+        return t
+    s, at, pos = "", [], 0                                     # 先把标记全拿掉，记下每个标记在剩下的串里的位置
+    for m in ms:
+        s += t[pos:m.start()]
+        at.append((len(s), m.group(1), m.group(2)))
+        pos = m.end()
+    s += t[pos:]
+    tag = [0] * len(s)                                         # 1 = 在标签里（跳过），2 = 在花括号里（不是字）
+    for m in HIDDEN_RE.finditer(s):
+        tag[m.start():m.end()] = [1 if s[m.start()] == "<" else 2] * (m.end() - m.start())
+    used: set[int] = set()
+
+    def char(i: int, step: int) -> int | None:                 # 从 i 往 step 方向找第一个不在标签里的字；看不见、用过了是 None
+        while 0 <= i < len(s) and tag[i] == 1:
+            i += step
+        return i if 0 <= i < len(s) and not tag[i] and not s[i].isspace() and i not in used else None
+    opens: dict[int, list[str]] = defaultdict(list)
+    closes: dict[int, list[str]] = defaultdict(list)
+    for i, kind, reading in at:
+        x, y = char(i - 1, -1), char(i, 1) if kind == "D" else None
+        span = (x, y) if x is not None and y is not None else (x, x) if x is not None else (y, y) if kind == "D" and y is not None else None
+        if span is None:
+            continue
+        used.update(range(span[0], span[1] + 1))
+        opens[span[0]].append(richtext.unity_ruby(reading))
+        closes[span[1]].append("</ruby>")
+    return "".join("".join(opens.get(i, ())) + c + "".join(closes.get(i, ())) for i, c in enumerate(s))
+
+
+def ruby_rich(t: str) -> str:
+    """各游戏的注音 -> Unity 的 `<ruby="读音">正文</ruby>`（`richtext.unity_ruby`，`richtext.from_unity` 再收成规范写法）：
+    原神按中心点换成最小范围（`_gi_ruby`），星铁 `{RUBY_B#读音}正文{RUBY_E#}`（读音可以是占位 `{RUBY_B#{TEXTJOIN#254}}`，留着），
+    绝区零 `<ruby><rt>读音</rt>正文</ruby>`（绝区零另有 Unity 写法的 `<ruby=读音>`，本来就认得）。删掉标签以后和 `RUBY_RE` 删掉注音的结果相同。"""
+    t = _gi_ruby(t)
+    t = SR_RUBY_RE.sub(lambda m: richtext.unity_ruby(m.group(1)) + m.group(2) + "</ruby>", t)
+    return ZZZ_RUBY_RE.sub(lambda m: richtext.unity_ruby(m.group(1)) + m.group(2) + "</ruby>", t)
+
+
+def clean(raw: str, gender: str, keep: bool = False, rich: bool = False) -> str:
+    """上游原文 -> 屏幕上会出现的文字（`\\N` 表示条内换行）。`keep`：占位原样留着（译文和原文模板用：阶段 3 标出来、
+    阶段 4 填值或删掉，`flowocr.placeholders`）；用来匹配的原文不留。`rich`：同 `keep`，另把认得的样式和注音按规范写法留在里面
+    （`ruby_rich`、`richtext.from_unity`，投回 `keep` 的结果上：两份只差标签）；投不上就是不带样式的那份。"""
     t = raw.lstrip("#")
     t = t.replace("\\n", "\n")
     t = GENDER_RE.sub(lambda m: m.group(2) if m.group(1) == gender else "", t)
+    if rich:
+        t = ruby_rich(t)
     t = RUBY_RE.sub("", t)
     t = _layout(t)
-    t = PLACEHOLDER_RE.sub("", t)
-    t = TAG_RE.sub("", t)
-    return "\\N".join(x.strip() for x in t.split("\n") if x.strip())
+    t = NBSP_RE.sub(" ", t)
+    t = ICON_RE.sub("", t)
+    styled = t
+    t = TAG_RE.sub("", t)                   # 先删标签：`<color>{NICKNAME}</color>，…` 删完标签占位才在行首
+    if not (keep or rich):
+        t = PH.drop(t)
+    t = "\\N".join(x.strip() for x in t.split("\n") if x.strip())
+    if rich and "<" in styled:
+        return richtext.project(richtext.from_unity(styled), t) or t
+    return t
 
 
-SMALL_KANA = str.maketrans("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ",
-                           "あいうえおつやゆよわアイウエオツヤユヨワカケ")
 NONWORD = re.compile(r"[\W_]+")
 
 
@@ -534,8 +627,95 @@ def cnorm(t: str) -> str:
     """检索用的**内容**归一：NFKC、小书写假名并成大写、去掉一切标点空白。
     OCR 最常见的差异是省略号 / 小书写假名（script-corpus 报告文本质量那节），
     检索这一步不该被它们挡住；量文本质量是 game_align 的事，不在这里。"""
-    t = unicodedata.normalize("NFKC", t.replace("\\N", ""))
-    return NONWORD.sub("", t.translate(SMALL_KANA))
+    return NONWORD.sub("", textfold.fold(t.replace("\\N", "")))
+
+
+# ---------------------------------------------------------------- 原神的称谓表（可选）
+
+PRONOUNS_TABLE = "pronouns"
+"""文本包里原神的称谓表（game-text-data 的 `pronouns_*`：`INFO_MALE_PRONOUN_HE` 这类键 -> 文本，日中逐行 id 相同）。
+**可选**：旧包没有它照读，称谓占位就留成占位（阶段 4 删掉）。"""
+PRONOUNS_CONTRACT = 1
+SEXPRO_RE = re.compile(r"\{(PLAYERAVATAR|MATEAVATAR)#SEXPRO\[([^|\[\]{}]+)\|([^|\[\]{}]+)\]\}")
+"""原神按性别取的称谓：`{PLAYERAVATAR#SEXPRO[甲|乙]}` 按旅行者的性别、`{MATEAVATAR#SEXPRO[…]}` 按另一位双子的性别选键——
+**第一个键是那个角色为男时用的，第二个为女时**，和键名里的 MALE / FEMALE 无关（`我的{PLAYERAVATAR#SEXPRO[INFO_MALE_PRONOUN_SISTER|
+INFO_FEMALE_PRONOUN_BROTHER]}` 是男主说「妹妹」；7.1.0 中文剧本里键对按位置读全部说得通）。再查称谓表（7.1.0 任务对话里中文 775 处、日文 982 处；日文另有按性别变的句尾 `INFO_*_PLAYER_END0x`，同样处理）。"""
+_PRON: dict[str, dict | None] = {}
+
+
+def pronoun_table(game: str) -> dict[str, dict[str, str]] | None:
+    """`{语种: {键: 文本}}`（`ja` / `zh-Hans`）；包里没有这张表是 None。"""
+    if game not in _PRON:
+        bd = bundle_of(game)
+        if not bd.has([PRONOUNS_TABLE]):
+            _PRON[game] = None
+        else:
+            bd.require({PRONOUNS_TABLE: PRONOUNS_CONTRACT})
+            ja, zh = {}, {}
+            for a, b in paired(game, PRONOUNS_TABLE):
+                if a["text"]:
+                    ja[a["id"]] = a["text"]
+                if b["text"]:
+                    zh[b["id"]] = b["text"]
+            _PRON[game] = {"ja": ja, "zh-Hans": zh}
+        if _PRON[game] is None:
+            print(f"  称谓表：文本包里没有（旧包），按性别取的称谓留成占位、出字幕时删掉；换 game-text-data 带 {PRONOUNS_TABLE}_* 的包", flush=True)
+    return _PRON[game]
+
+
+def sexpro(t: str | None, table: dict[str, str]) -> str | None:
+    """称谓占位改写成性别写法 `{M#…}{F#…}`（`M` / `F` 是旅行者的性别），之后和别的性别写法一起投票、二选一（`clean`）。
+    第一个键归男、第二个归女（`SEXPRO_RE`）；`MATEAVATAR` 是另一位双子，旅行者是男的时它是女的，所以对调。查不到键的原样留着（当占位）。"""
+    if not t or "SEXPRO" not in t:
+        return t
+
+    def one(m: re.Match) -> str:
+        male, female = table.get(m.group(2)), table.get(m.group(3))
+        if male is None or female is None:
+            return m.group(0)
+        if m.group(1) == "MATEAVATAR":
+            male, female = female, male
+        return f"{{M#{male}}}{{F#{female}}}"
+    return SEXPRO_RE.sub(one, t)
+
+
+# ---------------------------------------------------------------- 星铁玩家起名的占位（可选）
+
+TEXTJOINS_TABLE = "textjoins"
+"""文本包里星铁的 `{TEXTJOIN#n}` 候选表（game-text-data 的 `textjoins_*`：n -> 默认项下标 + 候选，日中逐行 id 相同）。
+**可选**：旧包没有它照读，剧本里就没有 `textjoins`，这类占位没有候选、匹配器不猜（阶段 4 删掉）。"""
+TEXTJOINS_CONTRACT = 1
+TEXTJOIN_RE = re.compile(r"\{TEXTJOIN#(\d+)\}")
+
+
+def textjoin_table(game: str, gender: str) -> dict[int, dict] | None:
+    """`{n: {"default": 下标或 None, "jp": [候选…], "cn": [候选…]}}`（候选和台词一样 `clean`：性别写法按投出的性别选、去掉注音和富文本标记、
+    占位留着——n=22 的默认项就是 `{NICKNAME}`，匹配器换成玩家名）；包里没有这张表是 None。"""
+    bd = bundle_of(game)
+    if not bd.has([TEXTJOINS_TABLE]):
+        return None
+    bd.require({TEXTJOINS_TABLE: TEXTJOINS_CONTRACT})
+    out = {}
+    for a, b in paired(game, TEXTJOINS_TABLE):
+        out[a["id"]] = {"default": a["default"], "jp": [clean(t, gender, keep=True) or None if t else None for t in a["items"]],
+                        "cn": [clean(t, gender, keep=True) or None if t else None for t in b["items"]]}
+    return out
+
+
+def used_textjoins(game: str, out_units: list[dict], gender: str) -> dict[str, dict] | None:
+    """圈出的剧本行（译文 / 原文模板）里用到的 `{TEXTJOIN#n}` 的候选，写进剧本的 `textjoins`（匹配器按视频认是哪个）；
+    没用到或包里没有候选表是 None。"""
+    used = sorted({int(n) for u in out_units for ln in u["lines"] for k in ("cn", "jp_tpl")
+                   for n in TEXTJOIN_RE.findall(ln.get(k) or "")})
+    if not used:
+        return None
+    tab = textjoin_table(game, gender)
+    if tab is None:
+        print(f"  玩家起名的占位：剧本用到 {len(used)} 个 {{TEXTJOIN#n}}，文本包里没有候选表（旧包），留成占位、出字幕时删掉", flush=True)
+        return None
+    out = {str(n): tab[n] for n in used if n in tab}
+    print(f"  玩家起名的占位：剧本用到 {len(used)} 个 {{TEXTJOIN#n}}，候选表里查到 {len(out)} 个", flush=True)
+    return out or None
 
 
 # ---------------------------------------------------------------- 短名词表（可选）
@@ -749,11 +929,11 @@ def mark_duplicates(out_units: list[dict], share: float, span: float) -> int:
     for u in out_units:
         for ln in u["lines"]:
             if ln["key"] in node_keys:
-                ln["kind"] = "Duplicate"
+                ln["status"] = "Duplicate"
                 n += 1
             node_keys.add(ln["key"])
     for u in out_units:
-        band = [ln for ln in u["lines"] if ln["kind"] not in NON_BAND_KINDS]
+        band = [ln for ln in u["lines"] if in_band(ln["kind"], ln["status"])]
         texts = [cnorm(ln["text"]) for ln in band]
         # "是不是拷贝"只按 ≥3 字的行判（`うん` 这种短句哪个单元都有，拿它投票会误判）；
         # 判定是拷贝之后，短行也照样按"前面出现过"标——同一份拷贝里的短句同样是重复的
@@ -761,15 +941,15 @@ def mark_duplicates(out_units: list[dict], share: float, span: float) -> int:
         if long and sum(k in seen for k in long) / len(long) >= share:
             for ln, k in zip(band, texts):
                 if k in seen and not shown_twice(ln["anchor"], span):
-                    ln["kind"] = "Duplicate"
+                    ln["status"] = "Duplicate"
                     n += 1
         seen.update(k for k in texts if k)
     return n
 
 
 def fold_variants(groups: list[list[dict]]) -> int:
-    """每个变体组（输出行 dict 的列表，已去掉 Choice / OutOfSpan）留**一个**代表行进分母，
-    其余记 `Variant`、带 `variant_of`（代表行的 key）；返回记了几行。
+    """每个变体组（输出行 dict 的列表，已去掉 Choice 和没播的）留**一个**代表行进分母，
+    其余处境记 `Variant`、带 `variant_of`（代表行的 key）；返回记了几行。
 
     代表行挑"被唯一查询锚住的 > 被锚住的 > 组里第一个"——只影响报表里显示哪一种写法，
     不影响命中：`game_align` 那边任一种说法被认领都记在代表行上。"""
@@ -781,7 +961,7 @@ def fold_variants(groups: list[list[dict]]) -> int:
                                           not d["anchor"], members.index(d)))
         for d in members:
             if d is not rep:
-                d["kind"], d["variant_of"] = "Variant", rep["key"]
+                d["status"], d["variant_of"] = "Variant", rep["key"]
                 n += 1
     return n
 
@@ -839,12 +1019,12 @@ def mark_offband(out_units: list[dict]) -> int:
             if ln.get("variant_of"):
                 members[ln["variant_of"]].append(ln)
         for ln in u["lines"]:
-            if ln["kind"] in NON_BAND_KINDS:
+            if not in_band(ln["kind"], ln["status"]):
                 continue
             seen = [m["anchor"]["in_band"] for m in (ln, *members[ln["key"]])
                     if m["anchor"] and m["anchor"]["in_band"] is not None]
             if seen and not any(seen):
-                ln["kind"] = "OffBand"
+                ln["status"] = "OffBand"
                 n += 1
     return n
 
@@ -894,7 +1074,7 @@ def sequence(out_units: list[dict], back: float, fwd: float) -> list[list]:
         eps = [ln["anchor"]["episodes"] if ln["anchor"] else None for ln in u["lines"]]
         on = [li for li, e in enumerate(eps) if e]
         for li, ln in enumerate(u["lines"]):
-            if ln["kind"] == "Duplicate":
+            if ln["status"] == "Duplicate":
                 continue
             if eps[li]:
                 src, win = eps[li], [[s - fwd, e + fwd] for s, e in eps[li]]
@@ -1081,18 +1261,21 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
         lines = []
         vgroups: dict[str, list[dict]] = defaultdict(list)
         for li, ln in enumerate(u.lines):
-            kind = ln.kind
-            if kind != "Choice" and li in out_span:
-                kind = "OutOfSpan"
-            elif kind != "Choice" and ln.memberships:
-                kind = branch_kind(ln.memberships, walked) or kind
+            status = None
+            if ln.kind != "Choice" and li in out_span:
+                status = "OutOfSpan"
+            elif ln.kind != "Choice" and ln.memberships:
+                status = branch_kind(ln.memberships, walked)
             text = clean(ln.raw, gender)
             if not text:
                 continue
             a = anchors.get((ui, li))
-            lines.append({"key": ln.key, "kind": kind, "role": ln.role, "speaker": ln.speaker,
+            lines.append({"key": ln.key, "kind": ln.kind, "status": status, "role": ln.role, "speaker": ln.speaker,
                           "speaker_cn": ln.speaker_cn,
-                          "text": text, "cn": clean(ln.cn or "", gender) or None,
+                          "text": text, "cn": (cn := clean(ln.cn or "", gender, keep=True) or None),
+                          **({"jp_tpl": tpl} if (tpl := clean(ln.raw, gender, keep=True)) != text else {}),
+                          **({"cn_rich": r} if cn and (r := clean(ln.cn, gender, rich=True)) != cn else {}),
+                          **({"jp_rich": r} if (r := clean(ln.raw, gender, rich=True)) != tpl else {}),
                           "anchor": None if a is None else
                           {"t0": a[0][0][0], "t1": a[0][-1][1], "queries": a[1],
                            "unique": a[2] > 0,
@@ -1100,7 +1283,7 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
                            "in_band": None if not (a[3] and band) else
                            any(band[0] <= y <= band[1] for y in a[3]),
                            "episodes": [[round(s, 2), round(e, 2)] for s, e in a[0]]}})
-            if ln.variant and kind not in ("Choice", "OutOfSpan"):
+            if ln.variant and ln.kind != "Choice" and status != "OutOfSpan":
                 vgroups[ln.variant].append(lines[-1])
         n_variant += fold_variants(list(vgroups.values()))
         out_units.append({"uid": u.uid, "title": u.title,
@@ -1108,19 +1291,21 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
     n_dup = mark_duplicates(out_units, dup_share, dup_span)
     for u in out_units:
         # 代表行被判成重演拷贝时，同组的另一种说法也是拷贝——否则它指向一条不在对齐序列里的行
-        dup = {ln["key"] for ln in u["lines"] if ln["kind"] == "Duplicate"}
+        dup = {ln["key"] for ln in u["lines"] if ln["status"] == "Duplicate"}
         for ln in u["lines"]:
             if ln.get("variant_of") in dup:
-                ln["kind"] = "Duplicate"
+                ln["status"] = "Duplicate"
                 n_dup += 1
     n_off = mark_offband(out_units)
     kinds = Counter(ln["kind"] for u in out_units for ln in u["lines"])
+    statuses = Counter(ln["status"] for u in out_units for ln in u["lines"] if ln["status"])
     if n_variant:
         print(f"  变体组：{n_variant} 行记成 Variant（同一句话的另一种说法，一组只算一个分母条目）")
     print(f"  重演拷贝：{n_dup} 行记成 Duplicate（和前面单元重复的内容行占本单元 ≥{dup_share:.0%}，"
           f"且 obs 里只上屏过一次）")
     print(f"  不在字幕带：{n_off} 行记成 OffBand（锚住它的框没有一个落在字幕带里）")
     print("  圈出的剧本按类型：" + "  ".join(f"{k} {v}" for k, v in kinds.most_common()))
+    print("  其中有处境的（不进分母）：" + "  ".join(f"{k} {v}" for k, v in statuses.most_common()))
     # 整库的说话人 日文 -> 中文（同名取出现最多的写法）：叠加 ASS 名牌层的译文从这里取。只看圈中的剧本行不够——
     # 原神任务对话的剧本行多半没有说话人，gi-s2 的 4 个名牌只看剧本行一个都翻不出，整库查得到 3 个（2026-09-14）
     spk: dict[str, Counter] = defaultdict(Counter)
@@ -1133,16 +1318,18 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
     print("  短名词表：" + (f"obs 里 {tstat['obs_keys']:,} 个候选键、查到 {tstat['keys']:,} 个，"
                            f"其中对多个中文的 {tstat['ambiguous']}（多数派 <60% 的 {tstat['majority_below_60']}）"
                            if tstat["table"] else "文本包里没有（旧包），名牌层只查说话人表"))
+    textjoins = used_textjoins(game, out_units, gender) if game in GAMES else None
     return {"units": out_units, "sequence": sequence(out_units, claim_back, claim_fwd),
             "speakers": {k: c.most_common(1)[0][0] for k, c in sorted(spk.items())},
             **({"terms": terms} if terms is not None else {}),
+            **({"textjoins": textjoins} if textjoins else {}),
             "gender": gender, "gender_votes": dict(votes),
             "stats": {"db_units": len(units), "db_lines": n_lines,
                       "obs_texts": len(ot), "queries": len(qs), "queries_hit": n_hit,
                       "queries_ambiguous": n_ambig, "units_picked": len(picked),
                       "short_anchors": n_short, "terms": tstat,
                       "band": [round(band[0], 3), round(band[1], 3)] if band else None,
-                      "kinds": dict(kinds)}}
+                      "kinds": dict(kinds), "statuses": dict(statuses)}}
 
 
 def main() -> int:

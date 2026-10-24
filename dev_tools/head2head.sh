@@ -126,6 +126,7 @@ fi
 # **换喂法**（2026-09-26）：`FEED=nonoise` 把全部非噪音区域轨按时间交错投影成一份 SRT 喂参照匹配器（`dev_tools/feed_srt.py`，
 # 和 `scriptmatch --feed nonoise` 同一个投影），量的就是产物实际的喂法；不给就是主轨（原口径）。同样要给 SUFFIX
 FEED=${FEED:-}
+MISS=${MISS:-1}             # 0 = 跳过第 4 步（naninovel 匹配器 + 疑似漏字幕检测器，给 arm_table 的臂间表）；这条臂已有的检测结果也会删（tracks 可能已重建，旧的证明不了自己还新鲜）
 if [ -n "$FEED" ] && [ -z "$SUFFIX" ]; then
   echo "**换了 FEED 却没给 SUFFIX**——两种喂法会写进同一份匹配产物。停。"
   exit 2
@@ -141,6 +142,7 @@ for N in "$@"; do
   [ -s "$OBS" ] || { echo "[skip] $OBS 不存在"; continue; }
   LOG=tmp/h2h/f${N}${SUFFIX}
   OUTDIR=out/yuka-f${N}${SUFFIX}
+  rm -f "${LOG}-miss.json"   # 第 4 步的产物：这一部中途失败、`continue` 掉的话，别留着上一次的给 arm_table 读
   echo "=================  input${N}  $(date '+%H:%M:%S')  ================="
 
   # ---- 1. 聚类 ----
@@ -213,7 +215,7 @@ import match_ref; match_ref.main('${TAG}', 'dialogue')" ) > "${LOG}-match.log" 2
     # 退出码根本没人看；随后只检查"JSON 非空"，**上一次的旧 JSON 会顶替本次成绩**。
     rm -f "${LOG}-${side}.json"
     "$PY" -m flowocr.analyze.script_align --script "$SCRIPT_RAW" --text "$SCRIPT_JP" \
-      --subs "$SUBS" --span-ref "${GT}/lower${N}_jp.ass" --raw-ocr "$RAW" \
+      --subs "$SUBS" --span-ref "${GT}/lower${N}_jp.ass" --raw-ocr "$RAW" --fill-ocr "$RAW" \
       --out "${LOG}-${side}.json" 2>&1 | tee "${LOG}-${side}.log" | tail -25
     rc=${PIPESTATUS[0]}
     [ "$rc" = 0 ] || { echo "**[fail] script_align input${N}/${side} 退出码 $rc**";
@@ -221,9 +223,27 @@ import match_ref; match_ref.main('${TAG}', 'dialogue')" ) > "${LOG}-match.log" 2
     [ -s "${LOG}-${side}.json" ] \
       || { echo "[fail] script_align input${N}/${side} 没产出 JSON"; FAILED=$((FAILED+1)); }
   done
+
+  # ---- 4. 臂间的另一把尺：naninovel 匹配器 + 疑似漏字幕检测器（只量我们这侧）----
+  # 基线是随素材发来的 ASS、过不了 naninovel，头对头（第 3 步）因此照旧走 match_ref；这一步只给臂间比较用，
+  # `arm_table` 读 `${LOG}-miss.json` 出覆盖几栏。`MISS=0` 跳过（只想重出头对头时）。
+  # naninovel 只喂主轨：FEED / MERGE_NAMEPLATE 的臂量出来和同 BUILD_ARGS 的普通臂一模一样，表里会印成"差 0"，所以跳过、不出产物。
+  # 每次都重跑（两条臂并跑五部实测约 10 分钟）：只看"tracks 比产物新"会漏掉匹配器和检测器自己的代码改动。
+  if [ "$MISS" = 1 ] && [ -z "$FEED" ] && [ "${MERGE_NAMEPLATE:-0}" != 1 ]; then
+    MATCHED="$OUTDIR/f${N}-matched.json"
+    rm -f "$MATCHED"
+    "$PY" -m flowocr.analyze.match "$OUTDIR/f${N}-tracks.json" --matcher naninovel --ctx script="$SCRIPT_RAW" \
+      --out "$MATCHED" > "${LOG}-nani.log" 2>&1 \
+      || { echo "[fail] naninovel input${N}（只影响臂间表；看 ${LOG}-nani.log）"; FAILED=$((FAILED+1)); continue; }
+    # 退出码非零也可能是检测器的不变量没过：产物照写，但这条臂的数不能拿来比
+    "$PY" "$CODE/dev_tools/miss_detect.py" "$MATCHED" --span-ref "${GT}/lower${N}_jp.ass" --no-pack --show 0 \
+      --out "${LOG}-miss.json" > "${LOG}-miss.log" 2>&1 \
+      || { echo "**[fail] miss_detect input${N}**（只影响臂间表，头对头照常；看 ${LOG}-miss.log）"; FAILED=$((FAILED+1)); }
+    grep -E '^  合计' "${LOG}-miss.log" || true
+  fi
 done
 echo "=================  全部完成 $(date '+%H:%M:%S')  ================="
 # **失败要非零退出。** 上一版全片失败也返回 0，而"一半成功一半失败最容易看漏"
 # 这件事这个脚本自己就踩过一次（见上面 `pwd -W` 那段注释）。
 [ "$FAILED" = 0 ] || { echo "**$FAILED 步失败**——上面的 [fail] 行"; exit 1; }
-echo "报数：python dev_tools/h2h_report.py tmp/h2h"
+echo "报数：python dev_tools/h2h_report.py tmp/h2h（对基线）；python dev_tools/arm_table.py tmp/h2h --arms <臂…>（臂间）"

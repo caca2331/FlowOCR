@@ -4,7 +4,7 @@ project-structure 计划："少量入口，直接可改"——普通 Python 模�
 **点分模块名**或**文件路径**加载；内置实现和用户实现走同一条路，没有注册商店、没有基类、没有配置 DSL。
 
     from flowocr import extensions
-    preset = extensions.load("srt_main", "preset")             # 内置：flowocr.output.presets.srt_main
+    preset = extensions.load("default_srt", "preset")          # 内置：flowocr.output.presets.default_srt
     matcher = extensions.load("gametext", "matcher")            # 内置：flowocr.analyze.matchers.gametext
     mine = extensions.load("D:/mine/my_preset.py", "preset")    # 文件
     theirs = extensions.load("some_pkg.their_matcher", "matcher")   # 已安装的模块
@@ -18,6 +18,7 @@ project-structure 计划："少量入口，直接可改"——普通 Python 模�
 * 匹配器：`cluster_patch(context: dict, options: dict | None) -> dict`（可选；返回 build_tracks 的参数覆盖，
   键是参数名如 `region_time_gate`，由默认聚类器应用）、`match(document: dict, context: dict, options: dict | None) -> dict`
   （输入阶段 2 的分析产物 `*-tracks.json` 的 dict，返回带匹配结果的产物 `*-matched.json` 的 dict）；
+  可选的 `PRESET = "<预设名>"` / `PRESET_OPTS = {…}`：这个匹配器的产物最适合哪个输出预设（`recommendation`）；
 * 输出预设：`render(document: dict, output_dir: Path | str, options: dict | None) -> list[Path]`
   （输入分析产物，写文件，返回写了哪些）；
 * 扩展效果：`NAME`（它在字幕稿 Effect 字段 `fo:…` 里的参数名）+ `elements(line, value)` / `tags(line, value, element)` 至少一个
@@ -33,7 +34,7 @@ from pathlib import Path
 from types import ModuleType
 
 BUILTIN = {"matcher": "flowocr.analyze.matchers", "preset": "flowocr.output.presets", "fx": "flowocr.typeset.fx"}
-"""内置实现所在的包：`load("srt_main", "preset")` 就是 `flowocr.output.presets.srt_main`。"""
+"""内置实现所在的包：`load("default_srt", "preset")` 就是 `flowocr.output.presets.default_srt`。"""
 REQUIRED = {"matcher": ("match",), "preset": ("render",), "fx": ()}
 OPTIONAL = {"matcher": ("cluster_patch",), "preset": (), "fx": ("elements", "tags")}
 """`fx`（阶段 4 的扩展效果）两个挂点至少要有一个，另要 `NAME`——`flowocr.typeset.core.load_fx` 核。"""
@@ -42,6 +43,29 @@ OPTIONAL = {"matcher": ("cluster_patch",), "preset": (), "fx": ("elements", "tag
 def builtin_names(kind: str) -> list[str]:
     pkg = importlib.import_module(BUILTIN[kind])
     return sorted(m.name for m in pkgutil.iter_modules(pkg.__path__) if not m.name.startswith("_"))
+
+
+def recommendation(module: ModuleType, spec: str) -> dict | None:
+    """匹配器声明的推荐预设：`{"preset": …, "opts": {…}, "by": <匹配器>}`，没声明是 None。
+    `flowocr.analyze.match` 把它抄进产物的 `provenance.recommend`，`flowocr.output.render` 不给 `--preset` 时照用——
+    推荐跟着产物走，渲染时不必再找得到匹配器模块（用户的匹配器可能是随手一个 `.py`；matcher-next 计划方案 A，owner 2026-10-06）。"""
+    from flowocr.provenance import portable
+    preset = getattr(module, "PRESET", None)
+    if not preset:
+        return None
+    opts = getattr(module, "PRESET_OPTS", None) or {}
+    preset = str(preset)
+    if preset.endswith(".py"):
+        # 相对的 .py 按**匹配器文件所在目录**解析（预设放在匹配器旁边），先定成绝对路径再记：
+        # 不然渲染时按当时的 cwd 找，换个目录就加载不到、或加载到同名的另一份（二次验收 2026-10-06）
+        p = Path(preset)
+        if not p.is_absolute():
+            p = Path(getattr(module, "__file__", "") or ".").resolve().parent / p
+        preset = str(p.resolve())
+    if spec.endswith(".py"):
+        spec = str(Path(spec).resolve())
+    # 路径过 `portable()`：产物会被分享，用户匹配器 / 预设的 .py 路径别带出本机目录与用户名；`render` 用时过 `local()`
+    return {"preset": portable(preset), "opts": {str(k): str(v) for k, v in dict(opts).items()}, "by": portable(spec)}
 
 
 def load(spec: str, kind: str) -> ModuleType:

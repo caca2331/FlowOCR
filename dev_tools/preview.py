@@ -14,6 +14,8 @@
 - **产物**：`*-tracks.json` / `*-matched.json` 走 `flowocr.output.render` 同一套预设（`--preset`、`--opt` 同它）；
   也可以直接给一份 `.ass`（原片时间轴）。
 - **视频**默认从产物的 provenance 找（matched -> 它的 tracks -> tracks 记的 `video`）；`--video` 可改。
+- **底板取色**（叠加预设、`plate_color` 开着时）：先不取色出整片 ASS、定时间窗，再只给窗里的行取色（`--video` 也交给它）；
+  窗外的底板留近黑，预览用不到。
 - **回抠**：建轨默认（`--refine auto`）已用 obs 证据结算回抠。没回抠的 tracks（`--refine off`、obs 没证据）只有采样级的打字机判定，
   一行 1 秒内打完的素材（鸣潮、yuka）不会逐字显出，这时会提示。
 - **时间窗**：`--start auto`（默认）挑 ASS 事件开始得最多的 `--duration` 秒；`--duration 0` 是从 `--start` 到片尾。
@@ -23,7 +25,7 @@
   分开截的音轨常常和视频不同起点，**给之前先量**（在音轨里定位一段精确截取的音频），别猜。
 - **坑**：`-ss` 放在 `-i` 前面会把时间轴归零，`subtitles` 滤镜就画成 0 秒那一刻的字（每一帧看着都正常）。
   烧录用 `-copyts` 保留原时间轴烧字，烧完再把视频、音频的时间轴归零；字幕轨则先把 ASS 平移到片段时间轴。
-- 只用 CPU（libx264），不占 GPU。
+- 压制只用 CPU（libx264）；底板取色解码有 N 卡时走 NVDEC。
 """
 from __future__ import annotations
 
@@ -39,6 +41,8 @@ from pathlib import Path
 from flowocr import extensions
 from flowocr.artifacts import matchedio, tracksio
 from flowocr.output import render
+from flowocr.output.presets import _overlay
+from flowocr.typeset import core
 from flowocr.provenance import local
 
 ASS_TIME = re.compile(r"^Dialogue:\s*[^,]*,(\d+):(\d+):(\d+)\.(\d+),")
@@ -229,8 +233,17 @@ def probe(path: Path) -> tuple[float, float, bool]:
             any(s.get("codec_type") == "audio" for s in info.get("streams") or []))
 
 
-def render_ass(src: Path, preset: str, opts: dict, outdir: Path) -> Path:
-    """跑预设，返回它写出的那份 ASS。叠加预设写两份（字幕稿 `*.script.ass` + 最终 ASS），预览最终那份；
+def plate_pass(preset: str, opts: dict) -> tuple[str, dict] | None:
+    """叠加预设、底板取色开着时给阶段 4 的 (样子, 选项)：预览先不取色出整片，定了时间窗再只给窗里的行取色；其余 None。"""
+    if preset not in _overlay.PRESETS:
+        return None
+    look = _overlay.PRESETS[preset][2]
+    o4 = {k: v for k, v in opts.items() if k in _overlay.STAGE4}
+    return (look, o4) if core.look_of(look, o4)[0].plate_color == "on" else None
+
+
+def render_ass(src: Path, preset: str, opts: dict, outdir: Path) -> tuple[Path, Path | None]:
+    """跑预设，返回 (它写出的那份 ASS, 字幕稿或 None)。叠加预设写两份（字幕稿 `*.script.ass` + 最终 ASS），预览最终那份；
     只写字幕稿的（`--preset script`）预览字幕稿本身（看的是 Aegisub 里打开的样子）。"""
     mod = extensions.load(preset, "preset")
     doc = render.load_doc(src)
@@ -239,7 +252,8 @@ def render_ass(src: Path, preset: str, opts: dict, outdir: Path) -> Path:
     finals = [p for p in asses if not p.name.endswith(".script.ass")] or asses
     if len(finals) != 1:
         raise SystemExit(f"预设 {preset} 应当写出恰好一份最终 ASS，写出的是 {asses}——预览只用叠加 ASS")
-    return finals[0]
+    drafts = [p for p in asses if p.name.endswith(".script.ass") and p != finals[0]]
+    return finals[0], (drafts[0] if drafts else None)
 
 
 def cut_clip(video: Path, ass: Path, out: Path, start: float, duration: float,
@@ -318,10 +332,13 @@ def main(argv: list[str] | None = None) -> int:
         k, v = kv.split("=", 1)
         opts[k] = v
     with tempfile.TemporaryDirectory() as work:
+        plates = None
         if src.suffix.lower() == ".ass":
             ass, tracks = src, None
         else:
-            ass = render_ass(src, a.preset, opts, Path(work))      # 不写在输出旁边：免得播放器再外挂一遍
+            plates = plate_pass(a.preset, opts)
+            ass, draft = render_ass(src, a.preset, {**opts, "plate_color": "off"} if plates else opts,
+                                    Path(work))            # 不写在输出旁边：免得播放器再外挂一遍
             tracks = tracks_of(json.loads(src.read_text(encoding="utf-8")))
             if tracks is not None and "text_effect" not in tracks:
                 print("[preview] 注意：这份 tracks 没回抠（--refine off 或 obs 没证据）：打字机只按采样级的门判，"
@@ -336,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             start = float(a.start)
         dur = a.duration if a.duration > 0 else total - start
+        if plates and draft is not None:
+            core.typeset_file(draft, ass, *plates, quiet=True, video=str(video), window=(start, start + dur))
         n = sum(1 for s in starts if start <= s < start + dur)
         print(f"[preview] {video.name} {start:.1f}–{start + dur:.1f} s（--start {start:g}），"
               f"窗里开始的 ASS 事件 {n} 条（全片 {len(starts)} 条，底板和字各算一条）；{a.mode}")

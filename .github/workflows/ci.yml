@@ -1,4 +1,4 @@
-# 公开仓库的 CI：Windows + CPU 路径（GitHub 的托管机没有 NVIDIA 显卡，GPU 路径测不了，不阻塞，靠用户反馈）。
+# 公开仓库的 CI：Windows + CPU、Linux + CPU 两个 job（GitHub 的托管机没有 NVIDIA 显卡，GPU 路径测不了，不阻塞，靠用户反馈）。
 # dev_tools/publish.py 发布时先推到 ci-gate 分支，这个工作流全绿才把同一个提交推上 main（.publish.toml 的 ci_gate）。
 name: CI
 
@@ -61,3 +61,41 @@ jobs:
 
       - name: 文档检查
         run: .venv\Scripts\python.exe dev_tools\check_docs.py
+
+  # Linux + CPU：守卫、三步冒烟、装成包之后加载外部扩展。打包与文档检查和平台无关，只在 Windows 那个 job 里跑。
+  linux-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # apt 的 ffmpeg 是 6.1：守卫和冒烟照过，但真实素材上取帧会出错，flowocr 只在 8.x 上验证过——用 BtbN 的 8.1 静态构建
+      - name: ffmpeg 与系统库
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fonts-dejavu-core libgl1 libglib2.0-0
+          curl -fsSL -o "$RUNNER_TEMP/ffmpeg.tar.xz" https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP/ffmpeg" --strip-components=1
+          echo "$RUNNER_TEMP/ffmpeg/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ffmpeg/bin/ffmpeg" -hide_banner -version | head -1
+
+      - name: 安装（CPU extras + dev 工具）
+        run: uv sync --frozen --extra cpu --group dev
+
+      - name: 守卫
+        run: .venv/bin/python tests/test_guards.py
+
+      - name: 三步冒烟（CPU）
+        run: .venv/bin/python dev_tools/ci_smoke.py --device cpu
+
+      - name: 装成包之后加载外部扩展（examples/）
+        run: |
+          uv build --no-create-gitignore --wheel --out-dir tmp/dist
+          uv venv tmp/pkgvenv
+          uv pip install --python tmp/pkgvenv/bin/python "$(ls tmp/dist/*.whl)[cpu]"
+          tmp/pkgvenv/bin/python dev_tools/ci_extensions.py --tracks tmp/ci-smoke/out/smoke-tracks.json

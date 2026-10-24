@@ -24,7 +24,7 @@
 有丢帧缺口的素材上（yuka f4，`src_fps` 59.9870）`t_us − idx/fps` 在 20 分钟窗口里从 +2.3 ms 漂到 **−257.7 ms**，
 f3 在 7.2 h 处是 9.5 s（docs/dev-guide/pitfalls.md「容器平均帧率不是时间轴」），而 run 的 t_start/t_end 是 pts；不锚就是两套时钟混用。
 锚之后只剩窗内（几十帧）的漂，缺口不落在窗里就是 0。CFR 素材上 `t_us − idx/fps ≡ 0`，所以历史读数不变。
-彻底修法（辅助流带 pts、两遍回抠也改）在 reuse-budget 计划第 1 条。
+当时设想的彻底修法（辅助流逐帧带 pts）2026-09-17 量过不必要：剩下的漂来自平均帧率和窗内真实帧率之差，锚住窗口就够（reuse-budget 计划 §8 第 1 条）。
 
 本模块**不 import cv2**（守卫在系统 Python 里跑；裁剪是 numpy 切片，辅助流已经是灰度）。
 线程模型：OCR 主线程只往队列里放；工作线程等环里的帧、抠、算、写回行的 dict；`wait_batch` 让延迟落盘那一层
@@ -54,6 +54,9 @@ END_TAIL_US = 200_000
 """结尾窗终点：t_end 之后这么久（淡出 / 交叉淡出的尾巴）。"""
 MAX_OPEN_SAMPLES = 40
 """变化段最多跨这么多采样点还没停变就放弃（滚动的跑马灯 / 计时器不是打字机；也别让裁剪堆无限长）。"""
+RECOVER_HOLD = 8
+"""回补异步（`--recover-async`）时最多扣住几个回抠批次等回补任务做完（`reuse_v2.ReuseV2.hold_max`，还要小于落盘等回抠的距离）。
+扣住的批也压着帧环，所以 `ring_in_flight` 跟着加这么多。"""
 GROW_SIM = 0.6
 """文本变了：新文本的前缀和旧文本像到这个程度算**打字机在长**（旧文本没消失，不用给它开结尾窗）；
 否则是**换句**（同一位置紧接着出下一句），旧文本的末行也要一份 `edge.off`——build_tracks 会在这里切 run。"""
@@ -91,11 +94,13 @@ def line_match(box, ref_box) -> bool:
 
 def ring_in_flight(args) -> int:
     """解码头到回抠工作线程之间最多压着几个采样帧——帧环的容量按它给（`ring_capacity`；漏一项就环满卡解码）：
-    取帧预取 + det 批 ×（1 + det 预取 + det 流水的前瞻）+ rec 固定滞后窗口 + `--decode-shards` 的共享内存槽。
+    取帧预取 + det 批 ×（1 + det 预取 + det 流水的前瞻）+ rec 窗口（主线程领先结算的上限）+ 扣着等回补的回抠批次（`--recover-async`）
+    + `--decode-shards` 的共享内存槽。
     放在这里而不是 run_ocr2：守卫要能按行为测它（run_ocr2 顶层 import 推理库，守卫够不着），原来只能查源码里有没有那几个参数名。"""
     from flowocr.extract import decode_proc      # 模块顶层只有标准库
     ahead = args.det_lookahead if args.det_batch > 1 else 0          # `--det-lookahead`：辅助线程上正在推理的那一批
-    return (args.prefetch + args.det_batch * (1 + args.det_prefetch + ahead) + args.rec_window
+    hold = RECOVER_HOLD if args.recover_async and args.rec_async else 0      # 扣着等回补任务的回抠批次
+    return (args.prefetch + args.det_batch * (1 + args.det_prefetch + ahead) + args.rec_window + hold
             + (decode_proc.slots_for(args.det_batch, args.det_prefetch) if args.decode_shards > 1 else 0))
 
 
@@ -114,7 +119,7 @@ def aux_frames_in(aux: AuxGrid | None, span: int) -> int:
 
 def ring_capacity(gap: int, lead: int, tail: int, strides: int = 5, in_flight: int = 1, aux: AuxGrid | None = None) -> int:
     """帧环要装多少帧：`release` 之后环里留着工作线程处理的那个采样点之前 2 个间隔（+ lead + 3，回看窗），
-    往前一直到**解码头**——中间压着 `in_flight` 个采样帧（取帧预取 + det 批 ×（1 + det 预取）+ rec 固定滞后窗口
+    往前一直到**解码头**——中间压着 `in_flight` 个采样帧（取帧预取 + det 批 ×（1 + det 预取）+ rec 窗口
     + `--decode-shards` 的共享内存槽，调用方逐项加，`ring_in_flight`），外加工作线程最多落后的 2 个采样点（文件头）。
     所以下界是 **in_flight + 4 个采样间隔** + lead + tail（结尾窗）+ 8 个源帧的跨度。`strides`（`--refine-ring`）只是地板。
     `aux` 给了就把这段跨度换算成**辅助流的帧数**（`aux_frames_in`）：素材帧率高于 `--aux-max-fps` 时辅助流隔帧取，
@@ -199,8 +204,12 @@ class FrameRing:
             return self.highest >= idx
 
     def take(self, lo: int, hi: int) -> list[tuple[int, np.ndarray]]:
+        # 按窗口里的帧号逐个查，不扫整个环（环上千帧、窗口几十帧；回抠线程里原来约 5%，2026-10-16）
         with self.cv:
-            return sorted((k, f) for k, f in self.frames.items() if lo <= k <= hi)
+            fr = self.frames
+            if hi - lo + 1 > len(fr):
+                return sorted((k, f) for k, f in fr.items() if lo <= k <= hi)
+            return [(k, fr[k]) for k in range(lo, hi + 1) if k in fr]
 
     def release(self, upto: int) -> None:
         with self.cv:
@@ -262,6 +271,8 @@ class EdgeRefiner:
         """`(seq) -> None`：每处理完一批就调（在工作线程里）。独立进程版（`edge_proc`）靠它把进度发回管线进程。"""
         self.on_error = None
         """`(exc) -> None`：工作线程抛错时调（同上）。"""
+        self.on_progress = None
+        """完成一个窗内工作单元时调；慢 CPU 一批未完成仍可报告实际进展。"""
         # `worker_busy_sec` 是线程的墙钟（GIL 之下大半在等主线程），**`worker_cpu_sec` 才是它自己的算力**
         self.stats = {"segments": 0, "on": 0, "off": 0, "off_replaced": 0, "relinked": 0, "jitter": 0,
                       "short_windows": 0, "stale_windows": 0, "gave_up": 0,
@@ -286,6 +297,10 @@ class EdgeRefiner:
         所以是 seq + MAX_OPEN_SAMPLES + 1。第一版只等第 seq 批本身，辅助流一落后（NVDEC 路，工作线程比主线程慢几十个采样点）
         行就先被写出去了、证据挂在已落盘的 dict 上——yuka-f5 的 on 行从 465 掉到 299（2026-09-16 深夜）。"""
         return seq + MAX_OPEN_SAMPLES + 1
+
+    def ready(self, seq: int) -> bool:
+        """第 seq 批处理完了没有（不等）；出错了也算，让随后的 `wait_batch` 抛出来。"""
+        return self.done_seq >= seq or self.error is not None or not self.th.is_alive()
 
     def wait_batch(self, seq: int) -> None:
         """等到第 seq 批处理完（延迟落盘写那一批的行之前调；调用方给 `settled_by(批号)`）。"""
@@ -392,6 +407,8 @@ class EdgeRefiner:
                 self._end(key, prev[0], prev[1], prev[2], self.sgrid.prev(idx), key in stale)
                 self.stats["off_replaced"] += 1
                 if seg is not None:                  # 上一句还没停变就被顶掉：按末次观测帧停变
+                    # 作废标记先并进来再停变：`_settle` 只看 `seg.stale`，原来这里漏了，回补改过的旧句照样写出 `on` 证据
+                    seg.stale = seg.stale or key in stale
                     self._settle(seg, self.sgrid.prev(idx), prev[1])
                     del self.open[key]
                     seg = None
@@ -449,6 +466,8 @@ class EdgeRefiner:
             return
         seg.idxs.extend(k for k, _ in got)
         seg.stacks.append(np.stack([f[seg.y0:seg.y1] for _, f in got]))
+        if self.on_progress is not None:
+            self.on_progress()
 
     def _inner(self, seg_y0: int, seg_y1: int, box) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]] | None:
         """最终的框（缩放后）在整行带里的裁剪范围 + 框在裁剪里的位置。"""
@@ -485,6 +504,8 @@ class EdgeRefiner:
                 rec["cell"] = [float(sig["cell"][0]), float(sig["cell"][1])] if sig["cell"] else None
         seg.row.setdefault("edge", {})["on"] = rec
         self.stats["on"] += 1
+        if self.on_progress is not None:
+            self.on_progress()
 
     def _end(self, key: int, row: dict, box, text: str, last_idx: int, stale: bool = False) -> None:
         """链断了：结尾窗（对比度曲线）+ 退回判据（整框相关系数、模板 = 末次观测帧）。"""
@@ -516,11 +537,11 @@ class EdgeRefiner:
             ix0, iy0, ix1, iy1 = inner
             tpl = by.get(last_idx)
             if tpl is not None and tpl[iy0:iy1, ix0:ix1].size >= 64:
-                t_in = tpl[iy0:iy1, ix0:ix1]
+                like = TF.ncc_to(tpl[iy0:iy1, ix0:ix1])
                 gone = None
                 for k in reversed(self.grid.frames(last_idx, t_end_idx)):    # last_true：[末次观测帧, +一个间隔]
                     f = by.get(k)
-                    if f is not None and TF.ncc(f[iy0:iy1, ix0:ix1], t_in) >= self.thr:
+                    if f is not None and like(f[iy0:iy1, ix0:ix1]) >= self.thr:
                         gone = k
                         break
                 rec["ncc_gone"] = gone
@@ -536,6 +557,8 @@ class EdgeRefiner:
         row.setdefault("edge", {})["off"] = rec
         self.stats["off"] += 1
         self.stats["end_sec"] += time.perf_counter() - t0
+        if self.on_progress is not None:
+            self.on_progress()
 
 
 # ---------- 第二遍（refine_boundaries --decoder obs）这边：把行上的证据重建成 measure() 的输出 ----------

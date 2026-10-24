@@ -12,13 +12,14 @@
 * **回补的单框读也走这里**（`rec_one`），于是**每个后端只被它自己那一个线程碰**。
   rec 后端（一条连接的 `OrtRec`）不保证多线程安全，两个线程一起调是会出事的那种 bug。
 * **可以有几个后端同时在途**（`--rec-inflight N`，decode-buffer）：每个后端一个发批线程、从同一个队列里挑，
-  后端是各自一条连接的 `OrtRec`（接同一个 ORT 服务，模型和显存一份）。结算按请求号、主线程按帧序提交，
-  所以几个在途只改"批怎么拼"，不改读哪一帧。
+  后端是各自一条连接的 `OrtRec`（接同一个 ORT 服务，模型和显存一份）。结算按请求号、主线程按帧序提交；
+  几个在途改的是"批怎么拼"和结果什么时候回来——主线程读数回来就结算（`run_ocr2.Loop.settle_ready`），
+  所以也会经时序改到哪些帧真读，owner 2026-10-11 定这种抖动不防（rec-batching 计划）。
 
 消费判据两条（量出来缺一不可）：
 
-1. **发什么** = `recpack.pick_batch`：取当前排着的请求里最大的那一组（近宽 + 封顶 `--rec-bucket`）。
-   **分组键是形状宽**：后端报了 `shape_w`（`OrtRec` 把张量宽收到 320 的倍数）就按它分，和同步路 `recpack.predict_bucketed`
+1. **发什么** = `recpack.pick_batch`：取当前排着的请求里最大的那一组（同宽 + 封顶 `--rec-bucket`）。
+   **分组键是形状宽**（`recpack.group_key`：`OrtRec` 把张量宽收到 320 的倍数），和同步路 `recpack.predict_bucketed`
    同一个口径。2026-09-23 之前这里按**精确**张量宽分，330 和 340 两个本来是同一个 `(n, 640)` 形状的裁剪被拆成两次调用——
    异步进默认后 quick 六段的 rec 调用里批 1 占 47%~74%（decode-buffer）。
 2. **什么时候发** = 膝点驻留 `--rec-knee K`：**挑出来那一组**不足 K 个就先不发
@@ -31,6 +32,11 @@
    那时无论攒了多少都发——所以"等"永远有出口，而且**不靠时钟**（少一个不确定性来源）。
 
 主线程快被最老那一帧卡住时把它标成优先（`prio`），含它最多的那一组先走。
+
+**回补任务**（`--recover-async`，rec-reads 计划的 B）：`submit_task` 交来一个 `reuse_v2.RecoverTask`，
+它的每一层中点和普通读一样排队、拼批；一层读齐了，发批线程当场 `feed` 进去、取下一层接着排，主线程不参与。
+任务只碰自己的不可变输入（缓存裁剪、两端文本），改行留给主线程在任务做完后按帧序做，所以"后台线程只处理不可变的请求"这条仍然成立。
+主线程真要等某几个任务时（`wait_tasks`）把它们剩下的请求和以后各层都标成优先。
 
 ⚠ **等待一定要有出口**：`stall_sec` 到了就抛，而不是等到天荒地老（同 `edge_refine.FrameRing` 那条教训）。
 """
@@ -46,21 +52,20 @@ from flowocr.extract import timeline as _tl   # --timeline（decode-buffer）
 class RecPool:
     """后台发批的 rec 消费者。主线程用 `submit` / `collect`，两者都按**请求号**说话。"""
 
-    def __init__(self, recs: list, cap: int, ratio: float, knee: int = 16,
+    def __init__(self, recs: list, cap: int, knee: int = 16,
                  stall_sec: float = 300.0) -> None:
         """`recs`：后端表，一个后端一个发批线程（= 同时在途的请求数）。第一个之外的必须是**独立的**后端（自己的连接）。"""
-        self.recs, self.cap, self.ratio = list(recs), max(1, cap), ratio
-        self.shape_w = getattr(self.recs[0], "shape_w", None)
-        """后端自己把张量宽收到少数几个形状上时（`OrtRec.shape_w`），分组键用**形状宽**、近宽合并不再生效——
-        同 `recpack.predict_bucketed`：同形状的本来就该同批，不同形状的并了后端也得拆开。"""
-        if self.shape_w is not None:
-            self.ratio = 0.0
+        self.recs, self.cap = list(recs), max(1, cap)
         self.knee = max(1, min(knee, max(1, cap)))   # 挑出来那一组够这么多才发（1 = 一有空就发）
         self.stall_sec = stall_sec
         self.pend: dict[int, object] = {}       # 请求号 -> 裁剪（还没发出去的）
-        self.wid: dict[int, int] = {}           # 请求号 -> 目标宽（分组键）
+        self.wid: dict[int, int] = {}           # 请求号 -> 分组键（`recpack.group_key`）
         self.done: dict[int, tuple | None] = {}  # 请求号 -> (文本, 分数)；后端少返回时是 None
         self.prio: set[int] = set()
+        self.owner: dict[int, object] = {}      # 请求号 -> 它所属的回补任务（`submit_task`）；普通读不在这里
+        self.task_ids: dict[int, list[int]] = {}       # id(任务) -> 这一层的请求号
+        self.task_got: dict[int, dict[int, tuple]] = {}  # id(任务) -> 这一层已回来的读数
+        self.task_prio: set[int] = set()        # 主线程在等的任务（id），它们以后各层的请求也插队
         self.calls = 0                          # predict 调用次数（含回补的单框读）
         self.sent = 0                           # 送进去的裁剪数
         self.batch_hist: dict[int, int] = {}    # 批大小 -> 次数（报表用）
@@ -78,7 +83,11 @@ class RecPool:
 
     # ---------- 主线程这边 ----------
     def new_ids(self, n: int) -> list[int]:
-        """要 n 个请求号。**只在主线程调**（请求号的顺序就是提交顺序）。"""
+        """要 n 个请求号（请求号的顺序就是提交顺序）。持锁：回补任务的下一层由发批线程领号。"""
+        with self.cv:
+            return self._take_ids(n)
+
+    def _take_ids(self, n: int) -> list[int]:
         ids = list(range(self._next, self._next + n))
         self._next += n
         return ids
@@ -91,9 +100,50 @@ class RecPool:
             self._check()
             for rid, crop in items:
                 self.pend[rid] = crop
-                tw = recpack.rec_target_w(*crop.shape[:2])
-                self.wid[rid] = self.shape_w(tw) if self.shape_w is not None else tw
+                self.wid[rid] = recpack.group_key(self.recs[0], crop)
             self.cv.notify_all()
+
+    def submit_task(self, task) -> None:
+        """交一个回补任务（`next_layer() -> [裁剪]` / `feed([(文本, 分数)])` / `done`）。之后各层由发批线程推进。"""
+        crops = task.next_layer()
+        with self.cv:
+            self._check()
+            self._queue_layer(task, crops)
+            self.cv.notify_all()
+
+    def _queue_layer(self, task, crops: list) -> None:
+        """（调用方持锁）把任务的一层排进队列；空层 = 任务做完了。"""
+        if not crops:
+            self.task_ids.pop(id(task), None)
+            self.task_got.pop(id(task), None)
+            self.task_prio.discard(id(task))
+            return
+        ids = self._take_ids(len(crops))
+        self.task_ids[id(task)], self.task_got[id(task)] = ids, {}
+        for rid, crop in zip(ids, crops):
+            self.pend[rid] = crop                # 任务持有的缓存裁剪，本来就是独立的数组
+            self.wid[rid] = recpack.group_key(self.recs[0], crop)
+            self.owner[rid] = task
+        if id(task) in self.task_prio:
+            self.prio |= set(ids)
+
+    def wait_tasks(self, tasks: list) -> None:
+        """等这几个回补任务做完：它们剩下的请求和以后各层都插队。等不到就抛（`stall_sec`，同 `collect`）。"""
+        with self.cv:
+            self._check()
+            for t in tasks:
+                if not t.done:
+                    self.task_prio.add(id(t))
+                    got = self.task_got.get(id(t), {})
+                    self.prio |= {r for r in self.task_ids.get(id(t), ()) if r not in got}
+            self.cv.notify_all()
+            t0 = time.perf_counter()
+            while not all(t.done for t in tasks):
+                self.cv.wait(0.5)
+                self._check()
+                if time.perf_counter() - t0 > self.stall_sec:
+                    raise RuntimeError(f"rec 消费者卡了 {self.stall_sec:.0f} s：等 {len(tasks)} 个回补任务，"
+                                       f"排队 {len(self.pend)}")
 
     def collect(self, rids: list[int], block: bool = True,
                 prio: bool = False) -> dict[int, tuple | None] | None:
@@ -155,7 +205,7 @@ class RecPool:
         rids = sorted(self.pend)
         widths = [self.wid[r] for r in rids]
         prio = {k for k, r in enumerate(rids) if r in self.prio}
-        return rids, recpack.pick_batch(widths, self.ratio, self.cap, prio)
+        return rids, recpack.pick_batch(widths, self.cap, prio)
 
     def _fire(self) -> bool:
         """现在该发吗（调用方持锁）：关了 / **还排着的**里有优先项 / 挑出来那一组够膝点 / 队列已经很深。
@@ -201,6 +251,22 @@ class RecPool:
                 h = self.shape_hist.setdefault(width, {})
                 h[len(batch)] = h.get(len(batch), 0) + 1
                 for (rid, _), r in zip(batch, res):
-                    self.done[rid] = (None if r is None
-                                      else (r["rec_text"], float(r["rec_score"])))
+                    val = None if r is None else (r["rec_text"], float(r["rec_score"]))
+                    task = self.owner.pop(rid, None)
+                    if task is None:
+                        self.done[rid] = val
+                    else:
+                        self.prio.discard(rid)
+                        got = self.task_got[id(task)]
+                        got[rid] = val
+                        if len(got) == len(self.task_ids[id(task)]):     # 这一层读齐了：喂进去、排下一层
+                            try:
+                                task.feed([got[i] if got[i] is not None else ("", 0.0)
+                                           for i in self.task_ids[id(task)]])
+                                nxt = task.next_layer()
+                                self._queue_layer(task, nxt)
+                            except BaseException as exc:    # noqa: BLE001 —— 同上，带回主线程
+                                self.error = exc
+                                self.cv.notify_all()
+                                return
                 self.cv.notify_all()

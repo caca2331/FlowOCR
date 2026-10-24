@@ -10,7 +10,8 @@
      **预留和放行是一个原子动作**，见 decide 里那一段）；真读出来的文本 != 手里的，就在缓存里递归二分
      把变化点找出来（端点相同就剪枝），改掉已缓冲、还没落盘的行。
      所以 obs 行**延迟落盘**（refresh + mem + 2 个采样点），顺序不变。
-     回补一旦把变化点前移，这一段的**在线回抠证据就作废**（`edge_stale`，见 commit 里那一段）。
+     回补一旦把变化点前移，这一段的**在线回抠证据就作废**（`edge_stale`，见 `_release`）。
+     `--recover-async` 时二分交给 rec 池逐层推进（`RecoverTask`），主线程不等；没做完之前那一帧和之后的回抠批次扣着不送。
 
 产物格式不变：沿用的行仍是 `reused: true`；跨空档沿用的多一个 `link` 字段；回补时被真读的那几帧变成非沿用行。
 这些参数只在 `--reuse-v2` 打开时才进 `_meta.config`（flowocr.extract.ocr_args 的 OPT_IN）；`--reuse-corr` / `--refresh-every` 的默认跟着它走（`ocr_args.resolve`）。
@@ -54,8 +55,69 @@ def hasdigit(t: str) -> bool:
     return any(ch.isdigit() for ch in t)
 
 
+class RecoverTask:
+    """一条链一次回补的递归二分（rec-reads 计划的 B）：`pend[j]` 的文本未知，端点是旧文本（`held`）和这次的新读（`new`）。
+
+    **输入全是不可变的**（缓存的裁剪、两端文本、发起时各行的文本），所以可以交给 rec 池的发批线程逐层推进
+    （`RecPool.submit_task`），主线程不参与；**改行不在这里做**——推进时只按顺序记下要写什么（`ops`），
+    做完之后由主线程按帧序 `apply`。确定性路径上同一个任务当场跑完（`ReuseV2._run_tasks`），读的框和写回的结果同原来的逐层二分。
+
+    `changed`（有没有把历史行的文本改掉）对着**发起时**的文本比：原来逐层对着当时的行比，
+    中途被上一层覆盖过的行和发起时 `same_text` 相同（覆盖它的读数要么和它相同、要么已经让 `changed` 成立），
+    `same_text` 又是等价关系，所以两种比法结果一样。"""
+    __slots__ = ("crops", "rows", "orig", "texts", "stack", "layer", "ops", "reads", "changed", "done",
+                 "cache_bytes", "lo_seq")
+
+    def __init__(self, held: tuple[str, float], new: tuple[str, float], pend: list[list]) -> None:
+        self.crops = [p[2] for p in pend]
+        self.rows = [p[1] for p in pend]
+        self.orig = [r["text"] for r in self.rows]
+        self.texts = {-1: held, len(pend): new}
+        self.stack = [(-1, len(pend))]
+        self.layer: list[tuple[int, int, int]] = []
+        self.ops: list[tuple[int, int, str, float]] = []    # (中点, hi, 文本, 分数)，按读回来的顺序
+        self.reads = 0
+        self.changed = False
+        self.done = False
+        self.cache_bytes = 0                   # 任务做完之前裁剪还占着回补缓存（`ReuseV2._lend`）
+        self.lo_seq = pend[0][0]               # 最早会改到的那一帧（落盘不能越过它）
+
+    def next_layer(self) -> list:
+        """下一层要读的裁剪（同一层的中点互不依赖）；没有了就标 `done`、返回空表。"""
+        self.layer = [(lo, (lo + hi) // 2, hi) for lo, hi in self.stack
+                      if hi - lo > 1 and not same_text(self.texts[lo][0], self.texts[hi][0])]
+        self.stack = []
+        if not self.layer:
+            self.done = True
+        return [self.crops[m] for _, m, _ in self.layer]
+
+    def feed(self, got: list[tuple[str, float]]) -> None:
+        """这一层的读数（和 `next_layer` 给出的裁剪一一对应）。"""
+        for (lo, mid, hi), (t, c) in zip(self.layer, got):
+            self.reads += 1
+            self.texts[mid] = (t, c)
+            self.changed = self.changed or any(not same_text(t, self.orig[j]) for j in range(mid, hi))
+            self.ops.append((mid, hi, t, c))
+            self.stack += [(lo, mid), (mid, hi)]
+        self.layer = []
+
+    def apply(self) -> None:
+        """（主线程）把读数按读回来的顺序写进行：中点是真读过的、换成这次的读数并去掉沿用标记；
+        中点到 hi 之间的行按它推断。中点这一行即使 `same_text` 判"没改"（标点变体）也换成这次的读数——它是一次独立观测，
+        留旧写法反而是拿沿用的文本冒充真读（2026-09-26 查过，不改）。"""
+        for mid, hi, t, c in self.ops:
+            row = self.rows[mid]
+            row["text"], row["conf"] = t, round(c, 4)
+            row.pop("reused", None)
+            row.pop("link", None)
+            row["recovered"] = True
+            for j in range(mid + 1, hi):
+                self.rows[j]["text"], self.rows[j]["conf"] = t, round(c, 4)
+        self.crops = []
+
+
 class Chain:
-    __slots__ = ("box", "text", "conf", "age", "last_seq", "pending", "cache_bytes", "ended_at", "uid", "last_row",
+    __slots__ =("box", "text", "conf", "age", "last_seq", "pending", "cache_bytes", "ended_at", "uid", "last_row",
                  "last_idx", "inflight", "confirmed", "read_w", "severed")
 
     def __init__(self, box, text, conf, seq):
@@ -97,20 +159,37 @@ class ReuseV2:
         self.a = args
         self.corr, self.estimate_shift = corr_fn, estimate_shift_fn
         self.rec_one = rec_one                 # crop -> (text, conf)，回补用；调用方自己数 rec
-        self.rec_many = None                   # [crop] -> [(text, conf)]；给了就**按层**发回补（见 _recover）
+        self.rec_many = None                   # [crop] -> [(text, conf)]；给了就**按层**发回补（见 _run_tasks）
+        # 回补异步（`--recover-async`，rec-reads 计划的 B）：两个都给了就把回补任务交给 rec 池逐层推进（`RecPool.submit_task`），
+        # 主线程不等；只在扣住的批太多、落盘要用到、收尾时才等（`wait_tasks`，等的那几个插队）
+        self.submit_task = None
+        self.wait_tasks = None
         self.edge = None                       # 两遍合一遍：edge_refine.EdgeRefiner（--refine-fused 时由 run_ocr2 挂上）
         self.live: list[Chain] = []
         self.ended: list[Chain] = []
+        # 已经结束、但还有真读在途的链：回补缓存先留着，等最后一次读结算、回补完再丢（`_release_if_done`）。
+        # 异步窗口下读完就断链时，原来结束那一刻就把缓存丢了，读数回来发现文本变了也回补不了（rec-reads 计划的现有漏洞 1）
+        self.held: list[Chain] = []
         self.grays: dict[int, np.ndarray] = {}   # 采样点 -> 灰度帧（uint8，`_crop` 取出时再转 float32）
         self.buf: dict[int, list[dict]] = {}     # 采样点 -> 该帧的行（延迟落盘）
         self.cache = 0
         self.reserved: dict[int, int] = {}       # 本帧放行沿用的框 -> 已经**预留**的缓存字节（见 decide）
         self.cache_cap = int(args.reuse_cache_mb * (1 << 20))
         self.horizon = (args.refresh_every or 0) + args.reuse_mem + 2
+        self.flush_lag = args.flush_lag
+        self.held_batches: list[dict] = []
+        """结算过、回抠批次还**扣着没送**的帧（按帧序）：回补任务没做完之前，作废标记还不知道，而回抠处理第 s 批时
+        当场就要用它（换句、断链、新开段都在那一批写死），所以第 s 批和之后各批都等着。同步回补时任务当场做完，这里恒为空。"""
+        # 扣住的批最多几个：落盘要回抠做到 `settled_by(upto)` = 结算帧 − (horizon − MAX_OPEN_SAMPLES − 1) 批，
+        # 扣住的批碰到这条线就成了互等（主线程等回抠、回抠等主线程放批）。默认 horizon 50 时这个距离是 9，扣 8 个
+        from flowocr.extract import edge_refine
+        self.hold_max = max(0, min(edge_refine.RECOVER_HOLD, self.horizon - edge_refine.MAX_OPEN_SAMPLES - 2))
+        self.recovered_out = 0                 # 已收尾的回补读数，`take_recover_reads` 交给调用方记账
         self.seq = -1
         self.stats = {"reuse_prev": 0, "reuse_moved": 0, "reuse_assoc": 0, "reuse_gap1": 0, "reuse_memory": 0,
-                      "recover_reads": 0, "recover_events": 0, "cache_forced": 0, "cache_peak": 0,
-                      "cache_overrun": 0, "edge_stale": 0,
+                      "recover_reads": 0, "recover_events": 0, "recover_waits": 0, "held_peak": 0,
+                      "cache_forced": 0, "cache_peak": 0,
+                      "cache_overrun": 0, "edge_stale": 0, "flush_deferred": 0,
                       "gate_digit": 0, "gate_unconfirmed": 0, "gate_dw": 0, "gate_pix": 0, "refresh": 0}
         # `decide` / `commit` 内部的分段计时（进 `_meta.reuse_v2_sec`）。**先量再挪**：
         # "把 decide / commit 挪出主线程"之前要知道里头到底是谁占时间——这个项目在"凭印象归因"上栽过两次
@@ -276,7 +355,8 @@ class ReuseV2:
             if self.trace is not None:
                 tr_row = {"seq": seq, "box": list(b), "chain": chain.uid, "link": link,
                           "gate": gate or "", "corr": round(c_val, 4),
-                          "digit": hasdigit(chain.text), "read": bool(gate)}
+                          "digit": hasdigit(chain.text), "read": bool(gate),
+                          "pending": chain.text_pending, "confirmed": chain.confirmed}
                 self.trace.append(tr_row)
             if gate:
                 self.stats[gate] += 1
@@ -323,7 +403,7 @@ class ReuseV2:
     # **判据只有一份**：`commit` 就是 stage1 + 马上 stage2，窗口模式只是把 stage2 推迟到窗口结算。
     def commit(self, seq: int, idx: int, t_us: int, boxes, polys, decided, read_set: set[int],
                assign: dict, rec_crop, corr_of: dict, record_corr: bool, fh) -> int:
-        """decided 含沿用的和真读的（真读的 age=0）。read_set = 真送进 rec 且拿到结果的框。返回回补用掉的 rec 次数。"""
+        """decided 含沿用的和真读的（真读的 age=0）。read_set = 真送进 rec 且拿到结果的框。返回这一次收尾的回补读数（同步时就是这一帧的）。"""
         st = self.commit_stage1(seq, idx, t_us, boxes, polys, decided, read_set, assign,
                                 rec_crop, corr_of, record_corr)
         texts = {i: (text, score) for i, text, score, _age in decided if i in read_set}
@@ -411,12 +491,16 @@ class ReuseV2:
                 nc.inflight = 1
                 new_live.append(nc)
                 deferred[-1]["new_chain"] = nc
-        # 本帧没接上的活链 -> 结束（缓存丢掉）；结束太久的丢掉
+        # 本帧没接上的活链 -> 结束（缓存丢掉；还有读在途的先留着）；结束太久的丢掉
         alive = {id(c) for c in new_live}
+        self.held = [c for c in self.held if id(c) not in alive]      # 读还在途时又被跨空档 / 记忆接回：缓存照常归活链
         ended_now: list[tuple] = []
         for c in self.live:
             if id(c) not in alive:
-                self._drop_pending(c)
+                if c.inflight:
+                    self.held.append(c)
+                else:
+                    self._drop_pending(c)
                 c.ended_at = seq
                 self.ended.append(c)
                 if c.last_row is not None:
@@ -431,7 +515,8 @@ class ReuseV2:
                 "ended_now": ended_now, "deferred": deferred, "inherit": inherit}
 
     def commit_stage2(self, st: dict, texts: dict, fh) -> int:
-        """要"读回来的文本"的那一半：回填行、回补、给 edge 事件定 kind、推落盘水位。返回回补用掉的 rec 次数。
+        """要"读回来的文本"的那一半：回填行、回补、给 edge 事件定 kind、推落盘水位。返回这一次收尾的回补读数
+        （`--recover-async` 时回补任务交给池子，读数在任务收尾的那次结算里才算进来，见 `_release`）。
 
         `texts`：框下标 -> (文本, 分数)。**窗口模式下这一步推迟到窗口结算**，于是 stage1 那会儿
         链的首读可能还没回来（`text_pending`）、沿用行里写的是空文本——所以**沿用行的文本在这里才定**，
@@ -439,16 +524,14 @@ class ReuseV2:
         因此此刻链上的文本必然是最终的。（W=0 时这一步是恒等变换：链的文本就是 stage1 写进行里的那个。）
         """
         seq = st["seq"]
-        extra_rec = 0
-        stale: set[int] = set()                # 这一批里历史文本被回补改过的链 uid（见下面 _recover 那一处）
         t_r = time.perf_counter()
         for row, chain, ev in st["inherit"]:
             row["text"], row["conf"], ev[3] = chain.text, round(chain.conf, 4), chain.text
-        # **两遍**（2026-09-26）：先收齐这一帧所有要回补的链，一起按层二分（`_recover`），再逐链收尾。
-        # 链之间互不依赖（回补只改这条链自己的历史行，收尾只动这条链），所以和逐链做完全等价，
-        # 差别只在同一层的读并成一次发——原来每条链每层各发一次、几乎全是批 1（wuwa-s2 320 次调用读 323 个框）
-        todo: list[tuple] = []                 # (d, 文本, 分数, 回补任务下标或 None)
-        jobs: list[tuple] = []                 # (chain, 新文本, 新分数, 这一帧之前的沿用行)
+        # **两遍**（2026-09-26）：先收齐这一帧所有要回补的链（各起一个 `RecoverTask`），再逐链收尾。
+        # 链之间互不依赖（回补只改这条链自己的历史行，收尾只动这条链），所以和逐链做完全等价；
+        # 同步时同一层的读并成一次发（`_run_tasks`）——原来每条链每层各发一次、几乎全是批 1（wuwa-s2 320 次调用读 323 个框）
+        todo: list[tuple] = []                 # (d, 文本, 分数, 回补任务或 None)
+        tasks: list[RecoverTask] = []
         for d in st["deferred"]:
             text, score = texts.get(d["i"], ("", 0.0))
             row, chain, ev = d["row"], d["chain"], d["ev"]
@@ -457,110 +540,138 @@ class ReuseV2:
             if nc is not None:
                 nc.text, nc.conf = text, score
                 nc.inflight -= 1
+                self._release_if_done(nc)
                 ev[0], ev[3], ev[4] = nc.uid, text, "new"
                 continue
             # 回补只看**这一帧之前**的沿用行；更晚的那些是"读还没回来时按旧文本写出去的"，
-            # 由下面的前向回填统一改（窗口模式才会有）。⚠ **别手工切 `chain.pending`**：
-            # 缓存的账在 `_drop_pending` 里，切了不退就是虚高（见 `_recover` 的说明）
+            # 由下面的前向回填统一改（窗口模式才会有）。这些行连同裁剪的账一起交给任务（`_lend`），
+            # 所以同一条链下一次回补碰不到它们——两个任务改的行不相交
             before = [pnd for pnd in chain.pending if pnd[0] < seq]
-            j = None
+            task = None
             if before and not same_text(text, chain.text):
-                j = len(jobs)
-                jobs.append((chain, text, score, before))
-            todo.append((d, text, score, j))
-        moved = []
-        if jobs:
-            t_rc = time.perf_counter()
-            moved = self._recover(jobs)
-            self.sec["recover"] += time.perf_counter() - t_rc
-        for d, text, score, j in todo:
+                task = RecoverTask((chain.text, chain.conf), (text, score), before)
+                self._lend(chain, before, task)
+                tasks.append(task)
+            todo.append((d, text, score, task))
+        for d, text, score, task in todo:
             chain, ev = d["chain"], d["ev"]
-            if j is not None:
-                moved_back = moved[j]
-                if self.trace is not None:
-                    self.trace.append({"seq": seq, "box": list(d["box"]), "chain": chain.uid,
-                                       "link": "recover", "gate": "recover", "corr": None,
-                                       "digit": None, "read": True, "n_reads": moved_back[0]})
-                extra_rec += moved_back[0]
-                # **回补改的是过去，链事件只能往前发**（2026-09-17 审计）：文本从 `AAA / AAA / BBB` 被改成
-                # `AAA / BBB / BBB` 之后，变化点其实在上一个采样点，而在线回抠这一批才收到 "changed"——
-                # 它开的打字机窗晚一个采样点，旧句的结尾窗也挂在一行已经被改写的文本上。
-                # 帧环只留 5 个采样间隔，回补能往回摸 --refresh-every 个采样点，重新量是不可能的；
-                # 所以**把这一批受影响的证据标成 stale**，第二遍当没量到、该 run 退回采样级（口径同 short）。
-                # 彻底修法（事件重放 / 按链保留像素）写在 reuse-budget 计划第 2 条。
-                if moved_back[1]:
-                    stale.add(chain.uid)
-                    self.stats["edge_stale"] += 1
             self._drop_pending(chain, upto=seq)
             ev[0], ev[3], ev[4] = chain.uid, text, "changed" if text != chain.text else "same"
             # 两次真读逐字相同才算证实；变了（打字机在长 / 换句 / 回补改了历史）就回到未证实，下一帧起重新走严门
             chain.confirmed = text == chain.text
             chain.text, chain.conf = text, score
             chain.inflight -= 1
+            self._release_if_done(chain)
         self.sec["rows"] += time.perf_counter() - t_r
-        t_e = time.perf_counter()
-        if self.edge is not None:
-            # 链断的文本在这里才取（2026-09-23）：原来 stage1 抄的是在途读之前的旧文本，回抠认不出"长字续接"，
-            # 段被拆开、全字偏早（gi-s2 全字代价 22 -> 75、relinked 184 -> 51）。同步时两者相同
-            ended = [(u, row, bx, ch.text, li) for u, row, bx, ch, li in st["ended_now"]]
-            self.edge.sample(seq, st["idx"], st["t_us"], [tuple(e) for e in st["events"]],
-                             ended, stale)
-        self.sec["edge"] += time.perf_counter() - t_e
+        # 链断的文本在这里才取（2026-09-23）：原来 stage1 抄的是在途读之前的旧文本，回抠认不出"长字续接"，
+        # 段被拆开、全字偏早（gi-s2 全字代价 22 -> 75、relinked 184 -> 51）。同步时两者相同
+        ended = [(u, row, bx, ch.text, li) for u, row, bx, ch, li in st["ended_now"]]
+        self.held_batches.append({"st": st, "ended": ended,
+                                  "jobs": [(d, t) for d, _, _, t in todo if t is not None]})
+        if tasks:
+            t_rc = time.perf_counter()
+            if self.submit_task is not None:
+                for t in tasks:
+                    self.submit_task(t)
+            else:
+                self._run_tasks(tasks)
+            self.sec["recover"] += time.perf_counter() - t_rc
+        self._release()
+        while len(self.held_batches) > self.hold_max:
+            self._release(block=True)
+        self.stats["held_peak"] = max(self.stats["held_peak"], len(self.held_batches))
         t_f = time.perf_counter()
         self._flush(fh, seq - self.horizon)
         self.sec["flush"] += time.perf_counter() - t_f
-        return extra_rec
+        return self.take_recover_reads()
 
-    def _recover(self, jobs: list[tuple]) -> list[tuple[int, bool]]:
-        """递归二分：每个任务 `(chain, 新文本, 新分数, pend)` 里 pend[j] 的文本未知，端点是 held（chain.text）和新读。
-        逐任务返回 (用掉的 rec 次数, 有没有把历史行的文本改掉)——改过就说明变化点比这一帧早，调用方要作废那一段的边界证据。
-
-        `pend` 是**这一帧之前**的沿用行（窗口模式下更晚的那些是"读还没回来时按旧文本写出去的"，由调用方前向回填）。
-        **缓存的回收不在这里做**——统一交给 `_drop_pending`，不然会出现"条目丢了、`cache_bytes` 没退"的虚高
+    def _lend(self, chain: Chain, before: list[list], task: RecoverTask) -> None:
+        """这几帧的沿用行和裁剪交给回补任务：从链上摘下来，字节的账从链挪到任务，任务收尾时（`_release`）才退给预算。
+        ⚠ **账只在这里和 `_drop_pending` / `_release` 里动**——手工切 `chain.pending` 不退就是虚高
         （2026-09-19 实测：缓存虚高 -> `cache_forced` 多触发 -> 判决变了，14 行产物不同）。"""
-        # 每个任务自己的端点表和栈；同一层里所有任务的中点**一次**发出去（`rec_many`）
-        texts = [{-1: (ch.text, ch.conf), len(pend): (t, c)} for ch, t, c, pend in jobs]
-        stacks = [[(-1, len(pend))] for _, _, _, pend in jobs]
-        reads = [0] * len(jobs)
-        changed = [False] * len(jobs)
-        # **按层走**（2026-09-19，首轮审计第 2 条）：同一层的几个中点互不依赖（每个区间只看自己的端点），
-        # 所以可以一次性发出去；2026-09-26 起同一帧里各条链的同一层也并在一起发。`rec_many` 没给就退化成逐个读——
-        # 两条路的**读和结果完全一样**，差别只在"发几次"
+        lent = {id(p) for p in before}
+        nb = sum(int(p[2].nbytes) for p in before)
+        chain.pending = [p for p in chain.pending if id(p) not in lent]
+        chain.cache_bytes -= nb
+        task.cache_bytes = nb
+
+    def _run_tasks(self, tasks: list[RecoverTask]) -> None:
+        """同步回补：这一帧的任务当场跑完。**按层走**（2026-09-19，首轮审计第 2 条）：同一层的几个中点互不依赖，
+        所以一次发出去；2026-09-26 起同一帧里各条链的同一层也并在一起发。`rec_many` 没给就退化成逐个读——
+        两条路的**读和结果完全一样**，差别只在"发几次"。"""
+        layer = [(t, t.next_layer()) for t in tasks]
         while True:
-            layer = []                         # (任务, lo, mid, hi)
-            for k, stack in enumerate(stacks):
-                tx = texts[k]
-                for lo, hi in stack:
-                    if hi - lo <= 1 or same_text(tx[lo][0], tx[hi][0]):
-                        continue
-                    layer.append((k, lo, (lo + hi) // 2, hi))
-                stacks[k] = []
+            layer = [(t, cs) for t, cs in layer if cs]
             if not layer:
-                break
-            crops = [jobs[k][3][m][2] for k, _, m, _ in layer]
+                return
+            crops = [c for _, cs in layer for c in cs]
             got = (self.rec_many(crops) if self.rec_many is not None
                    else [self.rec_one(c) for c in crops])
-            for (k, lo, mid, hi), (t, c) in zip(layer, got):
-                pend = jobs[k][3]
-                reads[k] += 1
-                texts[k][mid] = (t, c)
-                row = pend[mid][1]
-                changed[k] = changed[k] or not same_text(t, row["text"])
-                row["text"], row["conf"] = t, round(c, 4)
-                row.pop("reused", None)
-                row.pop("link", None)
-                row["recovered"] = True
-                # 中点这一行是**真读过的**：`same_text` 判"没改历史"（标点变体）时也换成这次的读数——它是一次独立观测，
-                # 留旧写法反而是拿沿用的文本冒充真读（2026-09-26 查过，不改）。中点到 hi 之间推断的那几行改成"相同就不覆盖"
-                # 也不会改变任何输出：`same_text` 可传递，一行最后没被读到，说明它所在区间两端的读数"相同"、父区间却不同，
-                # 所以最后一次覆盖它的读数一定和它当时的文本"不同"，两种写法留下的值一样
-                for j in range(mid + 1, hi):
-                    changed[k] = changed[k] or not same_text(t, pend[j][1]["text"])
-                    pend[j][1]["text"], pend[j][1]["conf"] = t, round(c, 4)
-                stacks[k] += [(lo, mid), (mid, hi)]
-        self.stats["recover_reads"] += sum(reads)
-        self.stats["recover_events"] += len(jobs)
-        return list(zip(reads, changed))
+            k = 0
+            for t, cs in layer:
+                t.feed(got[k:k + len(cs)])
+                k += len(cs)
+            layer = [(t, t.next_layer()) for t, _ in layer]
+
+    def _release(self, block: bool = False) -> None:
+        """按帧序送出扣住的回抠批次：最老那一批的回补任务都做完了，就改行、退缓存的账、定作废标记、送 `edge.sample`。
+        `block` 时最老那一批没做完就等它（等的任务插队），之后能送的照送、不再等。"""
+        while self.held_batches:
+            b = self.held_batches[0]
+            left = [t for _, t in b["jobs"] if not t.done]
+            if left:
+                if not block:
+                    return
+                t_w = time.perf_counter()
+                self.wait_tasks(left)
+                self.stats["recover_waits"] += 1
+                self.sec["recover"] += time.perf_counter() - t_w
+                block = False
+            self.held_batches.pop(0)
+            st = b["st"]
+            stale: set[int] = set()            # 这一批里历史文本被回补改过的链 uid
+            for d, t in b["jobs"]:
+                t.apply()
+                self.cache -= t.cache_bytes
+                t.cache_bytes = 0
+                self.recovered_out += t.reads
+                self.stats["recover_reads"] += t.reads
+                self.stats["recover_events"] += 1
+                if self.trace is not None:
+                    self.trace.append({"seq": st["seq"], "box": list(d["box"]), "chain": d["chain"].uid,
+                                       "link": "recover", "gate": "recover", "corr": None,
+                                       "digit": None, "read": True, "n_reads": t.reads})
+                # **回补改的是过去，链事件只能往前发**（2026-09-17 审计）：文本从 `AAA / AAA / BBB` 被改成
+                # `AAA / BBB / BBB` 之后，变化点其实在上一个采样点，而在线回抠这一批才收到 "changed"——
+                # 它开的打字机窗晚一个采样点，旧句的结尾窗也挂在一行已经被改写的文本上。
+                # 帧环只留 5 个采样间隔，回补能往回摸 --refresh-every 个采样点，重新量是不可能的；
+                # 所以**把这一批受影响的证据标成 stale**，第二遍当没量到、该 run 退回采样级（口径同 short）。
+                # 事件重放 / 按链保留像素 2026-09-17 量过不做：要改帧环的生命周期，不值（reuse-budget 计划 §8 第 2 条）。
+                if t.changed:
+                    stale.add(d["chain"].uid)
+                    self.stats["edge_stale"] += 1
+            if self.edge is not None:
+                t_e = time.perf_counter()
+                self.edge.sample(st["seq"], st["idx"], st["t_us"], [tuple(e) for e in st["events"]],
+                                 b["ended"], stale)
+                self.sec["edge"] += time.perf_counter() - t_e
+
+    def take_recover_reads(self) -> int:
+        """自上次取过之后收尾的回补读数（调用方并进 rec 的计数）。"""
+        n, self.recovered_out = self.recovered_out, 0
+        return n
+
+    def finish_recover(self) -> int:
+        """收尾：等完全部回补任务、送出全部扣住的批次（在 `pool.close` 和 `edge.finish` 之前）。返回其间收尾的回补读数。"""
+        while self.held_batches:
+            self._release(block=True)
+        return self.take_recover_reads()
+
+    def _release_if_done(self, chain: Chain) -> None:
+        """已结束的链最后一次在途读结算完：整条丢缓存（结束之后又沿用过的那几帧也在内，`upto` 丢不掉它们）。"""
+        if chain.inflight == 0 and any(c is chain for c in self.held):
+            self._drop_pending(chain)
+            self.held = [c for c in self.held if c is not chain]
 
     def _drop_pending(self, chain: Chain, upto: int | None = None) -> None:
         """丢掉这条链缓存着的裁剪（回补用的）。`upto` 给了就只丢 `seq <= upto` 的那些——
@@ -580,14 +691,39 @@ class ReuseV2:
         chain.cache_bytes -= freed
         self.cache -= freed
 
-    def _flush(self, fh, upto: int) -> None:
-        if self.edge is not None and any(k <= upto for k in self.buf):
-            # 写之前等 edge 证据挂上：不是等那一批本身，是等它开的段都停变了（edge_refine.settled_by）；
-            # 主线程因此按辅助流的节奏背压，辅助流慢于 OCR 时墙钟跟着慢，但证据不丢
-            self.edge.wait_batch(min(self.edge.settled_by(upto), self.seq))
-        for s in sorted(k for k in self.buf if k <= upto):
+    def _flush(self, fh, upto: int, lag: int | None = None) -> None:
+        """写出 `upto` 及以前的行。写之前等 edge 证据挂上：不是等那一批本身，是等它开的段都停变了（edge_refine.settled_by）；
+        主线程因此按辅助流的节奏背压，辅助流慢于 OCR 时墙钟跟着慢，但证据不丢。
+        `--flush-lag N`：证据还没挂齐的行最多留 N 个采样点不写、不等（窗口大时结算成堆，逐帧等会一口气等完这一堆）；
+        攒到 N 个以上才等，等到只剩 N 个。"""
+        # 还没做完的回补任务会改的行不写（任务最远改到 --refresh-every + --reuse-mem 帧之前，平时 horizon 已经盖住，这里兜底）
+        upto = min([upto] + [t.lo_seq - 1 for b in self.held_batches for _, t in b["jobs"]])
+        keys = sorted(k for k in self.buf if k <= upto)
+        if not keys:
+            return
+        if self.edge is not None:
+            need = lambda k: min(self.edge.settled_by(k), self.seq)      # noqa: E731
+            lag = self.flush_lag if lag is None else lag
+            if not lag:
+                self._wait_edge(need(upto))
+            else:
+                n = next((i for i, k in enumerate(keys) if not self.edge.ready(need(k))), len(keys))
+                self.stats["flush_deferred"] += len(keys) - n
+                if len(keys) - n > lag:
+                    n = len(keys) - lag
+                    self._wait_edge(need(keys[n - 1]))
+                keys = keys[:n]
+        for s in keys:
             for row in self.buf.pop(s):
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    def _wait_edge(self, k: int) -> None:
+        """等回抠做完第 k 批。要等的批还扣在这边就先送出去，不然主线程等回抠、回抠等主线程放批（`hold_max` 让这里平时碰不到）。"""
+        while self.held_batches and self.held_batches[0]["st"]["seq"] <= k:
+            self._release(block=True)
+        self.edge.wait_batch(k)
+
     def flush_all(self, fh) -> None:
-        self._flush(fh, 10 ** 12)
+        if self.held_batches:
+            raise RuntimeError(f"落盘收尾时还扣着 {len(self.held_batches)} 批回抠（先 finish_recover，池子关了就等不到了）")
+        self._flush(fh, 10 ** 12, lag=0)

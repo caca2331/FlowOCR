@@ -113,6 +113,7 @@ def report_arm(d: Path, runs: dict, arm: str, min_conf: float, srtio) -> None:
     """一条臂和 A 比：墙钟（逐轮 + 中位）、观测对账、臂内确定性、主轨。"""
     tot_a = tot_b = 0.0
     cpu_rows: list[tuple] = []
+    gpu_rows: list[tuple] = []
     tot = {"rows": 0, "cmp_rows": 0, "only_a": 0, "only_b": 0, "text_diff": 0,
            "gate_cross_same_text": 0, "fate_changed": 0}
     print(f"\n==== {arm} 对 A ====")
@@ -138,6 +139,9 @@ def report_arm(d: Path, runs: dict, arm: str, min_conf: float, srtio) -> None:
                              max(x["peak_commit_mb"] for x in ca), max(x["peak_commit_mb"] for x in cb),
                              max((x.get("gpu_mem_delta_mb", -1) for x in ca), default=-1),
                              max((x.get("gpu_mem_delta_mb", -1) for x in cb), default=-1)))
+            if all("gpu_busy_sec" in x for x in ca + cb):
+                gpu_rows.append((sid, [x["gpu_busy_sec"] for x in ca], [x["gpu_busy_sec"] for x in cb],
+                                 [x["wall_sec"] - x["gpu_busy_sec"] for x in ca], [x["wall_sec"] - x["gpu_busy_sec"] for x in cb]))
         c = compare_obs(ma[ks[0]][1], mb[ks[0]][1], min_conf)
         det = []
         for name, mm in (("A", ma), (arm, mb)):
@@ -177,6 +181,17 @@ def report_arm(d: Path, runs: dict, arm: str, min_conf: float, srtio) -> None:
             print(f"  {sid:<20}{ma_:>9.1f}{mb_:>9.1f}{mb_ / ma_ - 1:>+8.1%}  {rr:<22}{pa:>10.0f}{pb:>10.0f}{ga:>10}{gb:>10}")
         print(f"  CPU 合计（各段中位之和）：{ca_tot:.1f} → {cb_tot:.1f} s = {cb_tot / ca_tot - 1:+.1%}"
               + ("" if len(cpu_rows) == len(runs) else f"（只有 {len(cpu_rows)} / {len(runs)} 段两臂都有旁注）"))
+    if gpu_rows:
+        print("\n  GPU（整卡，`nvidia-smi` 有核在跑的比例 × 采样间隔累加，含起动和桌面；空 = jobcpu 的墙钟减忙，逐段中位）：")
+        print(f"  {'片段':<20}{'A 忙 s':>9}{arm + ' 忙 s':>9}{'Δ':>8}{'A 空 s':>9}{arm + ' 空 s':>9}{'Δ':>8}")
+        t = [0.0, 0.0, 0.0, 0.0]
+        for sid, ba, bb, ia, ib in gpu_rows:
+            m = [statistics.median(v) for v in (ba, bb, ia, ib)]
+            t = [x + y for x, y in zip(t, m)]
+            print(f"  {sid:<20}{m[0]:>9.1f}{m[1]:>9.1f}{m[1] / max(m[0], 1e-9) - 1:>+8.1%}"
+                  f"{m[2]:>9.1f}{m[3]:>9.1f}{m[3] / max(m[2], 1e-9) - 1:>+8.1%}")
+        print(f"  GPU 忙合计：{t[0]:.1f} → {t[1]:.1f} s = {t[1] / max(t[0], 1e-9) - 1:+.1%}；"
+              f"空合计：{t[2]:.1f} → {t[3]:.1f} s = {t[3] / max(t[2], 1e-9) - 1:+.1%}")
     if tot_a:
         print(f"合计（各段中位之和）：{tot_a:.2f} → {tot_b:.2f} s = {tot_b / tot_a - 1:+.1%}"
               f"（**加总会被框多的段主导**，跨素材比别拿这个数）")

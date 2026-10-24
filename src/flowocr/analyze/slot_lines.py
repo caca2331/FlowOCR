@@ -18,9 +18,11 @@ y 跨度随这一分钟里出现过几行而变。在那一层做任何几何缝
 
 支持度不够的 run（行位覆盖 < `MIN_SUPPORT` 个窗）各自成单例。
 
+管线（`build_tracks --cluster lines`）在两步之上再并"同刻同框的上下行"（`band_cooccur`），散 run 回落到缝合分组
+（`groups_for_pipeline`）；聚类的尺量的就是这份分组（`slot_pairs.pipeline_assign`）。
+
 用法：
-    from flowocr.analyze import slot_lines; asg = slot_lines.assign(L)      # run 下标 -> 带号
-    python -m flowocr.analyze.slot_lines f5 gi2
+    python -m flowocr.analyze.slot_lines f5 gi2        # 各片的带数、最大的几条带（散 run 各自成单例）
 """
 from __future__ import annotations
 
@@ -200,12 +202,12 @@ def band_cooccur(lines: list, sig: list[dict], runs: list, band: list[int], gap_
 
 
 def groups_for_pipeline(runs: list, W: int, H: int, fallback: dict[int, int] | None = None) -> list[list[int]]:
-    """给 `build_tracks --cluster lines` 用（实验性）：run 列表 -> 每个区域的 run 下标。行位 -> 带（`assign` 同一套），
+    """给 `build_tracks --cluster lines` 用（实验性）：run 列表 -> 每个区域的 run 下标。行位 -> 带（`band_of`）再并同刻同框的上下行（`band_cooccur`），
     **没进任何行位的散 run** 按 `fallback`（run 下标 -> 现行缝合给它的槽位号）归堆，同 `slot_learned.groups_for_pipeline`：
     不归堆的话单字残片各自成一个 noise 区域，逐区域产物多出几百个文件。"""
     from types import SimpleNamespace
     lines, free, sig = line_slots(SimpleNamespace(runs=runs, W=W, H=H))
-    band = band_cooccur(lines, sig, runs, band_of(sig))       # 管线要同刻同框的几行在一条轨上（尺用的 assign 不并这一步）
+    band = band_cooccur(lines, sig, runs, band_of(sig))       # 管线要同刻同框的几行在一条轨上
     by: dict = {}
     for k, (_, mem) in enumerate(lines):
         for i in mem:
@@ -218,27 +220,12 @@ def groups_for_pipeline(runs: list, W: int, H: int, fallback: dict[int, int] | N
     return [sorted(v) for v in by.values()]
 
 
-def assign(L, bw_y: float = BW_Y, bw_x: float = BW_X, min_support: int = MIN_SUPPORT,
-           gap_h: float = GAP_H) -> dict[int, int]:
-    lines, free, sig = line_slots(L, bw_y, bw_x, min_support)
-    band = band_of(sig, bw_x, gap_h)
-    out: dict[int, int] = {}
-    for k, (_, mem) in enumerate(lines):
-        for i in mem:
-            out[i] = band[k]
-    nxt = len(lines)
-    for i in sorted(free):
-        out[i] = nxt
-        nxt += 1
-    return out
-
-
 if __name__ == "__main__":
     from flowocr.analyze import cluster_layers as CL
     from collections import Counter
     for tag in sys.argv[1:]:
         L = CL.load(tag)
-        asg = assign(L)
+        asg = {i: k for k, g in enumerate(groups_for_pipeline(L.runs, L.W, L.H)) for i in g}
         c = Counter(asg.values())
         big = c.most_common(6)
         single = sum(1 for v in c.values() if v == 1)

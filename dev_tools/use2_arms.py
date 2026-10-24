@@ -3,6 +3,9 @@
 
     python dev_tools/use2_arms.py <out> <臂名=build_tracks 参数>... [--tags a,b 或 tag@obs 路径] [--jobs 4]
     臂的写法：name=--region-h-ratio 0 --slot-h-ratio 0（等号后面原样当 build_tracks 参数，空 = 默认）
+比臂的代价侧用 `dup_other`（带内重复认领里回显判定为"其他"的，报警看它）；`dup_band`（带内合计，含重播和回显）、`dup`（全部）留作参考。
+`gametext` 素材上的主尺（owner 2026-10-07）是 `dev_tools/miss_detect.py` 在匹配产物上量的"该出现的行的输出覆盖"，只数有内容（≥3 字）的行：
+`md_*` 几栏，含义见 `miss_detect.ruler`；主轨命中（`main_hit`，game_align）留作诊断栏。
 """
 import argparse
 import json
@@ -15,7 +18,9 @@ from pathlib import Path
 
 CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "src"))
+sys.path.insert(0, str(CODE / "dev_tools"))
 from flowocr import paths  # noqa: E402
+import miss_detect as MD  # noqa: E402
 
 ROOT = paths.data_root()
 PY = sys.executable
@@ -52,9 +57,18 @@ def one(out: Path, arm: str, args: list[str], tag: str) -> dict:
     res["match_rc"] = rc
     # **读不到数就是没有数**，不许记成 0（2026-09-24 Codex 审计 P2：失败的臂会看起来更好）；缺了的键进 `missing`
     pats = {("denom", "cover"): r"覆盖：该上屏的 (\d+) 条里 (\d+)/", ("_", "dup"): r"重复认领：(\d+) 条被 ≥2 条 cue 认领，多出 (\d+) 次",
+            # 比臂的代价侧看带内"其他"（回显判定，2026-10-06：重播、回显不是错）；带内合计留作参考列
+            ("dup_band",): r"带内（该在字幕带的台词）\d+ 条、多出 (\d+) 次",
+            ("dup_other",): r"\*\*其他 (\d+)（报警看这个）\*\*",
             ("suspect",): r"<0\.85 的 (\d+) 条", ("cues_fed",): r"cue (\d+) 条 ->"}
     rc2, txt2 = run([PY, "-m", "flowocr.analyze.game_align", ref, "--subs", tr, "--show", "0"], d / "align.log")
     res["align_rc"] = rc2
+    (d / "miss.json").unlink(missing_ok=True)      # 别读到上一次的
+    rc3, _ = run([PY, str(CODE / "dev_tools" / "miss_detect.py"), str(d / "matched.json"), "--no-pack", "--show", "0",
+                  "--out", str(d / "miss.json")], d / "miss.log") if rc == 0 else (1, "")
+    res["miss_rc"] = rc3
+    if (d / "miss.json").exists() and rc == 0:
+        res.update(MD.ruler(json.loads((d / "miss.json").read_text(encoding="utf-8"))))
     pats2 = {("main_hit",): r"命中 (\d+)（", ("main_cues",): r"：(\d+) 条 cue；"}
     missing = []
     for src, table in ((txt if rc == 0 else "", pats), (txt2 if rc2 == 0 else "", pats2)):
@@ -67,8 +81,10 @@ def one(out: Path, arm: str, args: list[str], tag: str) -> dict:
     if "suspect" in missing and rc == 0 and "改写幅度" not in txt:
         missing.remove("suspect")              # 一条 cue 都没换成原文时 scriptmatch 不打这一行，0 是真值
         res["suspect"] = 0
-    if missing or rc or rc2:
-        res["error"] = f"match_rc {rc} / align_rc {rc2}；读不到 {missing}（看 {d}/*.log）"
+    if "md_den" not in res:
+        missing.append("md_den")
+    if missing or rc or rc2 or rc3:
+        res["error"] = f"match_rc {rc} / align_rc {rc2} / miss_rc {rc3}（1 也可能是不变量没过）；读不到 {missing}（看 {d}/*.log）"
     return res
 
 
