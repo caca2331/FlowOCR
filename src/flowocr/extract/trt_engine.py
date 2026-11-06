@@ -24,8 +24,8 @@ det：长边封 960、32 对齐、最小 32，16:9 横屏一律 544×960，批�
 建好就占约 1.8 GB、上限 4 时约 1.0 GB，4×544×960 的速度一样（2026-10-16，`tmp/meas/trt/detprof/`）；`--det-batch` 给到 5 以上的批按次退回 CUDA EP。
 rec：高 48、宽 320..3200 十档、批 ≤16（批 × 宽 ≤ 20480 封顶，16×3200 实际不出现）。**只能一个 profile**：
 ORT 1.29 的 TensorRT EP 建得出多 profile 的引擎，但跑的时候只用第一个，落进第二个的形状 enqueue 失败（`tmp/meas/trt/mprof/`）。"""
-WORKSPACE = {"det": 2 << 30, "rec": 1 << 30}
-"""建引擎的 workspace 上限：det fp32 在 profile 上限 8×960×960 时给 1 GB 建不出来（找不到实现）；上限 4 时 1 / 2 GB 都建得出、
+WORKSPACE = {"det": 2 << 30, "rec": 1 << 30, "lama": 2 << 30}
+"""建引擎的 workspace 上限（lama 是阶段 5 的修补模型：输入形状固定、不要 profile，2 GB 照 inpainting 原型）：det fp32 在 profile 上限 8×960×960 时给 1 GB 建不出来（找不到实现）；上限 4 时 1 / 2 GB 都建得出、
 session 显存和速度一样，留 2 GB 的余量；rec 1 GB 建得出（quick A/B 的临时钩子就是这档），
 给大了引擎挑的实现会多占显存（rec fp32 4 GB 时一个 session 约 2.6 GB、1 GB 时约 1.8 GB，整卡读数，带噪声）。"""
 
@@ -58,10 +58,12 @@ def profile_shapes(spec: str) -> list[tuple[int, ...]]:
 
 def provider_options(kind: str, precision: str, prefix: str, cache: Path, device: int = 0) -> dict:
     """TensorRT EP 的选项（布尔值只认 'True' / 'False'，写错整个 EP 静默退回 CUDA EP——`make_session` 断言首选 provider 真是 TRT）。"""
-    lo, opt, hi = PROFILES[kind]
-    return {"device_id": device, "trt_fp16_enable": str(precision == "fp16"), "trt_max_workspace_size": str(WORKSPACE[kind]),
-            "trt_engine_cache_enable": "True", "trt_engine_cache_path": str(cache), "trt_engine_cache_prefix": prefix,
-            "trt_profile_min_shapes": lo, "trt_profile_opt_shapes": opt, "trt_profile_max_shapes": hi}
+    o = {"device_id": device, "trt_fp16_enable": str(precision == "fp16"), "trt_max_workspace_size": str(WORKSPACE[kind]),
+         "trt_engine_cache_enable": "True", "trt_engine_cache_path": str(cache), "trt_engine_cache_prefix": prefix}
+    if kind in PROFILES:                            # 没有 profile 的模型（lama）输入形状固定
+        lo, opt, hi = PROFILES[kind]
+        o.update(trt_profile_min_shapes=lo, trt_profile_opt_shapes=opt, trt_profile_max_shapes=hi)
+    return o
 
 
 def _sha256(p: Path) -> str:
@@ -116,14 +118,15 @@ def make_session(kind: str, model: Path, precision: str, prefix: str, cache: Pat
 
 
 def smoke(sess, kind: str) -> None:
-    """每个 profile 的 min / opt / max 各跑一次：引擎能跑、浮点输出是有限数。"""
+    """每个 profile 的 min / opt / max 各跑一次（没有 profile 的按各输入的固定形状跑一次全零）：引擎能跑、浮点输出是有限数。"""
     import numpy as np
-    name = sess.get_inputs()[0].name
-    for spec in PROFILES[kind]:
-        for shape in profile_shapes(spec):
-            outs = sess.run(None, {name: np.zeros(shape, np.float32)})
-            if not all(np.isfinite(o).all() for o in outs if o.dtype.kind == "f"):
-                raise RuntimeError(f"{kind} {shape} 输出有 NaN / Inf")
+    ins = sess.get_inputs()
+    feeds = ([{ins[0].name: np.zeros(shape, np.float32)} for spec in PROFILES[kind] for shape in profile_shapes(spec)]
+             if kind in PROFILES else [{i.name: np.zeros(i.shape, np.float32) for i in ins}])
+    for feed in feeds:
+        outs = sess.run(None, feed)
+        if not all(np.isfinite(o).all() for o in outs if o.dtype.kind == "f"):
+            raise RuntimeError(f"{kind} {[f.shape for f in feed.values()]} 输出有 NaN / Inf")
 
 
 if os.name == "nt":

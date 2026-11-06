@@ -36,6 +36,7 @@ sys.path.insert(0, str(CODE / "dev_tools"))
 sys.path.insert(0, str(CODE / "src"))   # 正式包（没装 flowocr 的 venv 里也能跑）
 from flowocr import paths  # noqa: E402
 from archive import archive_root  # noqa: E402
+from pyrun import code_env, interpreter  # noqa: E402
 os.chdir(paths.data_root())
 
 ap = argparse.ArgumentParser()
@@ -47,8 +48,7 @@ VIDEO = str(archive_root() / "gamestream/slices/wuwa-s2.mp4")     # h264：硬�
 OUT = Path("tmp/hwretry/out.jsonl")
 ORPHAN = Path("tmp/hwretry/orphan.pid")
 OUT.parent.mkdir(parents=True, exist_ok=True)
-PY = str(next((p for p in (CODE / ".venv/Scripts/python.exe", CODE / ".venv/bin/python") if p.exists()),
-               CODE / ".venv/Scripts/python.exe"))   # 开发 venv（Windows 的 Scripts、Linux 的 bin）
+PY = str(interpreter(CODE))   # pyrun 挑的开发 venv（槽里没有就用主 checkout 的）；子进程的 PYTHONPATH 由 code_env 钉到 $CODE/src
 
 
 def alive(pid: int, ct: float) -> bool:
@@ -62,7 +62,7 @@ def alive(pid: int, ct: float) -> bool:
 def main() -> int:
     for f in (OUT, ORPHAN):
         f.unlink(missing_ok=True)
-    env = dict(os.environ, FLOWOCR_FAULT_HWACCEL_AT="8", FLOWOCR_FAULT_ORPHAN=str(ORPHAN.resolve()))
+    env = code_env(CODE, dict(os.environ, FLOWOCR_FAULT_HWACCEL_AT="8", FLOWOCR_FAULT_ORPHAN=str(ORPHAN.resolve())))
     env.pop("FLOWOCR_OCR_WORKER", None)                          # 要从监督者那一层起
     if a.no_job:
         env["FLOWOCR_FAULT_NO_JOB"] = "1"

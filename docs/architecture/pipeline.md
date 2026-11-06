@@ -51,9 +51,9 @@ obs 没有证据就用默认设置重跑 (1)。
 
 ## 3. 回抠结算：`flowocr.analyze.refine_boundaries`（建轨末尾，`--refine auto`）
 
-不开视频：拿 obs 行的 `edge` 证据配到回抠标签区域（subtitle、dialogue-or-caption）的 run 上，按 `flowocr.extract.typewriter_fuse` 多信号融合出**首字出现 / 全字出现**
+不开视频：拿 obs 行的 `edge` 证据配到各区域的 run 上（全部区域；整段的文字效果和打字速度只从 subtitle、dialogue-or-caption 两类统计，[defaults.md 1.65](defaults.md#165-回抠覆盖全部区域文字效果只从正文区域统计2026-10-24)），按 `flowocr.extract.typewriter_fuse` 多信号融合出**首字出现 / 全字出现**
 （OCR 中途读数外推、首字格开始出现、逐字格定稿的稳健直线、尾字格定稿；每条记 `t_full_how`），结尾窗逐字格量字形对比度出**完全显示结束 / 完全消失**
-（`t_full_end` + `t_end`，`t_end_how` = curve / ncc；测量窗里一直没看到消失的记开放边界 `open`）。量不到的时刻留采样级。结算完 SRT 重出，最后才写 `tracks.json`。
+（`t_full_end` + `t_end`，`t_end_how` = curve / ncc；测量窗里一直没看到消失的记开放边界 `open`；末段还在平移的 run 不收早于采样级的终点、留采样级，记 `moving`）。量不到的时刻留采样级。结算完 SRT 重出，最后才写 `tracks.json`。
 开视频的离线测量只留在开发探针 `dev_tools/refine_offline_probe.py` 里核对在线证据。依据：[defaults.md 1.29](defaults.md#129-建轨顺带结算回抠build_tracks---refine-auto2026-09-25-owner-定)。
 
 ## 4. 哪些判据以采样间隔为单位

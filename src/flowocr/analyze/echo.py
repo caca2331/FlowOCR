@@ -15,7 +15,7 @@
   （后一次同一区域判 `replay`），记录面板也不会因为离台词框不到 `NEAR` 秒被判成同一次出现的 `same_time` / `other`、在 SRT 里多出一条。
   一行的认领全是 `log_panel` 的照下面的规则。`naninovel` 不给这个属性（恒为假），判定和原来逐项相同。
 * **其余标形态**：主那次出现里另一区域的认领 → `same_time`（同一区域、和主相接的不算，落到 `other`）；别的出现里，按顺序：
-  认领的 cue 面板样 → `log`；和主同一区域 → `replay`；另一区域、这一刻（起点 ± `LOG_WINDOW` 秒）各区域一共认领了 ≥ `LOG_BATCH` 条别的**旧行**
+  认领的 cue 面板样 → `log`；和主同一区域 → `replay`；另一区域、这一刻（起点 ± `LOG_WINDOW` 秒，有采样网格时按格号，见 `classify`）各区域一共认领了 ≥ `LOG_BATCH` 条别的**旧行**
   （那一行这次认领比它最早一次认领晚 > `LOG_OLD` 秒）→ `log`；剩下的 → `other`（报警留给人看）。
   "成批旧行"只判另一区域的（2026-10-06 定）：SRT 只去掉确定是回显的，宁可多一条重复也不删真台词——同区域的再现统一叫重播
   （原神 NPC 重复问候时选项菜单同刻重现、顺序剧本连续快速回看，都是同区域的真重演赶上了成批旧行）。
@@ -30,11 +30,12 @@ from dataclasses import dataclass
 from typing import Callable
 
 from flowocr.artifacts import matchedio
+from flowocr.extract.framegrid import TimeGrid
 
 NEAR = 2.0
 """同一次出现：同一行的两次认领时段重叠或相隔不超过这么多秒（同 `scriptmatch.MERGE_GAP`）。"""
 LOG_WINDOW = 1.0
-"""记录面板"这一刻"的半宽（秒）：别的认领的起点离这次认领的起点不超过这么多。"""
+"""记录面板"这一刻"的半宽（秒）：别的认领的起点离这次认领的起点不超过这么多；有采样网格时折成格数、按格号比（`classify`）。"""
 LOG_OLD = 10.0
 """旧行：那一行的这次认领比它最早的一次认领晚这么多秒以上。"""
 LOG_BATCH = 2
@@ -98,17 +99,57 @@ def occurrences(cs: list[Claim]) -> list[list[Claim]]:
     return out
 
 
-def classify(claims: list[Claim], anchor: dict[str, float] | None) -> dict[tuple[int, int], tuple[str, tuple[int, int]]]:
-    """(记录, slot) -> (形态, 主的 (记录, slot))；只认领一次的行和主不在里面。`anchor` 是 None 时每行取最早那次出现当主。"""
+Grid = tuple[Callable[[float], int], int]
+"""(起点秒 -> 它被采到的那一格的格号, `LOG_WINDOW` 折成几格)，`grid_of` 给，"这一刻"按格号比。"""
+
+
+def grid_of(doc: dict) -> Grid | None:
+    """tracks 的采样网格（`Grid`）：网格取 obs 带进 `meta` 的 `sample_grid`，旧产物退到等距的 `stride`，再退到 `src_fps` / `sample_fps`；
+    都没有（只有 SRT 的、很旧的产物）返回 None，"这一刻"照原来按秒比。
+    格号是起点所在帧往后取的最近一格：采样级的起点就在格上；回抠过的起点落在它被采到的那一格之前不到一个间隔（融合把首字夹在
+    [采样起点 − 一个间隔, 采样起点]），往后取回到的正是那一格。
+    两处会差一格：融合把首字恰好放在下界（前一格那一帧，gi1 事件 2680 从 673.5 s 回抠到 673.0 s）时还原成前一格——那是融合估计字在那一帧已经出现（估计，不是逐帧证实），按估计的出现时刻算前一格也说得通；
+    时刻按名义帧率换成帧号（`round(t × src_fps)`，同网格的帧号约定），pts 和名义帧率差出半帧以上的素材上落在边界的起点也会差一格。
+    要分毫不差得在产物里留回抠前的采样起点，没做：前一种按估计的出现时刻归格本身说得通，后一种要素材的时钟本来就偏。"""
+    m = doc.get("meta") or {}
+    fps = m.get("src_fps")
+    if not fps:
+        return None
+    if m.get("sample_grid"):
+        g = TimeGrid(*m["sample_grid"])
+    elif m.get("stride"):
+        g = TimeGrid.every(int(m["stride"]))
+    elif m.get("sample_fps"):
+        g = TimeGrid.for_rate(float(fps), float(m["sample_fps"]))
+    else:
+        return None
+    fps = float(fps)
+    return (lambda t: g.index(g.ceil(round(t * fps)))), round(LOG_WINDOW * 1e6 / g.interval_us(fps))
+
+
+def in_window(keys: list, x, half) -> tuple[int, int]:
+    """`keys`（升序）里落在 [x − half, x + half] 的下标区间 [lo, hi)。"""
+    return bisect.bisect_left(keys, x - half), bisect.bisect_right(keys, x + half)
+
+
+def classify(claims: list[Claim], anchor: dict[str, float] | None,
+             grid: Grid | None = None) -> dict[tuple[int, int], tuple[str, tuple[int, int]]]:
+    """(记录, slot) -> (形态, 主的 (记录, slot))；只认领一次的行和主不在里面。`anchor` 是 None 时每行取最早那次出现当主。
+
+    `grid`（`grid_of`）给了时"这一刻"按**采样格号**比：差不超过 `LOG_WINDOW` 折成的那几格。窗口量的是"同一次面板打开"，不该被起点精度左右：
+    回抠把起点挪到帧级后，同一次打开的面板里各行差的不再是整数个间隔（hsr 6378.0 s 打开的记录面板，邻行的起点从 6377.0 s 挪到 6376.7 s，
+    差 1.28 s，按秒比 ±1 s 数不到、整批旧行判成 other）；按秒放宽又分不开（25 fps 按 2 fps 采时间隔 12 / 13 帧交替，回抠后差两格的可以差 1.48 s，
+    采样级差三格的最近也只差 1.48 s）。格号把两者都还原到采样网格上。没有 `grid` 时照原来按秒比（± `LOG_WINDOW`）。"""
     by_rep: dict[str, list[Claim]] = defaultdict(list)
     for c in claims:
         by_rep[c.rep].append(c)
     first = {k: min(c.start for c in cs) for k, cs in by_rep.items()}
     order = sorted(claims, key=lambda c: c.start)
-    starts = [c.start for c in order]
+    slot, half = grid if grid else ((lambda t: t), LOG_WINDOW)
+    keys = [slot(c.start) for c in order]                 # 格号随起点不减，仍是升序
 
     def old_batch(c: Claim) -> int:
-        lo, hi = bisect.bisect_left(starts, c.start - LOG_WINDOW), bisect.bisect_right(starts, c.start + LOG_WINDOW)
+        lo, hi = in_window(keys, slot(c.start), half)
         return len({d.rep for d in order[lo:hi] if d.rep != c.rep and d.start - first[d.rep] > LOG_OLD})
 
     out: dict[tuple[int, int], tuple[str, tuple[int, int]]] = {}
@@ -150,10 +191,12 @@ def classify(claims: list[Claim], anchor: dict[str, float] | None) -> dict[tuple
 
 
 def mark(recs: list[dict], source_of: list[str], main_of: list[bool], panel_of: list[bool],
-         anchor: dict[str, float] | None, rep: Callable[[str], str] = lambda k: k, log_panel_of: list[bool] | None = None) -> None:
+         anchor: dict[str, float] | None, rep: Callable[[str], str] = lambda k: k, log_panel_of: list[bool] | None = None,
+         grid: Grid | None = None) -> None:
     """就地给每条记录和它的每条 `extra` 写 `echo` / `echo_of`（见文件头）。认领、时间、文本都不动。
-    `source_of` / `main_of` / `panel_of` / `log_panel_of` 按喂入 cue 的下标（记录的 `cues`）：来源区域、在不在主轨上、是不是面板样、是不是真记录面板（不给就都不是）。"""
-    got = classify(claims_of(recs, source_of, main_of, panel_of, rep, log_panel_of), anchor)
+    `source_of` / `main_of` / `panel_of` / `log_panel_of` 按喂入 cue 的下标（记录的 `cues`）：来源区域、在不在主轨上、是不是面板样、是不是真记录面板（不给就都不是）。
+    `grid`：tracks 的采样网格（`grid_of`）；只有 SRT、不知道时 None（`classify`）。"""
+    got = classify(claims_of(recs, source_of, main_of, panel_of, rep, log_panel_of), anchor, grid)
     for i, r in enumerate(recs):
         for slot, x in [(-1, r)] + list(enumerate(r.get("extra") or ())):
             form, of = got.get((i, slot), (None, None))

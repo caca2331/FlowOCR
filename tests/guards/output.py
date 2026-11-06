@@ -12,6 +12,11 @@ import re  # noqa: E402,F401
 from guards._common import *  # noqa: F401,F403
 
 
+def _gen(ln: str) -> bool:
+    """阶段 4 的生成行（Effect `fo-fx`，底板 `fo-fx|plate`）。"""
+    return ",fo-fx," in ln or ",fo-fx|plate," in ln
+
+
 def _disp(fill: str = "on", **tiers: str) -> dict:
     """匹配产物夹具的 `display`（显示协议）：`组名=档位`；两个保留组没给就是 `off`。"""
     tiers = {"unmatched": "off", "unfed": "off", **tiers}
@@ -949,6 +954,17 @@ def t_overlay_style() -> None:
           "第二行框不在第一行里，照算",
           [e["id"] for e in OV.typing_events([whole, line2, frag])] == [0, 2]
           and OV.effect_times(it_frag, raw, fr)[0] == 1_500_000)
+    # 淡出的碎片判据要同时在屏（defaults.md 1.68）：hsr 1:46:16 那句在 6377.5 s 断了一下、6378.0 s 起重新读出，框落在早先那次里
+    early = ev(50, [504, 467, 1644, 494], t0=0, t1=900_000, t_full_sampled=0, t_full_end=880_000)
+    again = ev(51, [504, 467, 1642, 494], t0=1_500_000, t1=10_000_000, t_full_sampled=1_500_000, t_full_end=10_000_000 - 10_000)
+    it_again = OV.Item(0, 10_000_000, [early["box"]], ["あいう"], "line", events=[early, again])
+    check("效果·碎片：更早、已经消失的同句读数不把后来的正文事件变成碎片，淡出不从早先那次消失时算（hsr 1:46:16 画成 124 s 的淡出）；"
+          "打字机照旧把后出现的那个当碎片（不然判出 1.5 s 假打字机）；和原行同时在屏的 det 切行碎片两边都去掉",
+          OV.effect_times(it_again, raw, fr) == (0, 0, 0)
+          and [e["id"] for e in OV.typing_events(it_again.events)] == [50]
+          and [e["id"] for e in OV.fade_events(it_again.events)] == [50, 51]
+          and [e["id"] for e in OV.fade_events([whole, line2, frag])] == [0, 2],
+          OV.effect_times(it_again, raw, fr))
     # 重读（检测器三场修复计划 U4）：zzz 7512.0 s 那句，台词框退场下移，最后一帧每行另起 n_obs 1 的事件
     S_ = 1_000_000
     r1, r2 = [355, 446, 620, 466], [356, 469, 604, 483]
@@ -971,6 +987,14 @@ def t_overlay_style() -> None:
     check("效果·重读：淡出照样从最后那段读数算（对话记录滚动时同一行在新位置重读，排掉的话淡出从第一段算、拉成几十秒）",
           [e["id"] for e in OV.effect_events(scroll, 500_000)] == [40] and OV.effect_times(it_scroll, raw, fr)[2] == 500_000,
           OV.effect_times(it_scroll, raw, fr))
+    # hsr 2982.0 s：对话记录合上时那行滑走（末段在动的门把终点从 12.02 s 留到采样级 12.5 s），11.9 s 起台词框里重读出同一句
+    line = "ここからは、俺もこの世界に目を向けなくては。"
+    rr = lambda how: [ev(60, [0, 0, 600, 30], t0=0, t1=12_500_000, t_full_sampled=0, t_end_how=how, text=line),  # noqa: E731
+                      ev(61, [100, 300, 700, 330], t0=11_900_000, t1=14_200_000, t_full_sampled=12_000_000, text=line)]
+    check("效果·重读：原事件的终点是末段在动的门留下的采样级（moving）时多容一个采样间隔，照样认出重读（hsr 2982.0 s 打字机从 6.1 s 回到 0）；"
+          "终点是量出来的就照原来只容一个间隔",
+          [e["id"] for e in OV.effect_events(rr("moving"), 500_000)] == [60]
+          and [e["id"] for e in OV.effect_events(rr("curve"), 500_000)] == [60, 61])
     check("效果·重读：和第一行同时在屏的短第二行（字恰好都在第一行里，gi1 0:39:39）不是重读",
           [e["id"] for e in OV.effect_events([first, short2], 500_000)] == [8, 9])
     twin = [ev(20, [0, 0, 100, 30], t0=0, t1=S_, text="LEVEL"), ev(21, [0, 40, 100, 70], t0=0, t1=S_, text="LEVEL")]
@@ -1004,6 +1028,13 @@ def t_overlay_style() -> None:
           "都量到了照常按最晚的完全显示结束算",
           OV.effect_times(two(l2o), refined, fr)[2] == 0 and OV.effect_times(two(l2c), refined, fr)[2] == 0
           and OV.effect_times(OV.Item(0, 5_500_000, [l1["box"]], ["一行"], "line", events=[l1]), refined, fr)[2] == 700_000)
+    # hsr 6376.75 s：对话记录里同一处先读到一次（已消失、量到了 t_full_end），后一次随面板滚走、终点留在采样级（moving，没有 t_full_end）
+    gone = ev(0, [0, 0, 100, 30], t0=0, t1=800_000, t_full_end=780_000, t_end_how="curve")
+    slid = ev(1, [0, 0, 100, 30], t0=1_200_000, t1=9_750_000, t_end_how="moving")
+    check("效果·成员里有末段在动的（moving：终点留在采样级、没有 t_full_end）：整条不做淡出，和开放边界一样，"
+          "不借早先那次已消失读数的 t_full_end（hsr 6376.75 s 画成 9 s 的淡出）",
+          OV.effect_times(OV.Item(0, 9_750_000, [gone["box"]], ["一行"], "line", events=[gone, slid]), refined, fr)[2] == 0
+          and OV.effect_times(two(ev(1, [0, 40, 100, 70], t0=0, t1=5_500_000, t_end_how="moving")), refined, fr)[2] == 0)
     check("效果·整段 instant 但离散度 > 1（判不清，gi-s2 回抠产物是 2.63）：按逐条的帧数门走，拿不准时跟着原文打字的节奏",
           OV.effect_times(item(t_full=1_000_000, t_full_how=ok), unclear, fr)[:2] == (1_000_000, 0)
           and OV.effect_times(item(t_full=40_000, t_full_how=ok), unclear, fr)[:2] == (0, 0))
@@ -1100,7 +1131,7 @@ def t_script_fx() -> None:
             return doc_.dumps(), ts
 
         def gen(txt: str, actor: str):
-            return [ln for ln in txt.splitlines() if ln.startswith("Dialogue:") and ",fo-fx," in ln
+            return [ln for ln in txt.splitlines() if ln.startswith("Dialogue:") and _gen(ln)
                     and ln.split(",")[4] == actor]
 
         final, ts = run(text)
@@ -1109,12 +1140,23 @@ def t_script_fx() -> None:
         TS.restore(rest)
         check("阶段 4 可以反复重跑：跑在自己的输出上逐字节相同；restore 还原出逐字节相同的字幕稿",
               again == final and rest.dumps() == text)
+        marked = [ln for ln in final.splitlines() if ",fo-fx|plate," in ln]
+        drawn = [ln for ln in final.splitlines() if _gen(ln) and "\\p1" in ln]
+        check("底板的标（阶段 5 只认它）：底板行 Effect 是 fo-fx|plate，正文、编号仍是 fo-fx；这份稿里没有别的绘图，底板 = 全部 \\p1 生成行",
+              marked and marked == drawn and all(ln.startswith("Dialogue:") for ln in marked), (len(marked), len(drawn)))
+        claim = d / "fx_claim.py"                      # 扩展效果把自己画的框叫作 plate：不打标（阶段 5 只抹阶段 4 自己画的底板）
+        claim.write_text((ROOT / "examples" / "fx_minimal.py").read_text(encoding="utf-8").replace('"frame")]', '"plate")]'),
+                         encoding="utf-8")
+        claimed, _ = run(text.replace(",fo:ev=1;", ",fo:frame;ev=1;", 1), fx=(str(claim),))
+        boxes = [ln for ln in claimed.splitlines() if "\\1a&HFF&\\3c&HFFFFFF&" in ln]
+        check("底板的标只给阶段 4 自己画的底板：扩展效果自称 plate 的框仍是 fo-fx",
+              boxes and all(",fo-fx," in ln for ln in boxes) and claimed.count(",fo-fx|plate,") == final.count(",fo-fx|plate,"), boxes[:1])
         check("生成行：派生样式 <Style>.fo-fx（BorderStyle 1、描边 2）、Effect fo-fx；源行改成 Comment、Effect 前面加 fo-src|",
               "Style: Body.fo-fx," in final and ",1,2,0,5," in final.split("Style: Body.fo-fx,")[1].split("\n")[0]
               and all(ln.startswith("Comment:") for ln in final.splitlines() if ",fo-src|" in ln)
               and sum(",fo-src|fo:" in ln for ln in final.splitlines()) == 5)
         check("生成行：打字机换成逐字 \\alpha（\\ko 不进最终文件）；多行按原框逐行摆",
-              "\\ko" not in "".join(ln for ln in final.splitlines() if ",fo-fx," in ln)
+              "\\ko" not in "".join(ln for ln in final.splitlines() if _gen(ln))
               and len([x for x in gen(final, "r0") if x.startswith("Dialogue: 1,") and "0:00:00.00" in x]) == 2)
         e_rows = [x for x in gen(final, "r0") if x.startswith("Dialogue: 1,") and "0:00:06.00" in x]
         check("一个原文框、译文两行：按原来一行的高度往下扩出一行、逐行摆，两行都画（原来按框 zip 只画第一行）",
@@ -1428,7 +1470,7 @@ def t_plate_grow() -> None:
             ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **kw))
             doc_ = AF.loads(txt)
             ts.run(doc_)
-            return [ln for ln in doc_.dumps().splitlines() if ",fo-fx," in ln and "\\p1" in ln], ts
+            return [ln for ln in doc_.dumps().splitlines() if _gen(ln) and "\\p1" in ln], ts
         plates, ts = run(text)
         check("阶段 4：打字机行的底板带 \\clip，字没出现之前零面积，全字后每行都盖上",
               plates and all("\\clip(" in p for p in plates) and ts.counts.get("plate_grow") == 1
@@ -1534,7 +1576,7 @@ def t_sentence_items() -> None:
             ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **kw))
             doc_ = AF.loads(txt)
             ts.run(doc_)
-            return [ln for ln in doc_.dumps().splitlines() if ",fo-fx," in ln and "\\p1" not in ln], ts
+            return [ln for ln in doc_.dumps().splitlines() if _gen(ln) and "\\p1" not in ln], ts
         lines, ts = run(text)
         second = [ln for ln in lines if "二" in ln]
         check("阶段 4：第二行的字在 3 s 才出现（不从条目起点画），第一行从起点",
@@ -1547,7 +1589,7 @@ def t_sentence_items() -> None:
             ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **kw))
             doc_ = AF.loads(txt)
             ts.run(doc_)
-            return [ln for ln in doc_.dumps().splitlines() if ",fo-fx," in ln and "\\p1" in ln]
+            return [ln for ln in doc_.dumps().splitlines() if _gen(ln) and "\\p1" in ln]
         for mode in ("on", "dim"):
             low = [pl for pl in plates(text, typewriter=mode)
                    if "\\clip(" in pl and int(re.search(r"\\pos\(\d+,(\d+)\)", pl).group(1)) > 940]   # 第二行的底板
@@ -1892,7 +1934,7 @@ def t_plate_grow_modes() -> None:
 
         def plates(txt, actor):
             return [ln.split("\\1a&H20&", 1)[1] for ln in txt.splitlines()
-                    if ",fo-fx," in ln and "\\p1" in ln and ln.split(",")[4] == actor]
+                    if _gen(ln) and "\\p1" in ln and ln.split(",")[4] == actor]
         out, _ = run(text)
         t_on = plates(out, "r0")
         from flowocr.output.layout import OVERLAY_PAD as pd
@@ -1938,6 +1980,96 @@ def t_plate_grow_modes() -> None:
         calls = next(iter(ts_m.fx.values())).CALLS
         check("扩展效果的 tags 挂点：切成两块的一行，底板上调两次、两块都带它改的东西",
               calls == [0, 0] and all("\\blur1" in p for p in plates(mk, "r0")), (calls, plates(mk, "r0")))
+
+
+def t_plate_src() -> None:
+    """`plate=src`（owner 2026-10-30）：只盖原文各行，译文超出原文的部分不加底板——译文比原文宽时底板仍是原文框加边距，
+    译文多扩出的行没有底板，打字机行只跟着原文长、全字后等于原文框；`rows` 对照着照旧并进译文。"""
+    print("底板只盖原文（plate=src）")
+    import re
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.output import script as SC
+    from flowocr.output.layout import OVERLAY_PAD as pd
+    from flowocr.typeset import assfile as AF
+    from flowocr.typeset import core as TS
+
+    doc = {"size": [1920, 1080], "frame_us": 500_000, "meta": {"src_fps": 30.0}}
+
+    def ev(i, box, f=None):
+        e = {"id": i, "box": box, "t_start": 0, "t_end": 6_000_000, "region": 0, "text": "x"}
+        return {**e, "t_full_sampled": f} if f else e
+    narrow = [900, 900, 1020, 940]
+    it_w = SC.Item(0, 6_000_000, [narrow], ["很长很长很长很长的一行译文"], "line", events=[ev(1, narrow)],
+                   region=0, translated=True, layer="body")
+    it_x = SC.Item(0, 6_000_000, [[600, 600, 1300, 640]], ["一行\n二行"], "line", events=[ev(2, [600, 600, 1300, 640])],
+                   region=1, translated=True, layer="body")
+    it_t = SC.Item(0, 6_000_000, [narrow], ["很长很长很长很长的一行译文"], "line", events=[ev(3, narrow, 2_000_000)],
+                   region=2, translated=True, layer="body")
+    single = [600, 500, 1300, 580]
+    it_s = SC.Item(0, 6_000_000, [single], ["一行原文\n二行原文"], "line", events=[ev(4, single, 2_000_000)], region=3)
+    it_f = SC.Item(0, 6_000_000, [[600, 300, 1300, 340], [700, 345, 1200, 385]], ["一行"], "line",
+                   events=[ev(5, [600, 300, 1300, 340]), ev(5, [700, 345, 1200, 385])], region=4, translated=True, layer="body")
+    with tempfile.TemporaryDirectory() as td, patch.object(export, "ink_widths", fake_widths):
+        d = Path(td)
+        SC.export_script(d / "m.script.ass", [it_w, it_x, it_t, it_s, it_f], doc)
+        text = (d / "m.script.ass").read_text(encoding="utf-8")
+
+        def run(txt=None, **kw):
+            ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **kw), TS.load_fx(()))
+            doc_ = AF.loads(txt or text)
+            ts.run(doc_)
+            return doc_.dumps()
+
+        def rects(txt, actor):
+            out = []
+            for ln in txt.splitlines():
+                if _gen(ln) and "\\p1" in ln and ln.split(",")[4] == actor:
+                    x, y = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", ln).groups())
+                    w, h = (float(v) for v in re.search(r"m 0 0 l ([\d.]+) 0 [\d.]+ ([\d.]+)", ln).groups())
+                    out.append(((x, y, x + w, y + h), ln))
+            return out
+        static_rows, static_src = run(typewriter="off"), run(typewriter="off", plate="src")
+        want = (narrow[0] - pd, narrow[1] - pd, narrow[2] + pd, narrow[3] + pd)
+        w_rows, w_src = rects(static_rows, "r0"), rects(static_src, "r0")
+        check("译文比原文宽：rows 的底板并进译文（比原文框宽），src 只有原文框加边距",
+              len(w_rows) == 1 and w_rows[0][0][2] - w_rows[0][0][0] > want[2] - want[0] + 100
+              and [r for r, _ in w_src] == [want], (w_rows, w_src))
+        x_rows, x_src = rects(static_rows, "r1"), rects(static_src, "r1")
+        check("译文多出一行（按原来一行的高度扩出去）：rows 两块，src 只有原文那一块",
+              len(x_rows) == 2 and len(x_src) == 1 and x_src[0][0][1] == 600 - pd and x_src[0][0][3] == 640 + pd, (x_rows, x_src))
+        t_src = rects(run(plate="src"), "r2")
+        clip_full = _clip_at(t_src[0][1].split("\\1a&H20&", 1)[1], 6000) if t_src else None
+        check("打字机行：src 一块，clip 只跟着原文长，全字后等于原文框加边距（不并进译文显出的部分）",
+              len(t_src) == 1 and "\\clip" in t_src[0][1] and clip_full == want
+              and all(_clip_at(t_src[0][1].split("\\1a&H20&", 1)[1], t)[2] <= want[2] for t in (1, 500, 1500, 3000)),
+              (t_src, clip_full))
+
+        box_of = lambda r: (r[0] - pd, r[1] - pd, r[2] + pd, r[3] + pd)          # noqa: E731
+        s_line = next(ln for ln in text.splitlines() if ",r3," in ln)
+        grown = text.replace(s_line, s_line + "\\N三行原文")
+        g_rows, g_src = rects(run(grown, typewriter="off"), "r3"), rects(run(grown, typewriter="off", plate="src"), "r3")
+        check("单框扩行（一个框装两行、正文加到三行，框往下扩一行）：rows 的底板跟着扩，src 仍是原文框加边距",
+              ";cap=2;" in s_line and len(g_src) == 1 and g_src[0][0] == box_of(single) and g_rows[0][0][3] > box_of(single)[3],
+              (g_rows, g_src))
+        s_tw = rects(run(plate="src"), "r3")
+        check("单框打字机：src 一块，全字后 clip 等于静态底板（原文框加边距）",
+              len(s_tw) == 1 and "\\clip" in s_tw[0][1] and _clip_at(s_tw[0][1].split("\\1a&H20&", 1)[1], 6000) == box_of(single), s_tw)
+        f_src = rects(static_src, "r4")
+        check("行数对不上（两个原文框、一行译文，free）：src 一块，取两个原文框的外接矩形加边距",
+              [r for r, _ in f_src] == [box_of([600, 300, 1300, 385])], f_src)
+        w_line = next(ln for ln in text.splitlines() if ",r0," in ln)
+        pos = re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", w_line)
+        moved = text.replace(w_line, w_line.replace(pos[0], "\\pos(%s,%s)" % (float(pos[1]) + 300, float(pos[2]) - 200), 1))
+        m_src = rects(run(moved, typewriter="off", plate="src"), "r0")
+        check("人挪过位置（\\pos 和 was 不一样）：src 的底板留在原文框上，不跟着字走",
+              [r for r, _ in m_src] == [want], m_src)
+        rb = text.replace(w_line, w_line.replace("很长很长很长很长", "{ruby:很长很长很长的读音}很长{/ruby}很长很长很长", 1))
+        r_src, r_rows = rects(run(rb, typewriter="off", plate="src"), "r0"), rects(run(rb, typewriter="off"), "r0")
+        check("带读音：src 的底板不并进读音（和没有读音时一样）；rows 并进去、往上长",
+              [r for r, _ in r_src] == [want] and r_rows[0][0][1] < w_rows[0][0][1], (r_src, r_rows))
 
 
 def t_ink_shift() -> None:
@@ -1990,13 +2122,78 @@ def t_ink_shift_plates() -> None:
             d = AF.loads(p.read_text(encoding="utf-8"))
             ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", plate="text"))
             ts.run(d)
-            lines = [ln for ln in d.dumps().splitlines() if ",fo-fx," in ln]
+            lines = [ln for ln in d.dumps().splitlines() if _gen(ln)]
             plate = next(ln for ln in lines if "\\p1" in ln)
             text = next(ln for ln in lines if "\\p1" not in ln)
             got[rsb] = (float(plate.split("\\pos(")[1].split(",")[0]), text.split("}")[0], int(text.split("\\fs")[1].split("}")[0].split("\\")[0]))
     (x0, t0, fs), (x1, t1, _) = got[0.0], got[0.5]
     check("右留白 0.5 字号：text 底板左移 0.25 × 字号（±1 px），正文的位置和字号不变",
           abs((x0 - x1) - 0.25 * fs) <= 1 and t0 == t1, got)
+
+
+def t_stacked_axes() -> None:
+    """名牌下的称号和名字共用锚轴（gi-s2 0:45 摆帧：称号的框只框进右边的花纹，按自己的框居中歪出 19 px）：
+    阶段 3 的预览位置和阶段 4 的正文都按名字的中心；时间不重叠、不紧挨着、不比它高的不算；人挪过的不动。"""
+    print("名牌和称号共用锚轴")
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from flowocr.output import export, layout
+    from flowocr.output import script as SC
+    from flowocr.typeset import assfile as AF
+    from flowocr.typeset import core as TS
+
+    name, title = [890, 849, 1028, 892], [930, 893, 1024, 923]          # 名字中心 959、称号中心 977
+    got = layout.stacked_axes([(0, 10, name), (0, 5, title), (20, 30, title), (0, 10, [930, 960, 1024, 990]),
+                               (0, 10, [700, 893, 760, 921]), None], [0.0] * 6, 1920)
+    check("称号和它的名字都取名字的中心；时间不重叠、隔得远、名字的中心不在框里的不取",
+          got == [959.0, 959.0, None, None, None, None], got)
+    edge = layout.stacked_axes([(0, 10, [1760, 849, 1900, 892]), (0, 10, [1790, 893, 1870, 923])], [200.0, 60.0], 1920)
+    check("名字和称号贴着画面右边、名字的译文长：两条按名字的字宽一起往里推，轴还是同一根（原来逐条推，名字 1814、称号 1830）",
+          edge == [1914 - 100.0] * 2, edge)
+    ui = layout.stacked_axes([(0, 10, [436, 768, 502, 806]), (0, 10, [160, 808, 512, 844]),      # 星铁菜单：字号相同、宽框
+                              (0, 10, name), (0, 10, [1000, 893, 1300, 921])], [0.0] * 4, 1920)                   # 称号框的中心不在名字框里
+    check("被误标成名牌的 UI：上下两行同一字号的不取（星铁「派閥」「35/35」）；两框中心不互相落在对方框里的不取", ui == [None] * 4, ui)
+    doc = {"size": [1920, 1080], "frame_us": 500_000, "meta": {"src_fps": 30.0}}
+    its = [SC.Item(0, 3_000_000, [name], ["施拉姆"], "name", region=0, translated=True, layer="body"),
+           SC.Item(0, 3_000_000, [title], ["佣兵"], "title", region=0, translated=True, layer="body")]
+    with tempfile.TemporaryDirectory() as td, patch.object(export, "ink_widths", fake_widths):
+        pth = Path(td) / "e.script.ass"
+        SC.export_script(pth, its, doc)
+        raw = pth.read_text(encoding="utf-8")
+        pos = [ln.split("\\pos(")[1].split(",")[0] for ln in raw.splitlines() if ln.startswith("Dialogue:")]
+        styles = [ln.split(",")[3] for ln in raw.splitlines() if ln.startswith("Dialogue:")]
+
+        def stage4(text):
+            d = AF.loads(text)
+            TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off")).run(d)
+            return [ln.split("\\pos(")[1].split(",")[0] for ln in d.dumps().splitlines()
+                    if _gen(ln) and "\\p1" not in ln]
+        out = stage4(raw)
+        moved = stage4(raw.replace("\\pos(959,908)", "\\pos(990,908)"))
+    check("阶段 3 的预览位置、阶段 4 的正文：称号（样式 Title）都在名字的中心 959",
+          pos == ["959", "959"] and out == ["959", "959"] and styles == ["Name", "Title"], (pos, out, styles))
+    check("人在字幕稿里挪过称号：照人给的位置", moved == ["959", "990"], moved)
+    rname, rtitle = [1760, 849, 1900, 892], [1790, 893, 1870, 923]
+    its = [SC.Item(0, 3_000_000, [rname], ["施拉姆施拉姆施拉姆"], "name", region=0, translated=True, layer="body"),
+           SC.Item(0, 3_000_000, [rtitle], ["佣兵"], "title", region=0, translated=True, layer="body")]
+    with tempfile.TemporaryDirectory() as td, patch.object(export, "ink_widths", fake_widths):
+        pth = Path(td) / "r.script.ass"
+        SC.export_script(pth, its, doc)
+        raw = pth.read_text(encoding="utf-8")
+        rpos = [ln.split("\\pos(")[1].split(",")[0] for ln in raw.splitlines() if ln.startswith("Dialogue:")]
+        rout = stage4(raw)
+    check("贴着画面右边、名字译文长到要往里推：阶段 3 的预览位置、阶段 4 的正文里名字和称号仍是同一根轴，且都往里推过",
+          len(set(rpos)) == 1 and len(set(rout)) == 1 and float(rpos[0]) < 1830, (rpos, rout))
+    its = [SC.Item(0, 3_000_000, [rname], ["施拉"], "name", region=0, translated=True, layer="body"),
+           SC.Item(0, 3_000_000, [rtitle], ["佣兵"], "title", region=0, translated=True, layer="body")]
+    with tempfile.TemporaryDirectory() as td, patch.object(export, "ink_widths", fake_widths):
+        pth = Path(td) / "f.script.ass"
+        SC.export_script(pth, its, doc)
+        raw = pth.read_text(encoding="utf-8")
+        fout = stage4(raw.replace("}佣兵", "}佣{\\fs200}兵"))
+    check("人在字幕稿里给称号行内加了 \\fs、称号变得比名字宽：阶段 4 按实际画出来的字宽一起避边，名字和称号仍是同一根轴",
+          len(fout) == 2 and len(set(fout)) == 1 and float(fout[0]) < 1830, fout)
 
 
 def t_plate_box_tall() -> None:
@@ -2020,7 +2217,7 @@ def t_plate_box_tall() -> None:
         SC.export_script(p, [it], doc)
         d = AF.loads(p.read_text(encoding="utf-8"))
         TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", plate="box")).run(d)
-        pl = next(ln for ln in d.dumps().splitlines() if ",fo-fx," in ln and "\\p1" in ln)
+        pl = next(ln for ln in d.dumps().splitlines() if _gen(ln) and "\\p1" in ln)
     import re
     x0, y0 = (int(v) for v in re.search(r"\\pos\((\d+),(\d+)\)", pl).groups())
     w, h = (int(v) for v in re.search(r"m 0 0 l (\d+) 0 \d+ (\d+)", pl).groups())
@@ -2091,6 +2288,7 @@ def t_plate_color() -> None:
         check("阶段 3 把产物记的源视频写进字幕稿的 FlowOCR Video", f"FlowOCR Video: {provenance.portable(vid)}" in text)
 
         def run(txt, look="default", video=None, fx=(), **kw):
+            kw.setdefault("plate_color", "on" if look == "default" else TS.LOOKS[look].plate_color)   # 取色默认关：这里测的是打开时
             ts = TS.Typesetter(replace(TS.LOOKS[look], **kw), TS.load_fx(fx), video=video)
             dd = AF.loads(txt)
             ts.run(dd)
@@ -2193,6 +2391,8 @@ def t_plate_color() -> None:
         check("视频开头的短行（0–0.04 s）取的是 0 s 那帧（解码起点不为负，帧的时刻不错位）",
               len(fc) == 1 and de(fc[0][2], LIGHT) <= 4, fc)
         check("dev、plate_color=off 不取色、不读视频：没有 P.fo-fx", "P.fo-fx" not in dev + off and "\\p1" in dev + off)
+        check("底板取色默认关（owner 2026-10-31：默认近黑半透明底板），两种外观都不开",
+              TS.LOOKS["default"].plate_color == TS.LOOKS["dev"].plate_color == "off")
         check("plate_color 只认 off / on", raises(lambda: TS.look_of("default", {"plate_color": "auto"}), ValueError))
 
         r0 = next(ln for ln in text.splitlines() if ln.startswith("Dialogue:") and ",r0," in ln)
@@ -2203,6 +2403,9 @@ def t_plate_color() -> None:
         check("扩展效果画的框（也是 \\p1 矩形）不当底板：不切格、不换样式、不改色，和不取色时逐字相同；取色照旧",
               ";plate;frame" in framed and len(frame_of(f_on)) == 1 and frame_of(f_on) == frame_of(f_off)
               and cells(f_on) == got, frame_of(f_on))
+        check("底板的标：取色换成的小格都带 fo-fx|plate，扩展效果画的框不带（阶段 5 不抹它）",
+              all(",fo-fx|plate," in ln for ln in f_on.splitlines() if ",P.fo-fx," in ln)
+              and all(",fo-fx|plate," not in ln and ",fo-fx," in ln for ln in frame_of(f_on)), frame_of(f_on))
         mine = text.replace(r0, r0.replace("あいう", "{\\1c&H00FF00&}あいう", 1))
         mb = next(ln for ln in run(mine)[0].splitlines() if ",r0," in ln and ",Body.fo-fx," in ln and "\\p1" not in ln)
         check("行首手写的 \\1c 写在自动字色之后（libass 取后写的），压过自动黑白字",
@@ -2291,7 +2494,7 @@ def t_placeholder_fill() -> None:
         out = d.dumps()
         TS.restore(d)
         back = d.dumps()
-    gen = [re.sub(r"\{[^}]*\}", "", ln.split(",", 9)[9]) for ln in out.splitlines() if ",fo-fx," in ln and "\\p1" not in ln]
+    gen = [re.sub(r"\{[^}]*\}", "", ln.split(",", 9)[9]) for ln in out.splitlines() if _gen(ln) and "\\p1" not in ln]
     check("字幕稿正文是标记、图例在 [Script Info]；阶段 4 换成值、空的连同落单的逗号删掉；还原逐字节相同",
           "[`0:荧]，你好" in src and "FlowOCR Placeholder 1: {X} 匹配器没给值" in src
           and gen == ["荧，你好", "走吧", "嗯，荧。"] and ts.fills == {("{NICKNAME}", "荧"): 2, ("{X}", ""): 1}
@@ -2363,7 +2566,7 @@ def t_game_style() -> None:
           "{\\1c&H91C2DB&}金色的{\\b1}话\\N第{\\1c\\b0}二行" in body[0]
           and body[1].endswith("}没有样式") and n["styled"] == 1, body)
     check("SRT 是基础输出：带样式的条目照样出纯文字", SC.srt_text(items[0]) == ["金色的话第二行"], SC.srt_text(items[0]))
-    gen = [ln for ln in out.splitlines() if ",fo-fx," in ln and "\\p1" not in ln and "金色" in ln]
+    gen = [ln for ln in out.splitlines() if _gen(ln) and "\\p1" not in ln and "金色" in ln]
     check("阶段 4：剧本的字色标签照画；dev 给整行定了字色时，闭标签（空的 \\1c）回到这一行的字色，不回样式的白",
           gen and all("\\1c&H91C2DB&" in ln and not re.search(r"\\1c(?=[\\}])", ln.split("}", 1)[1]) for ln in gen), gen)
 
@@ -2475,7 +2678,7 @@ def t_game_ruby() -> None:
             src = p.read_text(encoding="utf-8")
             d = AF.loads(src)
             TS.Typesetter(replace(TS.LOOKS["dev"], plate_color="off")).run(d)
-        return src, [ln for ln in d.dumps().splitlines() if ",fo-fx," in ln and "\\p1" not in ln], n
+        return src, [ln for ln in d.dumps().splitlines() if _gen(ln) and "\\p1" not in ln], n
     src, gen, n = run(styled)
     _s, ref, n0 = run(RT.select(styled, ruby=False))
     body = [ln for ln in src.splitlines() if ln.startswith("Dialogue:")][0]
@@ -2522,7 +2725,7 @@ def t_game_ruby_draw() -> None:
         d = AF.loads(text)
         with patch.object(export, "ink_widths", fake_widths):
             ts.run(d)
-        return [ln for ln in d.dumps().splitlines() if ",fo-fx," in ln], ts
+        return [ln for ln in d.dumps().splitlines() if _gen(ln)], ts
 
     def body(ln):
         return ln.split(",", 9)[9]
@@ -2739,6 +2942,23 @@ def t_delivery_cases() -> None:
             raised = True
         check("交付病例：ASS 的 PlayRes 和病例视频尺寸不同时锚点换算到视频像素；病例没写 size 就报错",
               got[0]["verdict"] == "完整" and raised, (got, raised))
+        # 选项菜单（hsr2-choice 的形状）：三个按钮上下相邻，第三个折成两行、各画一条事件；删掉一个按钮要判成缺
+        menu = ["[Events]",
+                "Dialogue: 1,0:00:49.00,0:00:54.00,Body.fo-fx,r43,0,0,0,fo-fx,{\\an5\\pos(1469,575)\\fs41}ナイスアイデア！",
+                "Dialogue: 1,0:00:49.00,0:00:54.00,Body.fo-fx,r26,0,0,0,fo-fx,{\\an5\\pos(1466,657)\\fs37}それでいけるの？",
+                "Dialogue: 1,0:00:49.00,0:00:54.00,Body.fo-fx,r17,0,0,0,fo-fx,{\\an5\\pos(1467,730)\\fs35}虚照に聞いたとこ",
+                "Dialogue: 1,0:00:49.00,0:00:54.00,Body.fo-fx,r17,0,0,0,fo-fx,{\\an5\\pos(1447,761)\\fs36}無駄だったね。"]
+        opts = [{"id": "o1", "kind": "option", "text": "ナイスアイデア！", "box": [1354, 554, 1586, 598], "t_on": 48.8, "t_off": 53.8},
+                {"id": "o2", "kind": "option", "text": "それでいけるの？", "box": [1358, 639, 1574, 676]},
+                {"id": "o3", "kind": "option", "text": "虚照に聞いたとこ無駄だったね。", "box": [1358, 713, 1576, 781]}]
+        mp = Path(td) / "menu.ass"
+        mp.write_text("\n".join(menu), encoding="utf-8")
+        full = [DC.judge(o, 51.0, DC.parse_ass(mp)) for o in opts]
+        mp.write_text("\n".join(menu[:1] + menu[2:]), encoding="utf-8")
+        cut = [DC.judge(o, 51.0, DC.parse_ass(mp)) for o in opts]
+        check("交付病例·选项：相邻按钮不拼进来、折成两行的按钮拼成整句、时段对；删掉一个按钮判成缺，别的不受影响",
+              [r["verdict"] for r in full] == ["完整"] * 3 and full[0]["on_ok"] and full[0]["off_ok"]
+              and [r["verdict"] for r in cut] == ["缺", "完整", "完整"], (full, cut))
 
 
 def t_evalset_compare() -> None:

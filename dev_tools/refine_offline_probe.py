@@ -7,7 +7,8 @@
   在线证据量得对不对（owner 2026-09-26）。`--out` 另写逐事件的 TSV（写进 tmp/）。
 - **三个时刻各算各的分母**：目标 = 回抠标签区域里的全部事件；每个时刻分"两边都量到 / 只在线 / 只离线 / 都没量到"，
   差值只在"两边都量到"上算。量到的判据：首字、全字看 `t_full_how` 的 `first` / `full` 不是 `none`（是 `none` 的值是采样级退回），
-  消失看有没有 `t_end_how`（只量到结尾的事件没有 `t_full_how`，不能拿它筛），`open`（窗里没看到消失、只是下界）不算量到、另数。
+  消失看有没有 `t_end_how`（只量到结尾的事件没有 `t_full_how`，不能拿它筛），`open`（窗里没看到消失、只是下界）不算量到、另数；
+  `moving`（末段在平移、早于采样级的终点没收，留采样级）也不算量到；离线两条路没有 obs 里最后一次观测的真实框，门退回按轨迹最后一点判。
 - 两边走同一份结算（`refine_boundaries.refine_tracks`），只差证据从哪来：`obs`（在线量的 `edge`）vs `cv2` / `ffmpeg`（开视频取窗）。
   09-17 翻默认时的读数：两条离线路之间时刻 ≥ 98% 逐帧相同（reuse-budget 计划 §7）。
 - 开视频要 CPU 解码整片的窗口，长片要十几分钟；跑之前先 `hw status`。
@@ -32,7 +33,7 @@ KEYS = ("t_start", "t_full", "t_end")
 def measured(ev: dict, key: str) -> bool:
     """这个时刻是不是回抠真量出来的（不是采样级的原值或退回值）。"""
     if key == "t_end":
-        return ev.get("t_end_how") not in (None, "open")
+        return ev.get("t_end_how") not in (None, "open", "moving")
     how = (ev.get("t_full_how") or {}).get("first" if key == "t_start" else "full")
     return how not in (None, "none") and ev.get(key) is not None
 

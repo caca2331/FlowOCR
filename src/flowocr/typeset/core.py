@@ -3,9 +3,9 @@
 方案：script-fx 计划。约定（artifacts.md 的字幕稿一节）：
 
 * 源行 = `[Events]` 里 Effect 是 `fo:…`（阶段 3 写的参数）或空的 `Dialogue:`。处理过的源行改成 `Comment:`、
-  Effect 前面加 `fo-src|`；生成行 Effect 标 `fo-fx`、样式用派生的 `<Style>.fo-fx`。
+  Effect 前面加 `fo-src|`；生成行 Effect 标 `fo-fx`（底板标 `fo-fx|plate`，阶段 5 按它认出要抹的区域）、样式用派生的 `<Style>.fo-fx`。
   别的行（用户自己注释掉的、别人的 `fx`、`Banner;`…）原样留着。
-* `restore` 删掉 `fo-fx` 行和派生样式、把 `fo-src|` 行恢复成源行，得到逐字节相同的字幕稿；处理之前先自动 `restore`，
+* `restore` 删掉 `fo-fx` / `fo-fx|…` 行和派生样式、把 `fo-src|` 行恢复成源行，得到逐字节相同的字幕稿；处理之前先自动 `restore`，
   所以可以反复重跑。
 * 带 `fo` 参数的源行按参数生成，**固定顺序**：排版（分行、字号、每行锚点、量文字边界）→ 元素（正文、底板、编号，
   外加扩展的元素）→ 运动（所有元素一起按 `path` 逐段展开）→ 时间效果（逐字 `\\alpha`、`\\fad`、配色）。
@@ -34,6 +34,8 @@ from flowocr.typeset import assfile, grow, platecolor, ruby
 
 EFFECT_SRC, EFFECT_FX = "fo-src|", "fo-fx"
 """处理过的源行 Effect 的前缀（后面是原来的 Effect，`restore` 去掉它）；生成行的 Effect。"""
+EFFECT_PLATE = EFFECT_FX + "|plate"
+"""底板行的 Effect（底板取色的小格也是）：阶段 5 的 inpainting 只认它，抹掉它盖住的区域；扩展效果画的绘图仍是 `fo-fx`，不抹。"""
 FX_STYLE_SUFFIX = ".fo-fx"
 """派生样式名的后缀。`restore` 按它删派生样式，所以要一个用户不会自己起的名字（`.fx` 会撞上手起的 `Sign.fx`）。"""
 INFO_KEY = "FlowOCR Typeset"
@@ -59,7 +61,7 @@ FX_STYLE = {"OutlineColour": "&H00101010", "BackColour": "&H00000000", "BorderSt
 TYPEWRITER_MODES = ("off", "on", "dim")
 FO_PARAMS = {"ev", "key", "box", "fit", "rows", "cap", "plate", "path", "tw", "grow", "rowt", "wrap", "off", "why", "was", "spk"}
 """内置认得的 `fo` 参数；扩展效果的名字另加。不认识的当场报错（`unknown=ignore` 才跳过）。"""
-KIND_OF_STYLE = {"Panel": "block", "Choice": "choice", "Offmain": "offmain", "Name": "name"}
+KIND_OF_STYLE = {"Panel": "block", "Choice": "choice", "Offmain": "offmain", **dict.fromkeys(draft.NAME_STYLES, "name")}
 GROW_LEAD = 1.0
 """底板跟着原文长时，原文的右沿往前领先这么多个行高（约一个字宽）：原文实际比匀速快时不露出一截。"""
 
@@ -78,7 +80,8 @@ class Look:
 
 
 LOOKS = {
-    "default": Look(0x20, "rows", "on", "on", False, False, "on"),
+    # owner 2026-10-31：底板默认不取色、只用近黑底（取色留作 --opt plate_color=on）
+    "default": Look(0x20, "rows", "on", "on", False, False),
     # owner 2026-09-24：开发看——底板 50%、UI 黄字、非主轨浅蓝、底板内侧右上角红字区域号（颜色与编号位置 09-25 改）；
     # 底板不取色：半透明的近黑底板看得见底下的原文
     "dev": Look(0x80, "rows", "on", "on", True, True),
@@ -102,6 +105,8 @@ class Element:
     tail2: str = ""
     fade: bool = False
     tokens: list | None = None
+    effect: str = EFFECT_FX
+    """这一行的 Effect：阶段 4 自己画的底板是 `EFFECT_PLATE`（`plate_el`），别的都是 `fo-fx`——扩展效果自称底板（kind 写 plate）的不打标。"""
 
 
 @dataclass
@@ -124,6 +129,21 @@ class Line:
 
 # ---- 还原 ----
 
+def source_video(info: assfile.Section | None, given: str | None = None) -> str:
+    """源视频的本机路径：给了就是它，否则 `[Script Info]` 的 `FlowOCR Video`（`provenance.local` 换成本机路径）；都没有是空串。
+    不核文件在不在：阶段 4 取色、阶段 5 烧录各自报各自的错。"""
+    if given:
+        return given
+    v = next((ln.split(":", 1)[1].strip() for ln in (info.lines if info is not None else []) if ln.startswith(VIDEO_KEY + ":")), "")
+    return str(provenance.local(v)) if v else ""
+
+
+def is_fx(effect: str) -> bool:
+    """阶段 4 的生成行：Effect 是 `fo-fx` 或 `fo-fx|<种类>`（如底板的 `EFFECT_PLATE`）。"""
+    e = effect.strip()
+    return e == EFFECT_FX or e.startswith(EFFECT_FX + "|")
+
+
 def restore(doc: assfile.Doc, origin: list[int] | None = None) -> int:
     """删掉 `fo-fx` 行、派生样式和阶段 4 写的 `[Script Info]` 键，把 `fo-src|` 行恢复成源行（去掉前缀）。返回恢复的源行数。
     `origin` 给了就填上 `[Events]` 里留下的每一行原来是这一节的第几行（报提示时按用户打开的那份文件报行号）。"""
@@ -134,7 +154,7 @@ def restore(doc: assfile.Doc, origin: list[int] | None = None) -> int:
         kept = []
         for i, ln in enumerate(ev.lines):
             r = assfile.parse_row(ln, names, assfile.EVENT_KINDS) if names else None
-            if r is not None and r.get("Effect").strip() == EFFECT_FX:
+            if r is not None and is_fx(r.get("Effect")):
                 continue
             if r is not None and r.kind == "Comment" and r.get("Effect").startswith(EFFECT_SRC):
                 r.kind = "Dialogue"
@@ -355,7 +375,7 @@ def plate_el(rect: list[float], back: str, clip: str = "") -> Element:
     x0, y0, x1, y1 = (round(v) for v in rect)     # 四条边各自取整再算宽高：位置和宽高分开取整，上下相邻的两块之间会空一像素的缝
     w, h = x1 - x0, y1 - y0
     return Element(0, x0, y0, "\\an7", "\\p1\\bord0\\shad0" + back + clip,
-                   "m 0 0 l %.0f 0 %.0f %.0f 0 %.0f{\\p0}" % (w, w, h, h), "plate", fade=True)
+                   "m 0 0 l %.0f 0 %.0f %.0f 0 %.0f{\\p0}" % (w, w, h, h), "plate", fade=True, effect=EFFECT_PLATE)
 
 
 def carry_rows(rows: list[list[tuple]]) -> list[list[tuple]]:
@@ -545,9 +565,9 @@ def text_front(cells: list[tuple[str, int | None, float | None]], left: float, w
     return grow.steps(pts)
 
 
-def dialogue(layer: int, s_us: int, e_us: int, style: str, actor: str, text: str) -> str:
+def dialogue(layer: int, s_us: int, e_us: int, style: str, actor: str, text: str, effect: str = EFFECT_FX) -> str:
     return (f"Dialogue: {layer},{export.ass_time(s_us, True)},{export.ass_time(e_us, False)},"
-            f"{style}{FX_STYLE_SUFFIX},{actor},0,0,0,{EFFECT_FX},{text}")
+            f"{style}{FX_STYLE_SUFFIX},{actor},0,0,0,{effect},{text}")
 
 
 class Typesetter:
@@ -632,6 +652,7 @@ class Typesetter:
         for x in laid.values():
             self.fit(x, widths, W)
         self.same_size(laid)
+        self.stack_axes(laid, widths, W)
         out, kinds = [], []                     # kinds：逐行的种类（源行 "src"、生成行是元素的 kind、其余 None），底板取色按它认行
         for i, ln in enumerate(ev_sec.lines):
             if i not in srcs:
@@ -656,7 +677,8 @@ class Typesetter:
                      if ln.startswith("Style:")}
             pstyle = next(n for n in (f"{platecolor.STYLE}{k or ''}{FX_STYLE_SUFFIX}" for k in itertools.count())
                           if n not in taken) if base is not None else None
-            mine = {s + FX_STYLE_SUFFIX for s, r in base_style.items()     # 人改过主色的样式（或第 3 步没有的样式）：正文照它，不自动改色
+            # 主色不是默认白的样式（人改过的、阶段 3 写了游戏名牌色的 `Name` / `Title`，或第 3 步没有的样式）：正文照它，不自动改色
+            mine = {s + FX_STYLE_SUFFIX for s, r in base_style.items()
                     if r is not None and (s not in draft.STYLES or r.get("PrimaryColour").strip().upper() != draft.STYLE_FILL)}
             got = platecolor.apply(out, kinds, self.video_of(info), W, self.H, window=self.window, style=pstyle, keep=mine)
             out = got.lines
@@ -682,10 +704,7 @@ class Typesetter:
     def video_of(self, info) -> str:
         """底板取色读的视频：`--video` 给的，否则字幕稿 `[Script Info]` 的 `FlowOCR Video`（阶段 3 照产物记的）。找不到就报错——
         静默退回近黑底板会让人以为取过色。"""
-        v = self.video
-        if not v and info is not None:
-            v = next((ln.split(":", 1)[1].strip() for ln in info.lines if ln.startswith(VIDEO_KEY + ":")), "")
-            v = str(provenance.local(v)) if v else ""
+        v = source_video(info, self.video)
         if not v or not Path(v).is_file():
             raise ValueError(f"底板取色要读源视频，{'找不到 ' + repr(v) if v else '字幕稿里没有 ' + VIDEO_KEY}："
                              "用 --video 指定，或 --opt plate_color=off 不取色")
@@ -810,6 +829,32 @@ class Typesetter:
         for i, s in zip(idx, got):
             laid[i]["size"] = s
 
+    def body_tokens(self, x: dict) -> tuple[list, list, list[int]]:
+        """普通条目逐行摆的正文元素：（各行的 Ruby 标记、去掉标记的各行元素、各行字号）。排版（`generate`）和共用锚轴的测宽（`stack_axes`）都用这一份，
+        行内 `\\fs` 改过的字宽两处一样算。"""
+        tok = x["rows_tok"] if x["mode"] == "rows" else [rows_joined(x["rows_tok"])]
+        if x["rowt"]:
+            tok = with_rowt(tok, x["rowt"], self.look.typewriter != "off")
+        elif x["tw"]:
+            tok = with_tw(tok, x["tw"], x["mode"] != "rows")
+        if x["mode"] == "rows":
+            tok = carry_rows(tok)
+        marks = [ruby.rubies_of(t) for t in tok]                  # 各处 Ruby（带正文首字的出现时刻）
+        tok = [ruby.strip(t) for t in tok]                         # 正文元素里去掉标记（落单、读音空的也去掉）
+        sizes = x["sizes"] if x["mode"] == "rows" and x["sizes"] else [x["size"]] * len(tok)
+        return marks, tok, sizes
+
+    def stack_axes(self, laid: dict, widths: dict, W: int) -> None:
+        """名牌下面的称号和名字共用一根锚轴（`layout.stacked_axes`）：居中、不在动、人没挪过、只有一个原文框的名牌行参加，
+        和阶段 3 的 `script.stacks` 同一判据。定下的轴放进 `x["axis"]`，逐行摆时代替这一行自己的框中心；避画面边按一组里最宽的字宽一起推。"""
+        idx = [i for i, x in laid.items() if x["kind"] == "name" and x["an"] == layout.ANCHOR["center"] and not x["moved"]
+               and not x["path"] and len(x["src_box"]) == 1 and x["mode"] in ("rows", "single")]
+        got = layout.stacked_axes([(laid[i]["start_us"], laid[i]["end_us"], laid[i]["src_box"][0]) for i in idx],
+                                  [max((tokens_width(t, sz, laid[i]["font"], widths) for _, t, sz in zip(*self.body_tokens(laid[i]))),
+                                       default=0.0) for i in idx], W)
+        for i, a in zip(idx, got):
+            laid[i]["axis"] = a
+
     # -- 第 2–4 步：元素、运动、时间效果 --
 
     def generate(self, x: dict, widths: dict, W: int) -> list[tuple[str, str]]:
@@ -848,28 +893,20 @@ class Typesetter:
             if x["has_k"] and (x["tw"] or not x["rowt"] or any(b > a for a, b in x["rowt"])):
                 self.count("typewriter")
             box, lines = x["box"], x["lines"]
-            tok = x["rows_tok"] if x["mode"] == "rows" else [rows_joined(x["rows_tok"])]
-            if x["rowt"]:
-                tok = with_rowt(tok, x["rowt"], look.typewriter != "off")
-            elif x["tw"]:
-                tok = with_tw(tok, x["tw"], x["mode"] != "rows")
-            if x["mode"] == "rows":
-                tok = carry_rows(tok)
-            marks = [ruby.rubies_of(t) for t in tok]                  # 各处 Ruby（带正文首字的出现时刻）
-            tok = [ruby.strip(t) for t in tok]                         # 正文元素里去掉标记（落单、读音空的也去掉）
-            sizes = x["sizes"] if x["mode"] == "rows" and x["sizes"] else [size] * len(tok)
+            marks, tok, sizes = self.body_tokens(x)
             tw = [tokens_width(t, sz, x["font"], widths) for t, sz in zip(tok, sizes)]
             line_ws = [[sum(widths.get((x["font"], s), 0.0) * (z or sz) for s, z in ln) for ln in runs_of(t)]
                        for t, sz in zip(tok, sizes)]                  # 每个可见行画出来的宽（读音按它定中心、缩字号）
             plate_mode = p.get("plate") if isinstance(p.get("plate"), str) else look.plate
             if x["mode"] in ("rows", "single"):
-                axes = layout.axes_in_screen(box, tw, align, x["translated"], W)
+                axes = layout.axes_in_screen(box, tw, align, x["translated"], W, x.get("axis"))
                 ink = [a + ink_shift(t, sz, x["font"], widths, align) for a, t, sz in zip(axes, tok, sizes)]   # 墨迹实际的锚轴
                 x["rubies"] = [ruby.place(m, a, (r[1] + r[3]) / 2, "middle", align, sz, lw, x["font"], widths, W)
                                for m, a, r, sz, lw in zip(marks, ink, box, sizes, line_ws)]
-                bare = (layout.plate_rects(box, tw, ink, plate_mode, align, text_hs(x, size, tok))
-                        if p.get("plate") else [])
-                plates = ruby.with_rubies(bare, [[q.rect for q in rs] for rs in x["rubies"]], plate_mode)
+                bare = (layout.plate_rects(x["src_box"] if plate_mode == "src" else box, tw, ink, plate_mode, align,
+                                           text_hs(x, size, tok)) if p.get("plate") else [])
+                plates = (bare if plate_mode == "src"            # 只盖原文：译文扩出的行、读音都不并进来
+                          else ruby.with_rubies(bare, [[q.rect for q in rs] for rs in x["rubies"]], plate_mode))
                 els += self.plate_els(x, plates, back, plate_mode, tok, tw, ink, align, widths, bare)
                 for i, (r, a, t, sz) in enumerate(zip(box, axes, tok, sizes)):
                     first, full = x["rowt"][i] if x["rowt"] else (None, x["full_ms"])
@@ -881,7 +918,8 @@ class Typesetter:
                 base = x["base"]
             else:
                 # 整块画在 \pos 上：字号按原来一行的高度适配，一般不冲出原文框的并集，没接 text_h（近似，计划里记过）
-                bare = layout.plate_rects(box, [], None, "box") if p.get("plate") and box else []
+                pbox = x["src_box"] if plate_mode == "src" else box      # 单框扩行时 box 已往下扩，只盖原文就用原文框
+                bare = layout.plate_rects(pbox, [], None, "box") if p.get("plate") and pbox else []
                 axis = [a + ink_shift(tok[0], size, x["font"], widths, align) for a in assfile.numbers(x["pos"])[:1]] if x["pos"] else []
                 x["rubies"] = [[]]
                 if marks[0] and (x["move"] or not x["pos"]):
@@ -892,7 +930,7 @@ class Typesetter:
                     x["rubies"] = [ruby.place(marks[0], axis[0], assfile.numbers(x["pos"])[1], valign, align, size, line_ws[0],
                                               x["font"], widths, W)]
                 # 人挪过位置的，底板还在原文框上、不跟着字走：读音也不并进去
-                plates = bare if x["moved"] else ruby.with_rubies(bare, [[q.rect for q in x["rubies"][0]]], "box")
+                plates = bare if x["moved"] or plate_mode == "src" else ruby.with_rubies(bare, [[q.rect for q in x["rubies"][0]]], "box")
                 els += self.plate_els(x, plates, back, plate_mode, tok, tw, axis, align, widths, bare)
                 els.append(Element(1, 0, 0, "\\an%d" % x["an"], "\\fs%d%s" % (size, ctag),
                                    body_of(tok[0], x["mode_tw"], x["full_ms"]), "text",
@@ -915,7 +953,7 @@ class Typesetter:
     def plate_els(self, x: dict, plates: list[list[float]], back: str, plate_mode: str, tok: list[list[tuple]],
                   tw: list[float], axes: list[float], align: str, widths: dict, bare: list[list[float]]) -> list[Element]:
         """底板元素。打字机行（逐字显出、不在动、人没挪过位置）跟着字长：只盖原文已出现的部分 ∪ 译文已显出的部分
-        （`text` 方案只算译文），见 `grow`；全字出现后是两者的并集（两段相连时就是静态底板）。其余照静态底板画。
+        （`text` 方案只算译文，`src` 方案只算原文），见 `grow`；全字出现后是两者的并集（两段相连时就是静态底板）。其余照静态底板画。
         `plates` 已经并进了读音（`ruby.with_rubies`），`bare` 是并之前的（整块画的几行按它等分）；
         读音在正文首字出现时整段出现，它那一段的右沿那时一下跳到读音的右沿。"""
         if not plates or x["mode_tw"] == "off" or x["path"] or x["moved"] or not axes:
@@ -924,6 +962,8 @@ class Typesetter:
         pad, size, font = layout.OVERLAY_PAD, x["size"], x["font"]
         src = [] if plate_mode == "text" else self.source_lines(x)
         rubies = x["rubies"]
+        if plate_mode == "src" and x["mode"] == "rows":   # 一个原文框一块（`plates` 按 `src_box` 算的），各自跟着这一行原文长
+            return [plate_el(static, back, c) for static, (r, f) in zip(plates, src) for c in grow.row_clips(static, [(r[0] - pad, f)])]
 
         def ruby_front(q: ruby.Placed, dim_from: int | None) -> grow.Front:
             t = dim_from if dim_from is not None else q.ruby.t or 0
@@ -961,6 +1001,8 @@ class Typesetter:
         h = (y1 - y0) / max(1, len(lines))
         dim_from = 0 if x["mode_tw"] == "dim" else None
         pieces = [(r[0] - pad, r[1] - pad, r[3] + pad, f) for r, f in src]
+        if plate_mode == "src":
+            return [plate_el(static, back, grow.bbox_clip(static, pieces))]
         for j, (ln, rn) in enumerate(zip(lines, runs)):
             w = sum(widths.get((font, s), 0.0) * (sz or size) for s, sz in rn)
             left = layout.text_span(axes[0], w, align)[0]
@@ -1032,7 +1074,7 @@ class Typesetter:
                 text = "{%s%s%s%s%s}%s" % (e.head, where, e.tail, ftag if e.fade else "", e.tail2, e.body)
                 if e.kind == "text":            # 行内回到样式色的 `\1c`（剧本样式的闭标签）回到这一行的字色（dev 的黄 / 浅蓝、人在行首写的颜色）
                     text = assfile.recolor_inline(text, assfile.head_color(text))
-                out.append((e.kind, dialogue(e.layer, seg[0], seg[1], src.style, src.actor, text)))
+                out.append((e.kind, dialogue(e.layer, seg[0], seg[1], src.style, src.actor, text, e.effect)))
         return out
 
     def plain(self, src: Src) -> str:

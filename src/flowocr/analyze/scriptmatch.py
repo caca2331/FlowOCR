@@ -39,6 +39,7 @@ from flowocr.artifacts import matchedio  # noqa: E402
 from flowocr.artifacts.matchedio import LAYERS  # noqa: E402   层的名单：判定（这里）和投影（overlay）两边都用
 from flowocr.analyze import echo as EC  # noqa: E402
 from flowocr.analyze import game_align as GA  # noqa: E402
+from flowocr.analyze import nameink as NI  # noqa: E402
 from flowocr.analyze import script_align as SA  # noqa: E402
 from flowocr.artifacts import srtio  # noqa: E402
 from flowocr.artifacts import tracksio  # noqa: E402
@@ -47,7 +48,8 @@ CODE_FP_FILES = ("src/flowocr/analyze/scriptmatch.py", "src/flowocr/artifacts/ev
                  "src/flowocr/analyze/script_align.py", "src/flowocr/artifacts/srtio.py", "src/flowocr/artifacts/tracksio.py",
                  "src/flowocr/artifacts/matchedio.py", "src/flowocr/placeholders.py",
                  "src/flowocr/analyze/matchers/gametext.py", "src/flowocr/analyze/gamescript.py", "src/flowocr/textfold.py", "src/flowocr/richtext.py",
-                 "src/flowocr/analyze/gtdbundle.py", "src/flowocr/paths.py", "src/flowocr/analyze/echo.py")
+                 "src/flowocr/analyze/gtdbundle.py", "src/flowocr/paths.py", "src/flowocr/analyze/echo.py",
+                 "src/flowocr/extract/framegrid.py", "src/flowocr/analyze/nameink.py", "src/flowocr/provenance.py")
 """本文件 + 它 import 的本地模块（同 `build_tracks.CODE_FP_FILES` 的口径，仓库相对路径）。
 再往上的两层各自有指纹、写在 provenance 里：剧本是 `ref_code_fp`（gamescript），轨是 `tracks_code_fp`。
 `gamescript`（连同它 import 的本地模块）也列在这里：匹配时还调 `gamescript.cnorm`（检索归一，依赖 `textfold`），`ref_code_fp` 记的是产剧本那次的代码。"""
@@ -77,6 +79,10 @@ SUSPECT = 0.85
 和 `unmatched_subs` 那个"幽灵条目上限"一个形状（docs/dev-guide/verification.md「报数口径」：指标的门不能等于接受判据的门）：
 2026-09-11 初版把它写成 `CONF_MED`（= 默认 fuzzy 0.75），四场整片读出来全是 0，被当成"没有可疑改写"。
 0.85 是拍的，只用来圈出**要摆帧的尾巴**，不是合格线。"""
+
+NOT_BY_SIM = ("contain", "context")
+"""相似度不是判据的两种认领，不进可疑改写和改写幅度分布：`contain` 整行都在 cue 里；`context` 是夹缝认领（`game_align.claim_flanked`），
+凭上下两行的认领加"读法是这一行的一截"认上，`ref.score` 照旧记诚实的相似度（`でも` 对 `でも…` 0.57）。"""
 
 
 def sim_of(raw: str, text: str, heads: frozenset[str] = frozenset()) -> float:
@@ -128,20 +134,24 @@ PANEL_MIN_SCORE = 0.85
 
 
 def match(ref: GA.Ref, cues: list[srtio.Cue], fuzzy: float,
-          panel_of: list[bool] | None = None, panel_mode: str = "keep", main_of: list[bool] | None = None) -> tuple[list[dict], dict]:
+          panel_of: list[bool] | None = None, panel_mode: str = "keep", main_of: list[bool] | None = None,
+          step: float = 0.0) -> tuple[list[dict], dict]:
     """每条 cue 一条记录。返回 (记录, `game_align.score` 的统计)。`main_of`：每条 cue 在不在主轨上（`cue_main`），第四遍认领只给主轨上的 cue。
+    `step`：tracks 的采样间隔（秒），夹缝认领判"同刻"用（`game_align.claim_flanked`）；0 = 不知道。
 
     `panel_mode="strict"` + `panel_of`：面板样 cue 的**弱认领**（score < `PANEL_MIN_SCORE`）退回"没认上"。
+    `how`：`exact` / `fuzzy`（主认领，打字机半截和读到一大段也记 `fuzzy`）/ `contain`（只靠整行包含认上）/ `context`（夹缝认领）/ `none`。
     """
     script = GA.fresh_script(ref)
     subs = [(c.start, "\n".join(c.lines), "") for c in cues]
-    st = GA.score(ref, script, subs, fuzzy, [c.end for c in cues], main_of)
+    st = GA.score(ref, script, subs, fuzzy, [c.end for c in cues], main_of, step)
     cn = {ln["key"]: {"cn": ln.get("cn"), **{k: ln[k] for k in ("jp_tpl", "jp_rich", "cn_rich") if ln.get(k)}}
           for u in ref.doc["units"] for ln in u["lines"]}
     unit = {ln["key"]: u["uid"] for u in ref.doc["units"] for ln in u["lines"]}
     sn = [SA.norm(e.text) for e in script]
     heads = st.get("heads") or frozenset()     # **匹配用的那一份开头行**，报分要用同一份（见 sim_of）
     vgroups = variant_index(ref, script)
+    ctx = set(st.get("context_subs", ()))
     out = []
     n_strict = [0]
     for i, c in enumerate(cues):
@@ -154,7 +164,7 @@ def match(ref: GA.Ref, cues: list[srtio.Cue], fuzzy: float,
             # `heads` 同样要带上（2026-09-19 自查补漏）：上一处把 `sim_of` 修了，**这一行漏了**——
             # 于是"名牌 + 正文"的 cue 剥开之后明明和剧本行逐字相同，却被记成 `fuzzy`。
             # 判据只有一份的意思是**这一份的每个调用点**都用同一种读法
-            rec["how"] = "exact" if sn[h] in GA.variants(raw, heads) else "fuzzy"
+            rec["how"] = "context" if i in ctx else "exact" if sn[h] in GA.variants(raw, heads) else "fuzzy"
             rec["ref"] = ref_rec(script[h], cn, unit, sim_of(raw, script[h].text, heads))
         elif extra:
             j = pick_variant(vgroups, script, extra[0], raw, heads)
@@ -463,7 +473,7 @@ def rows_of(body: list[dict]) -> list[list[float]]:
 DISPLAY = {
     "groups": {
         "dialogue": {"tier": "always", "label": "台词"},
-        "name": {"tier": "on", "label": "名牌"},
+        **matchedio.NAME_GROUPS,
         "choice": {"tier": "on", "label": "选项按钮"},
         "offband": {"tier": "on", "label": "字幕带外的台词（含绝区零的选项按钮、居中旁白）"},
         "cutscene": {"tier": "on", "label": "过场字幕"},
@@ -475,7 +485,8 @@ DISPLAY = {
         "unfed": {"tier": "off", "label": "没交给匹配器的文字"}},
     "fill": {"tier": "on"}}
 """游戏文本包匹配器的显示声明（显示协议，`matchedio._check_display`；owner 2026-10-06 D1 / D4、10-07 确认）：
-台词直接进 default；选项、带外的台词、过场字幕、黑屏旁白、名牌默认进、可关；界面文字、别处重现的台词、阅读面板、没画成译文的文字默认不进、可开。
+台词直接进 default；选项、带外的台词、过场字幕、黑屏旁白、名牌默认进、可关；界面文字、别处重现的台词、没挂在台词上的名牌样文字（`name_roles`，owner 2026-11-05）、
+阅读面板、没画成译文的文字默认不进、可开。
 `elsewhere` 是选项层那条路（`choice_items`：主轨外、逐字等于剧本行、没被认领）找到的台词——2026-10-07 摆帧多是对话记录面板里的旧行，
 也有短台词撞上界面里的同名字样（`カチーナ！` 对队伍列表的名字）；协议之前它们在 default 里也不画。
 填位（认领了、但 OCR 没读到这句）默认照画。"""
@@ -509,11 +520,12 @@ def mark_display(recs: list[dict], cues: list, group_fn) -> None:
             c["fill"] = not any(SA.supports(t, c["jp"] or "") for t in texts)
 
 
-def overlay_doc(items: list[dict], ov_stats: dict, evs_of: list[list[dict]]) -> dict:
-    """产物的 `overlay`：条目、计数、喂给匹配器的事件（`fed`，显示协议的两个保留组由它推出）。两个内置匹配器共用。"""
+def overlay_doc(items: list[dict], ov_stats: dict, evs_of: list[list[dict]], name_ink: dict | None = None) -> dict:
+    """产物的 `overlay`：条目、计数、喂给匹配器的事件（`fed`，显示协议的两个保留组由它推出）、判过名牌字色时各层的名牌色
+    （`name_ink`，`nameink.check`）。两个内置匹配器共用。"""
     ov_stats["groups"] = dict(Counter(it["group"] for it in items))
     return {"stats": ov_stats, "items": items,
-            "fed": sorted({e["id"] for evs in evs_of for e in evs})}
+            "fed": sorted({e["id"] for evs in evs_of for e in evs}), **({"name_ink": name_ink} if name_ink else {})}
 
 
 def choice_like(kind: str, status: str | None) -> bool:
@@ -959,7 +971,7 @@ TERM_ON_DIALOGUE = 0.3
 def on_dialogue(heads: frozenset[str], cues: list, recs: list[dict]) -> dict[str, float]:
     """每个开头行"挂在台词上"的比例：它作为非末行出现的 cue 里，主认领是**带内台词**（`gamescript.in_band`）的占几成。
 
-    为什么（2026-10-05，台账"名牌短名词表的余项"）：名牌判据（`head_lines` + `name_over_body`）认的是**形状**——
+    为什么（2026-10-05，台账"名牌短名词表的余项"）：名牌判据（`head_lines` + `tracksio.name_over_body`）认的是**形状**——
     常驻在一块变化的字上面的短行；任务目标、奖励标题、装备名、技能名也是这个形状，短名词表又按字形查得到它们的译文，
     09-26 五段切片新译出的 54 块里 30 块是这类 UI。真名牌下面是台词，UI 下面是任务列表、属性、技能说明——
     剧本认领得出这个区别，不用名字表、不用按游戏写词表。四场整场 + 五段切片（agent 按字面判）：门 0.3 时
@@ -994,46 +1006,123 @@ FUZZY_NAME_MIN = 2
 """名牌容错查（`fuzzy_names`）两边都至少这么多内容字：单字名一字之差就是全换（hsr `冷` / `刃`）。"""
 
 
-def fuzzy_names(name_items: list[dict], share: dict[str, float]) -> int:
-    """名牌容错查（owner 2026-10-06 定做；follow-up 第 2 组报告的"容错查的代价"）：没译出的名牌块，和**这段视频里已经译出的名牌**
-    只差一个字、且这样的名牌只有一个时，借它的译文，条目记 `name_src = "fuzzy"`。就地改 `name_items`，返回改了几个事件。
+NAME_VOTES = 3
+"""名牌投票（`fuzzy_names`）：一个读数下面至少这么多条记录的说话人是同一个人，才算"证据充分"。"""
+NAME_VOTE_SHARE = 2 / 3
+"""名牌投票：那个人还要占这个读数下面全部有说话人的记录的这么多。"""
 
-    为什么只吸附到已译出的：对整张短名词表做容错查，一字之差就撞到另一个条目的原神 42%、星铁 28%、绝区零 35%，
-    读错一个字的名牌按全表查到的多半是不相干的词；同一段视频里已经出现过、译出来的名字少得多。四场整场能救 215 块
-    （hsr `文光` / `交光` → 爻光、zzz `Uン` → 铃，摆帧核过）。被吸附的那行也要过"挂在台词上"的门（`on_dialogue`，同短名词表）。
+
+def record_speakers(recs: list[dict], ref: GA.Ref | None = None) -> list[tuple[str, str] | None]:
+    """每条记录主认领那一行的说话人（日文名, 中文名），名牌投票（`fuzzy_names`）的证据；没认上、或不知道是谁说的为 None。
+    认领自带 `speaker` / `speaker_cn` 的（naninovel）直接用；gametext 的认领不带，按 key 查剧本行（库里有说话人的行不多，票常常不够）。"""
+    by_key: dict[str, tuple[str, str]] = {}
+    if ref is not None:
+        for u in ref.doc["units"]:
+            for ln in u["lines"]:
+                if ln.get("speaker") and ln.get("speaker_cn"):
+                    by_key.setdefault(ln["key"], (ln["speaker"], ln["speaker_cn"]))
+    out: list[tuple[str, str] | None] = []
+    for r in recs:
+        f = r["ref"]
+        sp = None if not f else (f.get("speaker"), f.get("speaker_cn")) if "speaker" in f else by_key.get(f["key"])
+        out.append(sp if sp and sp[0] and sp[1] else None)
+    return out
+
+
+def fuzzy_names(name_items: list[dict], share: dict[str, float],
+                votes: dict[str, dict[int, tuple[str, str]]] | None = None) -> dict[str, int]:
+    """名牌容错（owner 2026-10-06 定做借已译出的；2026-10-24 owner 定加投票）：逐字查不到的名牌读数，按证据强弱两档认，
+    证据越弱、字面要求越严。就地改 `name_items`，返回两档各改了几个事件 `{"voted": n, "fuzzy": n}`。两档都要读数 ≥ `FUZZY_NAME_MIN` 个内容字。
+
+    1. **投票**（`name_src = "voted"`）：`votes[读数]` 是这个读数作为名牌挂着的每条记录的说话人（`record_speakers`，同一条记录只算一票）。
+       票最多的那个人有 ≥ `NAME_VOTES` 票、占有说话人的票 ≥ `NAME_VOTE_SHARE`，就算证据充分；读数还要能是这个人名字的一截
+       （`textfold.fits_within`：≤2 字的读数只许少读、不许读错，3 字起许错 1 处），才译成他。证据充分但字面对不上的（`ええ。` 下面总是同一个人说话）
+       不按投票译；第 2 档也只在借来的正是这个人时才借。
+       为什么要说话人：只看字形，2 字的读数一字之差就是一半换掉；名牌下面那句台词是谁说的，剧本已经认出来了。
+       《魔裁》名牌常少读头一个字（`二階堂ヒロ` 读成 `階堂ヒロ`）、或读错一个字形（`階堂ヒ口`），逐字查和第 2 档都接不住。
+    2. **借本段已译出的**（`name_src = "fuzzy"`）：没有充分的投票时，和**这段视频里已经译出的名牌**只差一个字（`one_char_apart`）、
+       这样的名牌只有一个、读数也挂在台词上（`on_dialogue`，同短名词表），借它的译文；有充分投票而指向别人时不借。
+       只吸附到已译出的：对整张短名词表做容错查，一字之差就撞到另一个条目的原神 42%、星铁 28%、绝区零 35%；
+       同一段视频里已经出现过、译出来的名字少得多（hsr `文光` / `交光` → 爻光、zzz `Uン` → 铃，摆帧核过）。
     误译的样子是把一个角色的名牌画成另一个角色的名字——比不译显眼，所以条件都取严的。"""
+    votes = votes or {}
     done: dict[str, dict] = {}
     for it in name_items:
         if it["cn"] and it["name_src"] in ("speakers", "terms"):
             done.setdefault(SA.norm(it["ocr"]), it)
     done = {k: it for k, it in done.items() if evalkit.content_len(it["ocr"]) >= FUZZY_NAME_MIN}
-    fixed: set[int] = set()
+    fixed: dict[str, set[int]] = {"voted": set(), "fuzzy": set()}
+    verdict: dict[str, tuple[str, str] | None] = {}       # 读数 -> 证据充分时票最多的那个人（日文名, 中文名）
+    for k, by_rec in votes.items():
+        c = Counter(by_rec.values())
+        if c:
+            who, v = c.most_common(1)[0]
+            if v >= NAME_VOTES and v >= NAME_VOTE_SHARE * sum(c.values()):
+                verdict[k] = who
     for it in name_items:
         if it["cn"]:
             continue
         k = SA.norm(it["ocr"])
-        if evalkit.content_len(it["ocr"]) < FUZZY_NAME_MIN or share.get(k, 0.0) < TERM_ON_DIALOGUE:
+        n = evalkit.content_len(it["ocr"])
+        if n < FUZZY_NAME_MIN:
+            continue
+        who = verdict.get(k)
+        if who is not None and textfold.fits_within(k, who[0], 0 if n <= 2 else 1):
+            it.update(jp=who[0], cn=who[1], name_src="voted")
+            fixed["voted"].add(it["events"][0])
+            continue
+        if share.get(k, 0.0) < TERM_ON_DIALOGUE:
             continue
         nb = [d for key, d in done.items() if one_char_apart(k, key)]
-        if len(nb) == 1:
+        if len(nb) == 1 and (who is None or who[1] == nb[0]["cn"]):
             it.update(jp=nb[0]["jp"], cn=nb[0]["cn"], name_src="fuzzy")
-            fixed.add(it["events"][0])
-    return len(fixed)
+            fixed["fuzzy"].add(it["events"][0])
+    return {k: len(v) for k, v in fixed.items()}
 
 
-NAME_BODY_GAP = 2.0
-"""名牌下沿到正文上沿最多隔几个名牌字高（`name_over_body`）。"""
+def name_roles(name_items: list[dict], line_items: list[dict]) -> dict[str, int]:
+    """名牌块逐块定组和层（owner 2026-11-05：有匹配器时，只有挂在认上的台词上的才是真名牌，名字和称号分开）。就地改，返回各类块数。
 
-
-def name_over_body(name: dict, body: dict) -> bool:
-    """名牌挂在这行正文上：正文在名牌中线以下、上沿离名牌下沿不超过 `NAME_BODY_GAP` 个字高，
-    左右有重叠或左边缘相距不超过两个字高（居中的名牌、左对齐的名牌都算）。
-    只看几何、不看名字（第 13 条）；并排一行的角色列表、离得远的键位和菜单标题对不上这个形状。"""
-    nb, bb = name["box"], body["box"]
-    h = max(1, nb[3] - nb[1])
-    if not (bb[1] >= (nb[1] + nb[3]) / 2 and bb[1] - nb[3] <= NAME_BODY_GAP * h):
-        return False
-    return min(nb[2], bb[2]) - max(nb[0], bb[0]) > 0 or abs(nb[0] - bb[0]) <= 2 * h
+    * **挂上**：这一块在屏的时候，正下方（`tracksio.name_over_body`，比台词块的首行、左右取整块 `tracksio.block_head`，间隔上限 `tracksio.NAME_GAP`）
+      有一块认上的台词——正文 / extra 层、组是 `dialogue`、不是对话记录面板里的旧行（`echo` 为 `log`）。
+      同一块名牌前后几次出现连成一串（`tracksio.plate_runs`：同名、同一处、隔不超过 `NAME_INERTIA_US`），一串里有一块挂上整串都算——
+      换句台词、漏读一两帧时名牌会断开一下，断开那一小段下面可能正好没有台词块。挂上的留在 `name` 组，没挂上的归 `matchedio.STRAY_NAME`（默认不画）。
+      为什么要逐块判：认开头行（`head_lines` + 同一条 cue 里有正文挂在下面）、查短名词表的门（`on_dialogue`）看的都是**这串字整场的形状**，
+      同一个名字出现在队伍栏、好友列表、头顶、对话记录面板里也一样认、一样译。四场整场（2026-11-05 重跑匹配量，有译文的名牌）
+      gi1 802 块里没挂上的 61、gi2 1048 / 36、hsr 480 / 135、zzz 234 / 26；抽帧看，绝大多数是上面那几种界面；
+      落在常规名牌位置、真名牌没挂上的是下面那句台词没认上（gi1 3 块、hsr 2 块、zzz-s2 2 块）——这时台词本身也不画译文，名牌跟着不画。
+      对话记录面板（hsr）里每条旧行上面也有一行字，读出来是 `二相楽園`、`後味` 这类地名、名词，所以 `log` 的台词不算。
+    * **称号**：挂上的块里，叠在一块**有译文**的名牌下面（或上面）、字小一号的（`tracksio.stack_partners`）层改成 `title`，
+      字幕稿里另用 `Title` 样式（原神的「傭兵」「燭明の守り人」）。离台词远的那块可能超出间隔上限
+      （称号在下时是名字，在上时是称号），所以一对里有一块挂上，两块都算挂上。
+      名字要有译文（认得出是谁）：绝区零没有称号，台词上面的角色名「ヴェリナ」、「大会ガイド」叠在一块大字招牌「QICAI JIE」下面，
+      只看几何会把角色名当称号、把招牌当名字（2026-11-05 整场 14 块）。
+    只改组和层，不改译文——选项层的去重、名牌投票在这之前就做完了，台词和选项的条目不受影响。"""
+    lines = sorted((it for it in line_items if it["group"] == "dialogue" and it.get("echo") != "log"),
+                   key=lambda it: it["start_us"])
+    starts = [it["start_us"] for it in lines]
+    span = max((it["end_us"] - it["start_us"] for it in lines), default=0)
+    direct = []
+    for n in name_items:
+        lo, hi = bisect.bisect_left(starts, n["start_us"] - span), bisect.bisect_left(starts, n["end_us"])
+        direct.append(any(lines[k]["end_us"] > n["start_us"] and tracksio.name_over_body(n["rows"][0], tracksio.block_head(lines[k]["rows"]))
+                          for k in range(lo, hi)))
+    runs = tracksio.plate_runs([(n["start_us"], n["end_us"], n["rows"][0], n["cn"] or SA.norm(n["ocr"])) for n in name_items])
+    direct = tracksio.spread(direct, runs)
+    partner = [j if j is not None and name_items[j]["cn"] else None
+               for j in tracksio.stack_partners([(n["start_us"], n["end_us"], n["rows"][0]) for n in name_items])]
+    hung = list(direct)
+    for i, j in enumerate(partner):
+        if j is not None and (direct[i] or direct[j]):
+            hung[i] = hung[j] = True
+    hung = tracksio.spread(hung, runs)
+    cnt = Counter()
+    for i, it in enumerate(name_items):
+        it["group"] = "name" if hung[i] else matchedio.STRAY_NAME
+        if hung[i] and partner[i] is not None and hung[partner[i]]:
+            it["layer"] = "title"
+        cnt[it["layer"] if hung[i] else matchedio.STRAY_NAME] += 1
+    return dict(cnt)
 
 
 SAME_PLACE = 0.5
@@ -1138,7 +1227,11 @@ def body_end(b: int, a: int, evs: list[dict], mates: list[dict] = (), ref_text: 
     成员里有开放边界（`t_end_how = open`，没看到它消失）的不夹：不知道它什么时候消失。
     差不到 `slack` 的不夹：回抠过的给 `BODY_END_SLACK_US`（记录的起止存成毫秒，和事件的微秒差出来的零点几毫秒只是取整），
     采样级的给 `tracksio.SAMPLE_SLACK` 个采样间隔（字最后一次被读到之后、下一个采样点之前什么时候消失不知道，采样点的间隔还有抖动；
-    yuka-f3「待って……！」夹掉的 0.5 s 那时字还在）。"""
+    yuka-f3「待って……！」夹掉的 0.5 s 那时字还在）。
+
+    这里认作"这句字还在"的读数**不**记进正文条目的 `events`（`body_start` 借的记）：它们都在正文事件之后，打字机按"全字出现"的最晚时刻判，
+    记进去只会把打字机拖晚；"包住正文"的读数还可能是另一句（2026-10-24 摆帧：zzz 6160.5 s 技能面板上的另一行、《魔裁》f4 26606.8 s 被人物挡住的缺字读数，
+    记进去都判出了假打字机，defaults.md 1.66）。"""
     if any(e.get("t_end_how") == "open" for e in evs):
         return max(a, b)
     ids, boxes = {e["id"] for e in evs}, [e["box"] for e in evs]
@@ -1155,8 +1248,9 @@ def body_end(b: int, a: int, evs: list[dict], mates: list[dict] = (), ref_text: 
     return max(a, last)
 
 
-def body_start(a: int, evs: list[dict], ref_text: str, index: tracksio.EventIndex, tol: int) -> int:
+def body_start(a: int, evs: list[dict], ref_text: str, index: tracksio.EventIndex, tol: int) -> tuple[int, list[dict]]:
     """正文块的起点：`a`（记录或这一段 cue 的起点）往后挪到"这句字最早出现的时刻"，只往后挪、不往前推，挪不到 `tol`（`BODY_SHIFT_TOL` 个采样间隔）就不挪。
+    返回 (起点, 借来的读数)。
     回抠过的正文也用这个容差：正文事件的起点常晚于打字机打出的头一两个字（「こ」「ええ、キ」），收紧到几个原生帧的话，
     摆帧 20 条里 8 条把起点挪过了头（检测器三场修复计划 U2，撤回）。
 
@@ -1167,53 +1261,83 @@ def body_start(a: int, evs: list[dict], ref_text: str, index: tracksio.EventInde
     同一处更早、和原文一字不差的读数和它对不上，只比正文会把起点挪晚 66 s。
 
     为什么要挪：cue 的起点由它全部的事件定，名牌、计数器、按键提示、还没消失的上一句都算，gi1 有一句被同一条 cue 里先出来的名牌
-    「カチーナ」拉早 24 s、一句被计数器「19000/24829」拉早 21.8 s，译文先浮在还没出字的地方（时间疑点检测器计划）。"""
+    「カチーナ」拉早 24 s、一句被计数器「19000/24829」拉早 21.8 s，译文先浮在还没出字的地方（时间疑点检测器计划）。
+
+    **借来的读数**（上面那些不在 `evs` 里、正文出现前就在屏的同一句读数）由调用方记进正文条目的 `events`（`overlay_items`）：
+    块盖住了它们，不记的话选项路会拿它们在同一处再出一块、`unmatched` 组补画它们的 OCR 原文、打字机只看正文事件，
+    把早就在屏的整句判成慢慢打出（2026-10-24，zzz `SKILL INFO` 判成 66.5 s，defaults.md 1.66）。"""
     first = min(e["t_start"] for e in evs)
     if first - a <= tol:
-        return a
+        return a, []
     ids, boxes = {e["id"] for e in evs}, [e["box"] for e in evs]
     texts = [e["text"] for e in evs] + ([ref_text] if ref_text else [])
-    t = first
+    t, lean = first, []
     for e in index.window(a - BODY_LOOKBACK_US, first):
         if (e["id"] not in ids and e["t_end"] > a and any(tracksio.boxes_cross(e["box"], b) for b in boxes)
                 and any(textfold.leads(e["text"], x) for x in texts)):
             t = min(t, e["t_start"])
-    return t if t - a > tol else a
+            lean.append(e)
+    return (t if t - a > tol else a), lean
+
+
+def yield_to_body(name_items: list[dict], body_items: list[dict]) -> tuple[list[dict], int]:
+    """一个事件同一时刻只画一块：任何正文块 `events` 里有的事件（正文事件本身，和定起点借来的读数，`body_start`），名牌层让出来——返回 (留下的名牌块, 让出的块数)。
+    实际碰到的是借来的读数：被认成开头行、又是这句台词早出现的那次读数的，是台词被当成了名牌（《魔裁》f3 9:05:24 起的「裁判の後。」：
+    名牌层在同一个框里另画一块 OCR 原文，盖在正文块上 63 s）。"""
+    in_body = {i for it in body_items for i in it["events"]}
+    kept = [it for it in name_items if it["events"][0] not in in_body]
+    return kept, len(name_items) - len(kept)
 
 
 def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: list,
                   ref: GA.Ref | None = None, readables: dict[str, tuple[str, str]] | None = None,
-                  obs_path: Path | None = None) -> tuple[list[dict], dict]:
+                  obs_path: Path | None = None, speakers: dict[str, str] | None = None,
+                  script_lines: frozenset[str] | None = None) -> tuple[list[dict], dict]:
     """**判定**：各层该盖哪些块，产出写进 `matched.json` 的 `overlay.items`（语言无关，jp / cn 都带）。
     导出器（`export_overlay`）只按层和语言投影，不再现场判断（artifacts.md 第 1 条）。返回 (条目, 各层计数)。
+
+    `speakers`：名牌层的说话人表（日文名按 `SA.norm` 归一 -> 中文名）。不给就从 `ref` 取（`speaker_names`）；
+    没有 `GA.Ref` 的匹配器（`naninovel`）用它交进自己的名字表——不交的话名牌层整层没有译文（2026-10-24，宣传片素材上的 `セナ` / `リオ`）。
+    `script_lines`：开头行要排掉的剧本台词（`GA.head_lines` 的同名参数）。不给就从 `ref` 取 `GA.band_lines`；
+    `naninovel` 交自己的（`naninovel.head_script_lines`）——不交的话落在两行 cue 首行的短台词（`ああ。`）被认成名牌、画出 OCR 原文。
 
     顺序 body → choice → panel → extra → name：前三层与 2026-09-14 之前 `export_overlay` 现场判出来的
     **顺序与内容相同**（开 body,choice,offmain 时叠加 ASS 与之前逐字节相同，带阅读面板（当时读上游 TextMap 的原型）再加 panel 也相同，
     matcher 计划的回归；那两道 offmain 过滤在那两段切片上不触发），新两层排在后面。
     ⚠ **保持关注**（product-goals 第 16 条）：选项 / 面板的规则是按预览摆帧逐条长出来的，别再按单帧补。"""
     # 和匹配用的同一份开头行（`GA.run`）：剧本在手就排掉本身是整条台词的
-    heads = GA.head_lines([(c.start, "\n".join(c.lines), "") for c in cues],
-                          GA.band_lines(ref.script) if ref is not None else frozenset())
+    if script_lines is None:
+        script_lines = GA.band_lines(ref.script) if ref is not None else frozenset()
+    heads = GA.head_lines([(c.start, "\n".join(c.lines), "") for c in cues], script_lines)
     body_items, extra_items = [], []
     index = tracksio.EventIndex(doc["events"], BODY_LOOKBACK_US)
+    parts_of = {ri: [(i, body_of(evs_of[i], heads, r["ref"].get("jp") or "", r["ref"].get("jp_tpl") or "")) for i in r["cues"]]
+                for ri, r in enumerate(recs) if r["ref"]}
+    own = {e["id"] for parts in parts_of.values() for _, b in parts for e in b}     # 各条认领自己的正文事件：别的正文块不借
     for ri, r in enumerate(recs):
         if not r["ref"]:
             continue
         s_us, e_us = int(round(r["start"] * 1e6)), int(round(r["end"] * 1e6))
-        parts = [(i, body_of(evs_of[i], heads, r["ref"].get("jp") or "", r["ref"].get("jp_tpl") or "")) for i in r["cues"]]
+        parts = parts_of[ri]
         body = [e for _, b in parts for e in b]
         mates = [e for i in r["cues"] for e in evs_of[i]]
+        taken = {e["id"] for e in body}
         for evs, rows, a, b in position_segments(parts, cues, s_us, e_us):
-            a = body_start(a, evs, r["ref"].get("jp") or "", index, int(BODY_SHIFT_TOL * doc["frame_us"]))
+            jp = r["ref"].get("jp") or ""
+            a, lead = body_start(a, evs, jp, index, int(BODY_SHIFT_TOL * doc["frame_us"]))
             refined = "text_effect" in doc and any("t_full_how" in e for e in evs)      # 同 `script.refined_of`
+            b = body_end(b, a, evs, mates, jp, BODY_END_SLACK_US if refined else int(tracksio.SAMPLE_SLACK * doc["frame_us"]))
+            # 定起点时借来的同一句读数也记进 `events`、排在正文事件后面（区域、对齐仍取第一个正文事件的；`body_end` 认的不记，见它的说明）：
+            # 块盖住了它们，一个事件同一时刻只画一块（选项路、`unmatched` 补画都不再用），打字机也看得见这句字早就在屏。
+            # 别的认领自己的正文事件不借（对话记录滚动时上一格的同一句是另一条记录的正文，它有自己的块）
+            lent = [e for e in lead if e["id"] not in taken and e["id"] not in own]
+            taken |= {e["id"] for e in lent}
             body_items.append({"layer": "body", "group": r["ref"]["group"], "fill": r["ref"]["fill"],
-                               "start_us": a, "end_us": body_end(b, a, evs, mates, r["ref"].get("jp") or "",
-                                                                 BODY_END_SLACK_US if refined else int(tracksio.SAMPLE_SLACK * doc["frame_us"])), "rows": rows,
-                               "events": list(dict.fromkeys(e["id"] for e in evs)), "key": r["ref"]["key"],
+                               "start_us": a, "end_us": b, "rows": rows,
+                               "events": list(dict.fromkeys(e["id"] for e in evs + lent)), "key": r["ref"]["key"],
                                **{k: r["ref"][k] for k in matchedio.TEXT_KEYS if k in r["ref"]},
                                "claim": [ri, -1], "echo": r.get("echo"), "echo_of": r.get("echo_of")})
-        # extra 盖它自己的那几行：字落在这条剧本行里、而且不是主认领已经用掉的事件
-        taken = {e["id"] for e in body}
+        # extra 盖它自己的那几行：字落在这条剧本行里、而且不是主认领已经用掉的事件（含正文块定起点借来的读数）
         for xi, x in enumerate(r["extra"]):
             parts = [(i, [e for e in body_of(evs_of[i], heads, x.get("jp") or "", x.get("jp_tpl") or "") if e["id"] not in taken])
                      for i in r["cues"]]
@@ -1230,22 +1354,37 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                     "claim": [ri, xi], "echo": x.get("echo"), "echo_of": x.get("echo_of")})
     # 名牌：主轨里被认成开头行的**事件**（一个事件一块，时间取事件自己的——名牌跨好几条 cue 挂着）。
     # `名前：台词` 那种同一行格式框不出名字那半，不进这一层
-    names = speaker_names(ref) if ref is not None else {}
+    if speakers is not None:
+        names, has_speakers = speakers, bool(speakers)
+    else:
+        names = speaker_names(ref) if ref is not None else {}
+        has_speakers = ref is not None and "speakers" in ref.doc
     terms = term_names(ref) if ref is not None else {}
     # 短名词表按字形查，只给"挂在台词上"的开头行查（`on_dialogue`）：任务目标、装备名这类 UI 不当名牌译
     share = on_dialogue(heads, cues, recs) if terms or names else {}
     name_items, seen = [], set()
     n_terms_off = 0
-    for evs in evs_of:
+    # 名牌投票的证据（`fuzzy_names`）：读数 -> {它挂着的记录: 那条记录的说话人}
+    rec_of = {i: ri for ri, r in enumerate(recs) for i in r["cues"]}
+    spk = record_speakers(recs, ref)
+    votes: dict[str, dict[int, tuple[str, str]]] = defaultdict(dict)
+    for i, evs in enumerate(evs_of):
+        ri = rec_of.get(i)
         for e in evs:
             k = SA.norm(e["text"])
-            if k not in heads or e["id"] in seen:
+            if k not in heads:
                 continue
-            # owner 2026-09-14：名牌几乎总和正文一起出现——同一条 cue 里要有一行正文挂在它下面（`name_over_body`），
-            # 挡掉被 head_lines 认进来的键位 / UI（hsr 整场 `回` 108→21、`A` 84→12、`D` 32→0，matcher 计划）。
-            # 同一个事件在别的 cue 里满足也算，所以只在收下时记 seen
-            if not any(b is not e and SA.norm(b["text"]) not in heads and evalkit.content_len(b["text"]) >= 3
-                       and name_over_body(e, b) for b in evs):
+            # owner 2026-09-14：名牌几乎总和正文一起出现——同一条 cue 里要有一行正文挂在它下面（`tracksio.name_over_body`），
+            # 挡掉被 head_lines 认进来的键位 / UI（hsr 整场 `回` 108→21、`A` 84→12、`D` 32→0，matcher 计划；
+            # 间隔上限 2026-11-05 从 2 个字高放到 `NAME_GAP` 的 3 个后是 21、21、2 块，收进来的这类再由 `name_roles` 归 `stray_name`）。
+            # 同一个事件在别的 cue 里满足也算，所以只在收下时记 seen；投票每条 cue 都记
+            # 左右按从这一行往下连着的那块台词比（`tracksio.rows_below` + `block_head`）：绝区零的台词左对齐、名牌居中，首行短时首行够不到名牌下面
+            body = [b["box"] for b in evs if b is not e and SA.norm(b["text"]) not in heads and evalkit.content_len(b["text"]) >= 3]
+            if not any(tracksio.name_over_body(e["box"], tracksio.block_head(tracksio.rows_below(body, b), b)) for b in body):
+                continue
+            if ri is not None and spk[ri]:
+                votes[k][ri] = spk[ri]
+            if e["id"] in seen:
                 continue
             seen.add(e["id"])
             # 名字对上了说话人表（或短名词表）才算"有译文"：没对上的名牌这一层不出译文（jp 口径也不拿 OCR 读数冒充"原文"）；
@@ -1259,10 +1398,15 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                    "rows": [box], "events": [e["id"]],
                                    "jp": e["text"] if cn else None, "cn": cn, "name_src": src,
                                    "ocr": e["text"]})
-    n_fuzzy = fuzzy_names(name_items, share)
+    name_items, n_lent = yield_to_body(name_items, body_items)
+    n_fz = fuzzy_names(name_items, share, votes)
     name_items.sort(key=lambda it: it["start_us"])
-    if n_fuzzy:
-        print(f"[名牌] 读错一个字、借本段已译出的名牌认上的 {n_fuzzy} 个名牌事件（name_src = fuzzy）")
+    if n_lent:
+        print(f"[名牌] 事件已记进正文块（定起点借来的读数）、名牌层让出的 {n_lent} 块")
+    if n_fz["voted"]:
+        print(f"[名牌] 逐字查不到、按下面台词的说话人投票认上的 {n_fz['voted']} 个名牌事件（name_src = voted）")
+    if n_fz["fuzzy"]:
+        print(f"[名牌] 读错一个字、借本段已译出的名牌认上的 {n_fz['fuzzy']} 个名牌事件（name_src = fuzzy）")
     if n_terms_off:
         print(f"[名牌] 短名词表查得到、但不挂在台词上（< {TERM_ON_DIALOGUE}，多是任务目标 / 装备 / 技能名）没译的 {n_terms_off} 个名牌事件")
     # 一个事件同一时刻只画一块：正文 / 第二条认领用掉的事件选项层不再用。名牌和选项层那条路撞在同一个事件上时，
@@ -1285,19 +1429,23 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                                  and box_inside(c["rows"][0], bb) >= 0.8 for bs, be, bb in blocks)]
     in_choice = {i for it in choices for i in it["events"]}
     name_items = [it for it in name_items if it["cn"] or it["events"][0] not in in_choice]
+    n_roles = name_roles(name_items, body_items + extra_items)
+    print(f"[名牌] 挂在认上的台词上的名字 {n_roles.get('name', 0)} 块、称号 {n_roles.get('title', 0)} 块；"
+          f"没挂上、归 {matchedio.STRAY_NAME}（默认不画）的 {n_roles.get(matchedio.STRAY_NAME, 0)} 块")
     items = body_items + choices + panels + extra_items + name_items
     stats = {k: sum(1 for it in items if it["layer"] == k) for k in LAYERS}
-    # 名牌层的 `name` 照层的惯例数块（在动的名牌切成几块，`event_segments`）；下面三个按**事件**数（去重），
+    # 名牌层的 `name` / `title` 照层的惯例数块（在动的名牌切成几块，`event_segments`）；下面几个按**事件**数（去重、两层合起来），
     # 和 2026-10-05 之前的读数同口径（那时一个事件一块）
     stats["name_events"] = len({it["events"][0] for it in name_items})
     stats["name_translated"] = len({it["events"][0] for it in name_items if it["cn"]})
     stats["name_from_terms"] = len({it["events"][0] for it in name_items if it["name_src"] == "terms"})
     stats["name_from_fuzzy"] = len({it["events"][0] for it in name_items if it["name_src"] == "fuzzy"})
+    stats["name_from_voted"] = len({it["events"][0] for it in name_items if it["name_src"] == "voted"})
     stats["name_terms_off"] = n_terms_off          # 短名词表查得到、但被 `on_dialogue` 门挡掉没译的名牌事件
     stats["panel_obs_used"] = n_obs
-    # 剧本有没有说话人表：没有的话名牌层结构上一条译文都不会有（`speaker_names` 的 ⚠），
-    # 记进产物，免得下次看见 `name_translated 0` 去查判据
-    stats["ref_has_speakers"] = ref is not None and "speakers" in ref.doc
+    # 剧本有没有说话人表（gametext 是剧本的 `speakers` 表，交了 `speakers` 的是那张表非空）：没有的话名牌层结构上一条译文都不会有
+    # （`speaker_names` 的 ⚠），记进产物，免得下次看见 `name_translated 0` 去查判据
+    stats["ref_has_speakers"] = has_speakers
     return items, stats
 
 
@@ -1317,6 +1465,8 @@ def run_match(ref: GA.Ref, subs: str, feed: str, feed_panel: str, fuzzy: float, 
         subs_path, tp = GA.resolve(subs)
         cues = srtio.read_subs([subs_path])
         evs_of = None                      # 下面按主轨和 SRT 逐条对账之后再取
+        if doc is None and subs.endswith("-tracks.json"):
+            doc = tracksio.load(Path(subs))    # 给的是 tracks：采样间隔、采样网格和叠加层都从它取，CLI 和匹配器 API 同一判法
     else:
         if doc is None and not subs.endswith("-tracks.json"):
             raise SystemExit(f"--feed {feed} 要从一级产物投影，--subs 必须给 *-tracks.json")
@@ -1332,15 +1482,17 @@ def run_match(ref: GA.Ref, subs: str, feed: str, feed_panel: str, fuzzy: float, 
         print(f"[喂入] --feed {feed}：{len(cues)} 条 cue（从 tracks.json 投影，"
               f"并带的那条聚合轨已排除；没并带时不排——那是真实区域）")
     main_of = cue_main(cues, evs_of, doc)
-    recs, _score = match(ref, cues, fuzzy, panel_of, feed_panel, main_of)
+    # 帧级起点：夹缝认领的"同刻"容一个采样间隔（秒），回显判定的"这一刻"按采样格号比；只喂 SRT、手上没有 tracks 时都不知道，照原来的判法
+    step, grid = (doc["frame_us"] / 1e6, EC.grid_of(doc)) if doc is not None else (0.0, None)
+    recs, _score = match(ref, cues, fuzzy, panel_of, feed_panel, main_of, step)
     n_raw = len(recs)
-    suspect_raw = sum(1 for r in recs if r["ref"] and r["how"] != "contain" and r["ref"]["score"] < SUSPECT)
+    suspect_raw = sum(1 for r in recs if r["ref"] and r["how"] not in NOT_BY_SIM and r["ref"]["score"] < SUSPECT)
     log_panel_of = log_panels(ref, cues, evs_of, panel_of, recs, merge_gap) if panel_of is not None else None
     recs = merge_runs(recs, merge_gap, [c.source for c in cues], log_panel_of)
-    mark_echoes(ref, recs, cues, main_of, panel_of, log_panel_of)
+    mark_echoes(ref, recs, cues, main_of, panel_of, log_panel_of, grid)
     mark_display(recs, cues, lambda c: group_of(c["kind"], c.get("status"), ref.role.get(c["key"])))
     # 叠加层的判定（有框才判得了）：写进 JSON，--ass 只投影
-    items = ov_stats = doc_t = evs = None
+    items = ov_stats = doc_t = evs = name_ink = None
     # tracks 只在要用时读：叠加层要框，匹配器猜占位的值可能要事件（`--no-overlay` 又不要事件时照旧不碰 tracks、不对账）
     if (doc is not None or subs.endswith("-tracks.json")) and (overlay or events):
         doc_t = doc if doc is not None else tracksio.load(Path(subs))
@@ -1352,8 +1504,11 @@ def run_match(ref: GA.Ref, subs: str, feed: str, feed_panel: str, fuzzy: float, 
                                         obs_path=Path(obs) if obs else None)
         if panel_src:
             ov_stats["panel_gametext"] = panel_src
+        # 名牌字色（owner 2026-11-05）：和匹配器同一阶段，只判认上的名牌；阶段 3 照判定写样式，不读视频
+        name_ink = NI.check(items, doc_t, (ref.doc.get("provenance") or {}).get("game"))
+        ov_stats["name_plain"] = sum(1 for it in items if it.get("ink") is False)
     return {"recs": recs, "n_raw": n_raw, "suspect_raw": suspect_raw, "cues": cues, "items": items, "ov_stats": ov_stats,
-            "doc_t": doc_t, "evs": evs, "subs_path": subs_path, "tp": tp}
+            "name_ink": name_ink, "doc_t": doc_t, "evs": evs, "subs_path": subs_path, "tp": tp}
 
 
 def cue_main(cues: list, evs_of: list[list[dict]] | None, doc: dict | None) -> list[bool]:
@@ -1366,12 +1521,13 @@ def cue_main(cues: list, evs_of: list[list[dict]] | None, doc: dict | None) -> l
 
 
 def mark_echoes(ref: GA.Ref, recs: list[dict], cues: list, main_of: list[bool],
-                panel_of: list[bool] | None, log_panel_of: list[bool] | None = None) -> None:
+                panel_of: list[bool] | None, log_panel_of: list[bool] | None = None,
+                grid: EC.Grid | None = None) -> None:
     """回显判定（`flowocr.analyze.echo.mark`）：锚点是剧本对齐序列里这一行的排序时刻（gamescript 从 obs 定的第一次上屏），
-    "在主轨上"是 `cue_main`。"""
+    "在主轨上"是 `cue_main`。`grid`：tracks 的采样网格（`echo.grid_of`；只喂 SRT 时 None）。"""
     rep = lambda k: ref.variant_of.get(k, k)   # noqa: E731
     EC.mark(recs, [c.source for c in cues], main_of, panel_of or [False] * len(cues),
-            EC.anchors(ref.doc["sequence"], rep), rep, log_panel_of)
+            EC.anchors(ref.doc["sequence"], rep), rep, log_panel_of, grid)
 
 
 def match_stats(ref: GA.Ref, recs: list[dict], suspect_raw: int | None = None) -> dict:
@@ -1410,7 +1566,7 @@ def match_stats(ref: GA.Ref, recs: list[dict], suspect_raw: int | None = None) -
     groups_band = sum(1 for k, v in ci.items() if v > 1 and k in band_keys)
     # 带内多出来的认领按回显形态拆（owner 10-06，matcher-next 计划第 1 节第 6 条）：报警看 `other`；带外仍只报合计
     echo_band = EC.counts(recs, band_keys, lambda k: ref.variant_of.get(k, k))
-    scores = [r["ref"]["score"] for r in recs if r["ref"] and r["how"] != "contain"]
+    scores = [r["ref"]["score"] for r in recs if r["ref"] and r["how"] not in NOT_BY_SIM]
     return {"how": how, "conf": conf, "band": band, "n_band_claimed": n_band_claimed,
             "n_band_main": n_band_main, "n_extra_recs": n_extra_recs, "groups": groups, "extra": extra,
             "groups_band": groups_band, "extra_band": extra_band, "echo_band": echo_band,
@@ -1422,7 +1578,7 @@ def report(st: dict, recs: list[dict], n_raw: int, merge_gap: float, fuzzy: floa
     """CLI 的统计打印（只打印，什么都不算——数都在 `match_stats` 里）。"""
     how, conf, band, scores = st["how"], st["conf"], st["band"], st["scores"]
     n_band_claimed, n_band_main, n_extra_recs = st["n_band_claimed"], st["n_band_main"], st["n_extra_recs"]
-    print(f"cue {n_raw} 条 -> 并掉同一条剧本行的相邻 cue 之后 {len(recs)} 条（--merge-gap {merge_gap}）：" + "、".join(f"{k} {how[k]}" for k in ("exact", "fuzzy", "contain", "none"))
+    print(f"cue {n_raw} 条 -> 并掉同一条剧本行的相邻 cue 之后 {len(recs)} 条（--merge-gap {merge_gap}）：" + "、".join(f"{k} {how[k]}" for k in ("exact", "fuzzy", "contain", "context", "none"))
           + f"；置信度 " + "、".join(f"{k} {conf[k]}" for k in ("high", "med", "low", "none")))
     print(f"覆盖：该上屏的 {len(band)} 条里 {evalkit.denom(n_band_claimed, len(band))} 被认领"
           f"（和 game_align 的命中同口径）")
@@ -1446,8 +1602,8 @@ def report(st: dict, recs: list[dict], n_raw: int, merge_gap: float, fuzzy: floa
     if scores:
         if fuzzy >= SUSPECT:
             print(f"  ⚠ --fuzzy {fuzzy} ≥ 可疑改写的门 {SUSPECT}：下面那个数结构上恒为 0，别读（见 SUSPECT）")
-        print("改写幅度（被换成原文的 cue 与剧本行的相似度；`contain` 不在分布里——整行都在 cue 里，"
-              "相似度不是它的判据）："
+        print("改写幅度（被换成原文的 cue 与剧本行的相似度；`contain`、`context` 不在分布里——整行都在 cue 里、"
+              "凭上下两行的认领认上，相似度不是它们的判据）："
               + "  ".join(f"P{q*100:.0f} {evalkit.fmt_pctl(scores, q, unit='')}"
                           for q in (0.05, 0.25, 0.5))
               + f"；<{SUSPECT} 的 {sum(1 for s in scores if s < SUSPECT)} 条**是可疑改写，要摆帧**"
@@ -1456,10 +1612,12 @@ def report(st: dict, recs: list[dict], n_raw: int, merge_gap: float, fuzzy: floa
 
 
 def matched_doc(ref: GA.Ref, recs: list[dict], n_raw: int, st: dict, ref_path: str, subs_path: Path, tp: dict,
-                argv: list[str], params: dict, items, ov_stats, evs, fills: dict | None = None) -> dict:
+                argv: list[str], params: dict, items, ov_stats, evs, fills: dict | None = None,
+                name_ink: dict | None = None) -> dict:
     """`*-matched.json`（`SCHEMA`）。provenance 记这次是谁、用哪版代码、什么参数产的。
     `evs`：喂给匹配器的每条 cue 的事件（`run_match` 的 `evs`），叠加层的 `fed` 由它来（显示协议）。
-    `fills`：匹配器猜的占位的值（`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …}, "how": 从哪来, …}}`，`flowocr.placeholders`）。"""
+    `fills`：匹配器猜的占位的值（`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …}, "how": 从哪来, …}}`，`flowocr.placeholders`）。
+    `name_ink`：名牌字色判过时这款游戏各层的名牌色（`nameink.check`），记进 `overlay.name_ink`。"""
     from flowocr.analyze import build_tracks as bt
     pv = ref.doc["provenance"]
     scores = st["scores"]
@@ -1486,7 +1644,7 @@ def matched_doc(ref: GA.Ref, recs: list[dict], n_raw: int, st: dict, ref_path: s
             "cues": recs,
             **({"fills": fills} if fills else {}),
             "display": DISPLAY,
-            **({"overlay": overlay_doc(items, ov_stats, evs)} if items is not None else {})}
+            **({"overlay": overlay_doc(items, ov_stats, evs, name_ink)} if items is not None else {})}
 
 
 
@@ -1565,7 +1723,7 @@ def main() -> int:
     report(st, recs, res["n_raw"], a.merge_gap, a.fuzzy, ov_stats, a.readables)
     doc = matched_doc(ref, recs, res["n_raw"], st, a.ref, res["subs_path"], res["tp"], sys.argv[1:],
                       {"fuzzy": a.fuzzy, "merge_gap": a.merge_gap, "feed": a.feed, "feed_panel": a.feed_panel, "readables": a.readables},
-                      items, ov_stats, res["evs"], gametext.fills(ref, recs, res["evs"]))
+                      items, ov_stats, res["evs"], gametext.fills(ref, recs, res["evs"]), res["name_ink"])
     p = Path(a.out)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")

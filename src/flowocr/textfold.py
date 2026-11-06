@@ -2,7 +2,8 @@
 
 只折**读法差、不改内容**的两类：NFKC（全角 / 半角、兼容字形：`！` / `!`、`…` / `...`）和小书写假名折大（`っ` / `つ`、`ょ` / `よ`）。
 `fold` 不去标点、不去空白——要不要去由调用方定（匹配器的 `norm` 去，打字机生长判前缀时不去：标点也是打出来的字）；
-要去的用 `bare`，判两个读数是不是同一句字用 `same_reading`，判一个读数能不能是一句字出现的开头用 `leads`。
+要去的用 `bare`，判两个读数是不是同一句字用 `same_reading`，判一个读数能不能是一句字出现的开头用 `leads`，
+判一个读数能不能是一段字的一截（容几处错）用 `fits_within`。
 """
 from __future__ import annotations
 
@@ -44,3 +45,19 @@ def leads(a: str, b: str) -> bool:
     或者只有标点（打字机先打出来的「……」）。只看字，在不在同一处由调用方判。"""
     x = bare(a)
     return not x or bare(b).startswith(x) or same_reading(a, b)
+
+
+def fits_within(q: str, s: str, edits: int) -> bool:
+    """读数 `q` 能不能是 `s` 的一截：`s` 里有一段和 `q` 的编辑距离不超过 `edits`，两头没读到的字不算差
+    （`階堂ヒロ` 是 `二階堂ヒロ` 少读了头一个字，0 处差；`階堂ヒ口` 再错一个字形，1 处差）。两边先 `bare`，有一边为空就不算。
+    门（`edits`）和长度门由调用方定：名牌投票（`scriptmatch.fuzzy_names`）、夹缝认领（`game_align.claim_flanked`）。"""
+    q, s = bare(q), bare(s)
+    if not q or not s:
+        return False
+    prev = [0] * (len(s) + 1)                 # 第 0 行全 0：从 `s` 的任意位置起头都不罚
+    for i, a in enumerate(q, 1):
+        cur = [i] + [0] * len(s)
+        for j, b in enumerate(s, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a != b))
+        prev = cur
+    return min(prev) <= edits                 # 取最后一行的最小值：在 `s` 的任意位置收尾都不罚

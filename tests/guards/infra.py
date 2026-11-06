@@ -720,11 +720,29 @@ def t_paths() -> None:
             if "||" not in ln and not (ln.rstrip().endswith("\\") and "||" in nxt):
                 unchecked.append(f"{sh.name}:{i + 1}")
     check("**驱动里调体检工具的地方都接住了失败**（`|| … FAILED`）", not unchecked, unchecked)
-    # 用 `$CODE/.venv` 的驱动都把 PYTHONPATH 钉到 `$CODE/src`：槽里的 .venv 是指回主 checkout 的 junction 时，
-    # editable 安装会导回主 checkout 的代码，而 provenance 照样记槽的 git_head 以外的东西（2026-09-26 审计）
-    unpinned = [sh.name for sh in sorted((ROOT / "dev_tools").glob("*.sh"))
-                if 'PY="$CODE/.venv' in (t := sh.read_text(encoding="utf-8")) and 'export PYTHONPATH="$(cd "$CODE"' not in t]
-    check("用 `$CODE/.venv` 的驱动都把 PYTHONPATH 钉到 `$CODE/src`", not unpinned, unpinned)
+    # 驱动的解释器和 PYTHONPATH 只从 `dev_tools/pyenv.sh` 来：它取 `pyrun.py --which` 挑的解释器（槽里没有 .venv 就用主 checkout 的），
+    # 把 PYTHONPATH 钉到 `$CODE/src`——槽里的 .venv 是指回主 checkout 的 junction 时，editable 安装会导回主 checkout 的代码（2026-09-26 审计）。
+    # 原来每个驱动各写死 `$CODE/.venv/Scripts/python.exe`，槽里没有 .venv 就 exit 2（复盘 2026-10-06-1 D5）。
+    pyenv = (ROOT / "dev_tools" / "pyenv.sh").read_text(encoding="utf-8")
+    check("pyenv.sh 的解释器取自 pyrun.py --which，PYTHONPATH 取它给的 code（= $CODE/src）",
+          '"$CODE/dev_tools/pyrun.py" --which' in pyenv and "PY=$(sed -n 's/^interpreter  *//p'" in pyenv
+          and "export PYTHONPATH=$(sed -n 's/^code  *//p'" in pyenv)
+    drivers = [sh for sh in sorted((ROOT / "dev_tools").glob("*.sh")) if sh.name != "pyenv.sh"]
+    code_lines = {sh.name: [ln for ln in sh.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")] for sh in drivers}
+    unsourced = [n for n, lines in code_lines.items()
+                 if any(re.search(r"\$\{?PY\b", ln) for ln in lines)
+                 and not any(re.match(r'\s*(source|\.) "\$CODE/dev_tools/pyenv\.sh"', ln) for ln in lines)]
+    check("用 `$PY` 的驱动都 source `$CODE/dev_tools/pyenv.sh`", not unsourced, unsourced)
+    hardcoded = [f"{n}:{ln.strip()[:60]}" for n, lines in code_lines.items() for ln in lines
+                 if re.search(r"\.venv[/\\](Scripts|bin)[/\\]python", ln) or re.match(r"\s*(export\s+)?PY=", ln)
+                 or re.search(r"(^|[\s;&|(])(export\s+)?PYTHONPATH=", ln)]   # 行内的 `PYTHONPATH=… python` 也算
+    check("驱动里不写死解释器路径、不自己设 PY / PYTHONPATH（一律交给 pyenv.sh）", not hardcoded, hardcoded[:8])
+    # dev_tools 的 Python 工具起开发 venv 的子进程同理：从 pyrun 取（`from pyrun import interpreter, code_env`），不自己拼 .venv 里的路径。
+    # docstring 里 `<某实验的 venv>/Scripts/python.exe` 那种用法示例不含 `.venv`，不算。
+    venv_py = re.compile(r"""\.venv(["']\s*[/,]\s*["']|[/\\])(Scripts|bin)\b""")   # `.venv/Scripts`、`".venv" / "Scripts"`、`Path(".venv", "Scripts")`
+    py_hardcoded = [p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "dev_tools").rglob("*.py"))
+                    if p.name != "pyrun.py" and venv_py.search(p.read_text(encoding="utf-8"))]
+    check("dev_tools 的 Python 工具不自己拼 .venv 里的解释器路径（只有 pyrun.py 挑）", not py_hardcoded, py_hardcoded)
 
 
 def t_package() -> None:

@@ -38,14 +38,17 @@ def interpreter(code: Path) -> Path:
     sys.exit(f"pyrun: no .venv in {code} or its main checkout; run `uv sync --frozen --extra nvidia --group dev` (or --extra cpu) first")
 
 
+def code_env(code: Path, env: dict[str, str]) -> dict[str, str]:
+    """`env` with `<code>/src` first on PYTHONPATH."""
+    return {**env, "PYTHONPATH": os.pathsep.join(filter(None, [str(code / "src"), env.get("PYTHONPATH")]))}
+
+
 def main() -> int:
-    py, src = interpreter(CODE), CODE / "src"
+    py = interpreter(CODE)
     if sys.argv[1:] == ["--which"]:
-        print(f"interpreter {py}\ncode        {src}")
+        print(f"interpreter {py}\ncode        {CODE / 'src'}")
         return 0
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(src), env.get("PYTHONPATH")]))
-    return subprocess.run([str(py), *sys.argv[1:]], env=env).returncode
+    return subprocess.run([str(py), *sys.argv[1:]], env=code_env(CODE, dict(os.environ))).returncode
 
 
 if __name__ == "__main__":

@@ -77,7 +77,7 @@ def t2s(s: str) -> float:
 
 @dataclass
 class Ev:
-    """一条生成行（`Dialogue:`，Effect `fo-fx`），字段照 `core.dialogue` 的顺序。"""
+    """一条生成行（`Dialogue:`，Effect `fo-fx`，底板是 `fo-fx|plate`），字段照 `core.dialogue` 的顺序。换小格时 Effect 原样带过去。"""
     fields: list[str]           # Layer … Effect, Text 共 10 个
     start: float
     end: float

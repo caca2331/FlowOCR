@@ -5,10 +5,10 @@
 若仓库根有 `AGENTS.local.md`（维护者的私有补充，公开仓库里没有）且它还不在你的上下文里，开工前先读。
 
 ```text
-视频 -> 采样 -> 检测 -> 识别 -> 时间合并（起止） -> 时空聚类（对白 / 字幕 / UI / 水印…） -> <tag>-tracks.json -> SRT / 字幕稿 -> 叠加 ASS
+视频 -> 采样 -> 检测 -> 识别 -> 时间合并（起止） -> 时空聚类（对白 / 字幕 / UI / 水印…） -> <tag>-tracks.json -> SRT / 字幕稿 -> 叠加 ASS -> 烧进视频
 ```
 
-四个阶段：1 提取（`flowocr.extract`）、2 分析（`flowocr.analyze`）、3 输出 SRT 和可在 Aegisub 里编辑的字幕稿（`flowocr.output`）、4 特效渲染（`flowocr.typeset`）。
+五个阶段：1 提取（`flowocr.extract`）、2 分析（`flowocr.analyze`）、3 输出 SRT 和可在 Aegisub 里编辑的字幕稿（`flowocr.output`）、4 特效渲染（`flowocr.typeset`）、5 烧进视频（`flowocr.burn`）。
 
 **两个用途**：①视频文字帧翻译（漫画翻译式，多位置 + overlay）；②游戏 / 影视字幕，往往能找到原文剧本做匹配，
 产出用于翻译 overlay 与语音识别去重。用途②把准确性重心从字符错误率挪到了**漏条 / 幽灵条目 / 切分口径 / 时间精度**上。
@@ -21,6 +21,7 @@ python dev_tools\pyrun.py -m flowocr.extract.run_ocr2 <video> --out <obs.jsonl> 
 python dev_tools\pyrun.py -m flowocr.analyze.build_tracks <obs.jsonl> --outdir <dir> --tag <tag>       # 阶段 2
 python dev_tools\pyrun.py -m flowocr.output.render <matched.json> --preset matched_srt --opt lang=cn   # 阶段 3
 python dev_tools\pyrun.py -m flowocr.typeset <x.script.ass>                                            # 阶段 4（叠加预设会连跑 3、4）
+python dev_tools\pyrun.py -m flowocr.burn <x.ass> [--inpaint]                                          # 阶段 5（叠加预设加 --burn 连跑 3、4、5）
 python dev_tools\pyrun.py tests\test_guards.py      # 共享层守卫（秒级；改完代码先跑）
 python dev_tools\check_docs.py                    # 文档检查（链接、锚点、公开文档不指向私有文件）
 python dev_tools\track_health.py <轨.srt> --hours <h>   # 改完 build_tracks 先跑：只看产物的体检
@@ -45,7 +46,7 @@ python dev_tools\track_health.py <轨.srt> --hours <h>   # 改完 build_tracks �
 ## 项目约定
 
 - 目录：
-  - `src/flowocr/` 放生产代码（四个阶段的子包 extract / analyze / output / typeset，加 artifacts）。
+  - `src/flowocr/` 放生产代码（五个阶段的子包 extract / analyze / output / typeset / burn，加 artifacts）。
   - `dev_tools/` 放还在维护的工具：驱动、评测、对账；改了要跟着更新文档和指标。
   - `explore/` 下每个一次性实验一个目录、自带 venv，缓存走 `explore/env.ps1` / `explore/env.sh`；可整目录删，结论写进文档。实验本身不公开。
   - `tests/` 放守卫与单元测试（`tests/test_guards.py` 是入口）。

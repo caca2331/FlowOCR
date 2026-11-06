@@ -72,7 +72,7 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
     st = SM.match_stats(ref, res["recs"], res["suspect_raw"])
     return SM.matched_doc(ref, res["recs"], res["n_raw"], st, str(ref_path), res["subs_path"], res["tp"],
                           list(context.get("argv") or []), params, res["items"], res["ov_stats"], res["evs"],
-                          fills(ref, res["recs"], res["evs"]))
+                          fills(ref, res["recs"], res["evs"]), res["name_ink"])
 
 
 # ---------------------------------------------------------------- 占位的值（owner 2026-10-05）

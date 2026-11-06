@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from flowocr.artifacts import tracksio
 from flowocr.output import export
 
 OVERLAY_PAD = 14
@@ -13,11 +14,14 @@ OVERLAY_PAD = 14
 EDGE_PAD = 6
 """字离画面边的最小距离（锚轴往里推、扩出的行不出画面、译文字号的宽度上限）。和底板外扩分开：边距加大不该把贴满整屏的长译文字号压小一档。"""
 
-PLATE_MODES = ("box", "rows", "text")
+PLATE_MODES = ("box", "rows", "text", "src")
 """底板怎么画（owner 2026-09-12 要三种比观感）：
 * `box`：原字幕正文框的并集，一整块；
 * `rows`：逐行一块，每行宽 = max(原文这一行的区间, 译文这一行的区间)——多行字幕不填满矩形；
-* `text`：只有译文文字底下有底板。"""
+* `text`：只有译文文字底下有底板；
+* `src`：只盖原文各行（原文框外扩边距），译文超出原文的部分不加底板，更接近原生字幕（owner 2026-10-30；
+  阶段 5 的 inpainting 路线默认用它，只抹原文）。调用方传原文框（`src_box`），`text_w` / `axis` / `text_h` 不看；
+  整块画的行（单框、行数对不上）和别的方案一样取原文框的外接矩形，几个框之间的空隙也盖上。"""
 
 OVERLAY_MIN_SCALE = 0.75
 """叠加字号不低于"按框高换算的字号"的这么多（owner 2026-09-12：第五个选项字被压得过小）。只给译文。"""
@@ -36,13 +40,15 @@ def text_span(axis: float, w: float, align: str) -> tuple[float, float]:
     return axis - w / 2, axis + w / 2
 
 
-def anchor_axis(rows: list[list[float]], align: str, common: bool) -> list[float]:
+def anchor_axis(rows: list[list[float]], align: str, common: bool, fixed: float | None = None) -> list[float]:
     """每行的锚轴。`common`（matched 的多行）取整组的公共轴：居中用**最宽那行**的中心，左 / 右用最外的沿——
     `rows_of` 的行框只是这一行**被收下的**事件的并集，一行被 det 切成两框、其中一个被剔时只剩半行，
     拿它自己的中心当轴，这一行会歪半个行宽；缺了半截的那行不会是最宽的（两行时中位数就是平均，挡不住）。
-    不 `common`（tracks 一个事件一行）取这一行自己的框。"""
+    不 `common`（tracks 一个事件一行）取这一行自己的框。`fixed` 给了就各行都用它（`stacked_axes` 定的）。"""
     def own(r):
         return r[0] if align == "left" else r[2] if align == "right" else (r[0] + r[2]) / 2
+    if fixed is not None:
+        return [fixed] * len(rows)
     if not common:
         return [own(r) for r in rows]
     if align == "left":
@@ -74,17 +80,20 @@ def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str,
 
     def tall(r):
         return row_span(r, th_of.get(id(r), max(ths, default=0.0)))
-    if mode == "box":
+    if mode == "src":
+        out = [[r[0] - p, r[1] - p, r[2] + p, r[3] + p] for r in rows]
+    elif mode == "box":
         spans = [text_span(a, w, align) for w, a in zip(text_w, axes)] if text_w and axis is not None else []
         x0 = min([r[0] for r in rows] + [s[0] for s in spans])
         x1 = max([r[2] for r in rows] + [s[1] for s in spans])
         return [[x0 - p, tall(rows[0])[0] - p, x1 + p, tall(rows[-1])[1] + p]]
-    out = []
-    for r, w, a in zip(rows, text_w, axes):
-        tx0, tx1 = text_span(a, w, align)
-        x0, x1 = (tx0, tx1) if mode == "text" else (min(r[0], tx0), max(r[2], tx1))
-        y0, y1 = tall(r)
-        out.append([x0 - p, y0 - p, x1 + p, y1 + p])
+    else:
+        out = []
+        for r, w, a in zip(rows, text_w, axes):
+            tx0, tx1 = text_span(a, w, align)
+            x0, x1 = (tx0, tx1) if mode == "text" else (min(r[0], tx0), max(r[2], tx1))
+            y0, y1 = tall(r)
+            out.append([x0 - p, y0 - p, x1 + p, y1 + p])
     for a, b in zip(out, out[1:]):
         if b[1] < a[3]:
             a[3] = b[1] = (a[3] + b[1]) / 2
@@ -159,14 +168,37 @@ def same_size(boxes: list[tuple[int, int, list[float]]], sizes: list[int]) -> li
     return out
 
 
-def axes_in_screen(rows: list[list[float]], text_w: list[float], align: str, common: bool, W: int) -> list[float]:
+def axes_in_screen(rows: list[list[float]], text_w: list[float], align: str, common: bool, W: int,
+                   fixed: float | None = None) -> list[float]:
     """锚轴，最宽那行放不进画面就把整组的轴往里推（左 / 右锚时译文比原文长会从一侧伸出去）。"""
-    axes = anchor_axis(rows, align, common)
+    axes = anchor_axis(rows, align, common, fixed)
     spans = [text_span(a, w, align) for a, w in zip(axes, text_w)]
     lo, hi = min(s for s, _ in spans), max(z for _, z in spans)
     pad = EDGE_PAD
     shift = pad - lo if lo < pad else (W - pad) - hi if hi > W - pad else 0
     return [a + shift for a in axes]
+
+
+def stacked_axes(items: list[tuple[int, int, list[float]] | None], text_w: list[float], W: int) -> list[float | None]:
+    """名牌下面的称号（或上面的，不看上下）和名字共用一根锚轴：居中的单框名牌条目 `items[i]` = (起, 止, 原文框)，
+    不参加的给 None。称号认它的名字（`tracksio.stack_partners`：时间上重叠、竖直上紧挨着、字明显比它大、两框的中心互相落在对方框里），
+    名字和认它的称号都取名字的框中心当轴；不成对的是 None（照用自己的框）。
+    轴放不进画面时按组里最宽的那条（`text_w[i]`：这条最宽一行的字宽）一起往里推：`axes_in_screen` 是逐条推的，
+    长名字推了、短称号没推，中线就又错开。
+
+    称号两边常有花纹（原神的「傭兵」），det 时而只框进一边（gi-s2：0:27 起框是 930–1024，中心 977，名字的中心 958），
+    按自己的框居中就歪出十几到二十 px；名字的框没有花纹、各条之间稳定，所以小字跟着大字走。阶段 3 写预览位置、阶段 4 排版都过这一处。"""
+    groups: dict[int, list[int]] = {}
+    for i, j in enumerate(tracksio.stack_partners(items)):
+        if j is not None:
+            groups.setdefault(j, [j]).append(i)
+    axes: list[float | None] = [None] * len(items)
+    for j, members in groups.items():
+        box = items[j][2]
+        a = axes_in_screen([box], [max(text_w[k] for k in members)], "center", True, W, (box[0] + box[2]) / 2)[0]
+        for k in members:
+            axes[k] = a
+    return axes
 
 
 def block_layout(box: list[float], paras: list[str], row_h: int, font: str, widths: dict,

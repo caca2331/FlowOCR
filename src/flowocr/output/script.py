@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import subprocess
@@ -41,13 +42,19 @@ from flowocr.typeset import assfile
 FORMAT_VERSION = "1"
 """字幕稿格式的版本，写在 `[Script Info]` 的 `FlowOCR Script` 键里。"""
 
-STYLES = ("Body", "Extra", "Name", "Choice", "Offmain", "Panel", "UI")
+STYLES = ("Body", "Extra", "Name", "Title", "PlainName", "StrayName", "Choice", "Offmain", "Panel", "UI")
 """字幕稿的样式 = 角色（Style 表示"这是什么"，不表示"在哪"）。`Offmain` 是 matched 的"主轨外"那一层；
-条目在不在主轨另由 `fo` 参数 `off` 记（dev 按它改字色）。"""
+条目在不在主轨另由 `fo` 参数 `off` 记（dev 按它改字色）。`Title` 是名牌下面字小一号的称号（原神的「傭兵」），名字和称号分开，
+在 Aegisub 里按样式改得了各自的字号、颜色（owner 2026-11-05）；`StrayName` 是长得像名牌、但不是挂在台词上又认出了译名的字
+（匹配器的 `stray_name` 组打开时、退回画 OCR 原文的名牌、tracks 的低置信名牌 `mark_names`）。
+匹配器判过名牌字色时（`overlay.name_ink`，`analyze.nameink`），`Name` / `Title` 的主色是这款游戏的名牌色（`style_lines`），
+原文字色和名牌色对不上的那种名牌（原神「グライアイの眼」的蓝底白字面板）另用 `PlainName`（白字，名字和称号都用它）。
+四种名牌样式阶段 4 都按名牌排（`NAME_STYLES`）。"""
+NAME_STYLES = ("Name", "Title", "PlainName", "StrayName")
 
 PREVIEW_BOX = "&H20101010"
 STYLE_FILL = "&H00FFFFFF"
-"""字幕稿各样式的主色（白）。阶段 4 认它：样式的主色还是它，才算没被人改过、底板取色可以自动改字色。"""
+"""字幕稿各样式默认的主色（白）。阶段 4 认它：样式的主色还是它，底板取色才自动改字色；不是它的（人改过的、写了名牌色的 `Name` / `Title`）照样式的颜色画。"""
 """预览底框的颜色（`BorderStyle=3` 用 OutlineColour 画框）：近黑、α 0x20。只供预览，阶段 4 的生成行不用它。"""
 
 STYLE_MODES = ("on", "off")
@@ -90,7 +97,7 @@ class Item:
     end_us: int
     rows: list[list[float]]
     lines: list[str]
-    kind: str                                  # line / name / choice / offmain / block
+    kind: str                                  # line / name / title / plain_name / stray_name / choice / offmain / block
     events: list[dict] = field(default_factory=list)
     region: int = -1
     main: bool = True
@@ -311,6 +318,39 @@ def tracks_items(doc: dict, keep: str, per_event: bool = False) -> list[Item]:
     return out
 
 
+def mark_names(items: list[Item]) -> list[Item]:
+    """tracks 的名牌条目分档（没有匹配器时的高置信标签，owner 2026-11-05），就地改 `kind`、原样返回：
+    * 同时正下方有一行主轨上的句子（`tracksio.name_over_body`，左右取整句 `tracksio.block_head`，间隔上限 `tracksio.NAME_GAP`）的是高置信的名牌，留 `name`（样式 `Name`）；
+      同一块名牌前后几次出现（`tracksio.plate_runs`，读数相同（去掉标点后是空串的按原样）、同一处）有一次挂上就都算；
+    * 没有的改 `stray_name`（样式 `StrayName`），和匹配器的 `stray_name` 组同一个意思：长得像名牌、没挂在台词上；
+    * 高置信的名牌里叠在另一块下面（或上面）、字小一号的（`tracksio.stack_partners`，只在不在动、只有一个框的之间找）改 `title`；一对里一块挂上两块都算。
+    和匹配器的分组（`scriptmatch.name_roles`）同一套几何，只是"台词"换成主轨上的句子。建轨按版式标的名牌里界面字不少，
+    15 段切片的 tracks 量过（2026-11-05）：高置信那一档几乎全是角色名（绝区零 zzz-s2 40 块里 37 块），另一档多是界面字，
+    也有台词不在主轨上（过场）、或名牌在队伍栏和对话记录里的真名字；称号不看这一档时分出 70 块、只有 7 块是真称号，看了之后剩 10 块：这 7 块和鸣潮 3 块 `Lv.` 字样。"""
+    lines = sorted((it for it in items if it.kind == "line" and it.main and not it.ui), key=lambda it: it.start_us)
+    starts = [it.start_us for it in lines]
+    span = max((it.end_us - it.start_us for it in lines), default=0)
+
+    def over_line(it: Item) -> bool:
+        lo, hi = bisect.bisect_left(starts, it.start_us - span), bisect.bisect_left(starts, it.end_us)
+        return any(lines[k].end_us > it.start_us and tracksio.name_over_body(it.rows[0], tracksio.block_head(lines[k].rows))
+                   for k in range(lo, hi))
+    names = [i for i, it in enumerate(items) if it.kind == "name" and not it.ui]
+    runs = tracksio.plate_runs([(items[i].start_us, items[i].end_us, items[i].rows[0], textfold.bare(items[i].lines[0]) or items[i].lines[0].strip())
+                                for i in names])
+    hung = dict(zip(names, tracksio.spread([over_line(items[i]) for i in names], runs)))
+    idx = [i for i in names if not items[i].boxes and len(items[i].rows) == 1]
+    pair = {i: idx[j] for i, j in zip(idx, tracksio.stack_partners([(items[i].start_us, items[i].end_us, items[i].rows[0]) for i in idx]))
+            if j is not None}
+    for i, j in list(pair.items()):
+        if hung[i] or hung[j]:
+            hung[i] = hung[j] = True
+    hung = dict(zip(names, tracksio.spread([hung[i] for i in names], runs)))
+    for i in names:
+        items[i].kind = ("title" if i in pair and hung[pair[i]] else "name") if hung[i] else "stray_name"
+    return items
+
+
 def project_items(items: list[dict], doc: dict, lang: str, vis: matchedio.Visible,
                   marks: placeholders.Marks | None = None, drawn: set[int] | None = None,
                   bare: set[int] | None = None, style: bool = True, ruby: bool = True) -> list[Item]:
@@ -362,7 +402,9 @@ def _project_one(it: dict, doc: dict, lang: str, mains, aligns, marks: placehold
     if it["layer"] in ("body", "extra"):
         return Item(it["start_us"], it["end_us"], it["rows"], overlay_lines(text, [r[2] - r[0] for r in it["rows"]], kw["styled"]), "line", source=text,
                     events=evs, **kw)
-    return Item(it["start_us"], it["end_us"], it["rows"], [text], it["layer"], **kw)   # choice / offmain / name：一块一行，不做打字机 / 淡入淡出
+    # 没挂在台词上的名牌（打开了这一组时）另用 StrayName 样式；判过字色、和这款游戏的名牌色对不上的用 PlainName
+    kind = "stray_name" if it.get("group") == matchedio.STRAY_NAME else "plain_name" if it.get("ink") is False else it["layer"]
+    return Item(it["start_us"], it["end_us"], it["rows"], [text], kind, **kw)   # choice / offmain / name / title：一块一行，不做打字机 / 淡入淡出
 
 
 PANEL_COVER = 0.8
@@ -411,26 +453,41 @@ def native_frame_us(doc: dict) -> int:
 
 
 FRAGMENT_COVER = 0.9
-"""框有这么多落在同一条目里**更早出现**的另一个事件框内的事件，算那一行的碎片（`typing_events`）。"""
+"""框有这么多落在同一条目里**更早出现**的另一个事件框内的事件，算那一行的碎片（`typing_events`、`fade_events`）。"""
 
 
-
-def typing_events(events: list[dict]) -> list[dict]:
-    """算效果时刻用的事件：去掉**碎片**——框几乎整个落在同一条目里一个更早出现的事件框内的事件。
-    det 偶尔在一两个采样点把一行静止的字切成两框，切出来的那块另起一个事件、被一起认领进这句台词，
-    它的起点晚（一行早就打完了），拿它的"全字出现"会把打字机拖到它身上（gi-s2 129.5 s：
-    两行 1 秒打完，被 135.5 s 冒出的半截行拖成 6 秒）。"""
+def _covered(f: dict, o: dict) -> bool:
+    """f 的框至少有 `FRAGMENT_COVER` 落在 o 的框里。"""
     def area(b):
         return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
 
-    def inside(f, o):
-        a = area(f["box"])
-        ix = [max(f["box"][0], o["box"][0]), max(f["box"][1], o["box"][1]),
-              min(f["box"][2], o["box"][2]), min(f["box"][3], o["box"][3])]
-        return a > 0 and area(ix) >= FRAGMENT_COVER * a
+    a = area(f["box"])
+    ix = [max(f["box"][0], o["box"][0]), max(f["box"][1], o["box"][1]),
+          min(f["box"][2], o["box"][2]), min(f["box"][3], o["box"][3])]
+    return a > 0 and area(ix) >= FRAGMENT_COVER * a
 
+
+def typing_events(events: list[dict]) -> list[dict]:
+    """算显出时刻（打字机、淡入）用的事件：去掉**碎片**——框几乎整个落在同一条目里一个更早出现的事件框内的事件，
+    不管那个事件这时还在不在屏。
+    det 偶尔在一两个采样点把一行静止的字切成两框，切出来的那块另起一个事件、被一起认领进这句台词，
+    它的起点晚（一行早就打完了），拿它的"全字出现"会把打字机拖到它身上（gi-s2 129.5 s：
+    两行 1 秒打完，被 135.5 s 冒出的半截行拖成 6 秒）。
+    不要求两者同时在屏：一句打完后变暗被重读、或早已整句在屏的字后来又读成一个新事件时，早先那次可能已经消失，
+    后来的读数框落在它里面、全字出现晚，留着就判出假打字机（要求同时在屏量过：《魔裁》f2 7:16:13 打完变暗的一句判出 5.5 s，
+    zzz 1:32:16 早已整屏在的技能说明判出 15 s）。淡出用的是另一套判据（`fade_events`）。"""
     return [f for f in events
-            if not any(o is not f and o["t_start"] < f["t_start"] and inside(f, o) for o in events)]
+            if not any(o is not f and o["t_start"] < f["t_start"] and _covered(f, o) for o in events)]
+
+
+def fade_events(events: list[dict]) -> list[dict]:
+    """算淡出用的事件：去掉碎片，但只去和它落进的那个更早事件**同时在屏**的（它出现时那个还没消失）。
+    淡出看的是这句字最后什么时候开始消失：更早那次读数已经消失、后来的事件是同一句重新读出来的时候，
+    按 `typing_events` 把后来的当碎片去掉，淡出就从早先那次消失时算起，字明明一直亮到条目结束却画成长淡出
+    （hsr 1:46:16 那句在 6377.5 s 断了一下、6378.0 s 起重新读出一直亮到 6501.9 s，画成 124 s 的淡出）。
+    det 切行切出来的碎片和原行同时在屏，照样去掉（gi-s2 129.5 s 那个半截行）。"""
+    return [f for f in events
+            if not any(o is not f and o["t_start"] < f["t_start"] < o["t_end"] and _covered(f, o) for o in events)]
 
 
 TAIL_IN = 0.8
@@ -450,10 +507,13 @@ def is_reread(f: dict, o: dict, step: int) -> bool:
     """f 是 o 的**重读**：o 先出现、f 在 o 全字之后才出现、o 在 f 出现时已经消失（差不出一个采样间隔），
     且 f 的字几乎都按顺序落在 o 里（`TAIL_IN`）。台词框退场时整体下移，建轨的几何门接不上，最后一帧每行另起一个
     `n_obs` 1 的事件（zzz 7520.0 s：框下移 14–17 px、「ちょちょちょ」读成「ちょちょちよ」）；拿它的全字时刻会把打字机拖到句尾。
-    要 o 已经消失：同时在屏的短第二行（gi1「てるの。」整行的字恰好都在第一行里）不是重读。去完标点为空的读数不算。"""
+    要 o 已经消失：同时在屏的短第二行（gi1「てるの。」整行的字恰好都在第一行里）不是重读。去完标点为空的读数不算。
+    o 的终点是末段在动的门留下的采样级（`t_end_how = moving`）时多容一个采样间隔：门把它的终点留在采样点上，比字真正离开晚到一个间隔
+    （hsr 2982.0 s 对话记录合上时滑走的一行，终点从 2988.02 s 留到 2988.5 s，原样比就认不出 2987.9 s 起的重读、打字机拖成 6.1 s）。"""
     fb = textfold.bare(f["text"])
+    slack = 2 * step if o.get("t_end_how") == "moving" else step
     return (bool(fb) and o["t_start"] < f["t_start"] and f["t_start"] >= _full_at(o)
-            and o["t_end"] <= f["t_start"] + step and _contained(fb, textfold.bare(o["text"])) >= TAIL_IN)
+            and o["t_end"] <= f["t_start"] + slack and _contained(fb, textfold.bare(o["text"])) >= TAIL_IN)
 
 
 def effect_events(events: list[dict], step: int, pool: list[dict] | None = None) -> list[dict]:
@@ -470,15 +530,16 @@ def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True, po
     """(打字机时长, 淡入, 淡出)，单位 µs；不做的是 0。只有不动的 `line` 才做。
 
     * 显出的时刻（打字机、淡入）只从 `effect_events` 取（一行被 det 切出来的碎片、退场那一帧的重读不算；`pool` 是判重读用的整条事件，按行算时传）；
-      淡出看的是这句字**最后**什么时候开始消失，从 `typing_events` 取（只去碎片）：对话记录滚动时同一行在新位置被重新读出、也满足重读的形状，
-      排掉的话淡出从第一段读数的消失算起，hsr 1:51:29 记录面板上的一句拉成 36 s 的淡出。
+      淡出看的是这句字**最后**什么时候开始消失，从 `fade_events` 取（只去和原行同时在屏的碎片，不去重读）：对话记录滚动时同一行在新位置被重新读出、也满足重读的形状，
+      排掉的话淡出从第一段读数的消失算起，hsr 1:51:29 记录面板上的一句拉成 36 s 的淡出；碎片的判据为什么和显出时刻不同见 `fade_events`。
     * 打字机：条目的事件被回抠过（带 `t_full_how`）就只认回抠的 `t_full`；整段素材判成 `instant`、而且是
-      "字确实没有生长"那种（离散度 ≤ `INSTANT_MAX_SPREAD`）才不做，判不清的、没判定（样本 < 8）的按逐条的门走；没被回抠的（没回抠的产物、或 `--labels` / `--regions` 没挑到的区域）
+      "字确实没有生长"那种（离散度 ≤ `INSTANT_MAX_SPREAD`）才不做，判不清的、没判定（样本 < 8）的按逐条的门走；没被回抠的（没回抠的产物、没认领到证据的条目、或开发探针按 `labels` / `regions` 只挑了部分区域）
       用采样级的 `t_full_sampled`。按事件判、不按整份产物判：只回抠了部分区域时，其余区域照样有采样级的效果。
       两种都要 ≥ `TW_MIN_FRAMES` 帧（回抠按原生帧、采样级和"全字没量出来"的回抠值按采样间隔）。
     * 淡出：`t_full_end`（回抠）到条目结束，不足一帧的不做——回抠会把没淡出的也填上，夹在结尾前一点。
-      成员里有**开放边界**（`t_end_how = open`：没看到它消失）的整条不做——不知道它什么时候、怎么消失，
-      不能借别的行的 `t_full_end` 给整句（多行译文连底板）做淡出。
+      成员里有**开放边界**（`t_end_how = open`：没看到它消失）或末段在动（`moving`：终点留在采样级、不填 `t_full_end`）的整条不做——
+      都没有消失的证据，不知道它什么时候、怎么消失，不能借别的行的 `t_full_end` 给整句（多行译文连底板）做淡出
+      （hsr 6376.75 s 对话记录里一句随面板滚走，借了早先那次已消失读数的 `t_full_end`，画成 9 s 的淡出）。
     * 淡入：**实际没做**逐字显出时才复刻（首字出现 → 回抠的全字出现），不足 `TW_MIN_FRAMES` 个原生帧、
       或全字没量出来的不做，最长 `FADE_IN_MAX_US`。"""
     if it.kind != "line" or it.boxes or not it.events:
@@ -505,8 +566,8 @@ def effect_times(it: Item, doc: dict, frame_us: int, typewriter: bool = True, po
         fs = last("t_full_sampled")
         if fs is not None and fs - s >= TW_MIN_FRAMES * doc["frame_us"]:
             tw = fs - s
-    tail = typing_events(it.events)
-    fend = (None if any(ev.get("t_end_how") == "open" for ev in tail)
+    tail = fade_events(it.events)
+    fend = (None if any(ev.get("t_end_how") in ("open", "moving") for ev in tail)
             else min(max(v), e) if (v := [ev["t_full_end"] for ev in tail if ev.get("t_full_end") is not None]) else None)
     fout = e - fend if fend is not None and e - fend >= frame_us else 0
     # 淡入也要 ≥ 2 个原生帧：即时出现的字回抠给的全字时刻晚一两帧，不该变成一个 1–2 帧的 \fad
@@ -655,6 +716,12 @@ def style_of(it: Item) -> str:
         return "UI"
     if it.kind == "name":
         return "Name"
+    if it.kind == "title":
+        return "Title"
+    if it.kind == "plain_name":
+        return "PlainName"
+    if it.kind == "stray_name":
+        return "StrayName"
     return "Extra" if it.layer == "extra" else "Body"
 
 
@@ -680,7 +747,7 @@ def view_rows(it: Item, H: int) -> list[list[float]]:
 
 def draft_line(it: Item, size: int, W: int, H: int, widths: dict, tw_us: int, fin: int, fout: int, why: str | None,
                font: str = export.FONT_CN, grow: list[tuple[int, int]] | None = None,
-               rowt: list[tuple[int, int]] | None = None) -> str:
+               rowt: list[tuple[int, int]] | None = None, axis: float | None = None) -> str:
     """一个条目 → 字幕稿里的一行源行：正文是一个主流 tag 块 + 纯文字（行间 `\\N`），阶段 4 的参数 `fo:…` 放在 Effect 字段——
     正文里没有参数，改字的时候碰不到（owner 2026-09-27 看 Aegisub 里的字幕稿后定：正文尽量是纯文字、便于编辑；参数放 Effect）。"""
     t0, t1 = export.ass_time(it.start_us, True), export.ass_time(it.end_us, False)
@@ -699,7 +766,7 @@ def draft_line(it: Item, size: int, W: int, H: int, widths: dict, tw_us: int, fi
     tw = [layout.line_width(font, ln, widths) * size for ln in it.lines]
     per_row = len(it.lines) == len(rows)
     axes = layout.axes_in_screen(rows, tw if per_row else [max(tw, default=0.0)] * len(rows),
-                                 it.align, it.translated, W)
+                                 it.align, it.translated, W, axis)
     x = axes[0]
     y = (rows[0][1] + rows[-1][3]) / 2
     if it.boxes:                                      # 预览：整条一个 \move 从首点到末点，精确轨迹在 path 里
@@ -731,22 +798,40 @@ def styled_lines(it: Item, lines: list[str]) -> list[str] | None:
     return got.split("\n") if got is not None else None
 
 
-def style_lines(font: str = export.FONT_CN) -> list[str]:
+def style_lines(font: str = export.FONT_CN, fills: dict[str, str] | None = None) -> list[str]:
     """字幕稿的样式：一个角色一个，参数相同。`BorderStyle=3` 出预览底框（各渲染器都认，框用 OutlineColour、外扩 `OVERLAY_PAD`）；
-    次要色全透明、阴影 0：人要自己调某一行的打字机节奏时写 `\\k` 族 tag，预览就是逐字显出（`\\ko` 藏不住阴影，第 0 步探针量过）。"""
-    return [f"Style: {s},{font},48,{STYLE_FILL},&HFF000000,{PREVIEW_BOX},&H00000000,"
+    次要色全透明、阴影 0：人要自己调某一行的打字机节奏时写 `\\k` 族 tag，预览就是逐字显出（`\\ko` 藏不住阴影，第 0 步探针量过）。
+    `fills`：样式 → 主色（`&H00BBGGRR`），没给的是 `STYLE_FILL`（`name_fills` 给名牌色）。"""
+    fills = fills or {}
+    return [f"Style: {s},{font},48,{fills.get(s, STYLE_FILL)},&HFF000000,{PREVIEW_BOX},&H00000000,"
             f"0,0,0,0,100,100,0,0,3,{layout.OVERLAY_PAD},0,5,0,0,0,1" for s in STYLES]
 
 
+NAME_INK_STYLES = {"name": "Name", "title": "Title"}
+"""`overlay.name_ink` 的层 → 写名牌色的样式。"""
+
+
+def name_fills(document: dict) -> dict[str, str]:
+    """匹配产物判过名牌字色时（`overlay.name_ink`：层 → `#rrggbb`）`Name` / `Title` 的主色（`&H00BBGGRR`）；tracks、没判过的是空的。"""
+    ink = (document.get("overlay") or {}).get("name_ink") or {}
+    return {NAME_INK_STYLES[k]: f"&H00{v[5:7]}{v[3:5]}{v[1:3]}".upper() for k, v in ink.items() if k in NAME_INK_STYLES}
+
+
+def stacks(it: Item) -> bool:
+    """参加名牌 / 称号共用锚轴（`layout.stacked_axes`）的条目：居中、不在动、只有一个原文框的名牌（三种名牌样式）。阶段 4 的 `Typesetter.stack_axes` 是同一判据。"""
+    return style_of(it) in NAME_STYLES and it.align == "center" and not it.boxes and len(it.rows) == 1
+
+
 def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = True, fade: bool = True,
-                  why: bool = False, info: dict | None = None) -> tuple[Counter, dict]:
+                  why: bool = False, info: dict | None = None, fills: dict[str, str] | None = None) -> tuple[Counter, dict]:
     """把条目写成字幕稿。返回（计数：各种类、打字机 / 淡入淡出条数、对齐；量好的字宽——连跑阶段 4 时交给它，不用再量一遍）。
 
     * 字号 = `layout.fit_line`（原文只按框，译文有保底、不超画面）；同栏同时在屏的选项取中位数（`layout.same_size`）；
       面板按 `layout.block_layout` 折行；
     * 位置：单行就是阶段 4 的位置；多行是整组的锚轴和几行的竖直中心（阶段 4 按原框逐行摆，预览里行距是字体的）；
       在动的写一个首点到末点的 `\\move` 供预览，精确轨迹在 `fo` 的 `path`；
-    * 效果见 `effect_times`，打字机记成 `fo` 的 `tw`（正文保持纯文字）、淡入淡出写成 `\\fad`。"""
+    * 效果见 `effect_times`，打字机记成 `fo` 的 `tw`（正文保持纯文字）、淡入淡出写成 `\\fad`；
+    * `fills`：样式的主色（`name_fills`，匹配器判过的名牌色），没给的样式是白字。"""
     W, H = doc["size"]
     frame_us = native_frame_us(doc)
     font = export.FONT_CN
@@ -757,8 +842,11 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
     for i, s in zip(choice, layout.same_size([(items[i].start_us, items[i].end_us, items[i].rows[0]) for i in choice],
                                              [sizes[i] for i in choice])):
         sizes[i] = s
+    axes = layout.stacked_axes([(it.start_us, it.end_us, it.rows[0]) if stacks(it) else None for it in items],
+                               [max((layout.line_width(font, ln, widths) * sz for ln in it.lines), default=0.0) if stacks(it) else 0.0
+                                for it, sz in zip(items, sizes)], W)
     lines_out, n = [], Counter()
-    for it, size in zip(items, sizes):
+    for it, size, axis in zip(items, sizes, axes):
         n[it.kind] += 1
         got = "\n".join(styled_lines(it, it.lines) or ()) if it.kind != "block" else ""
         n["styled"] += richtext.select(got, ruby=False) != richtext.plain(got)
@@ -772,10 +860,11 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
         # 有逐行时刻时，底板的原文那部分也逐行起盖：grow 按整条的时长夹（一行都不打字时 tw 是 0）
         grow = (grow_times(it, doc, tw_us if rowt is None else max(1, it.end_us - it.start_us))
                 if it.kind != "block" else None)
+        n["stacked"] += axis is not None
         lines_out.append(draft_line(it, size, W, H, widths, tw_us, fin, fout,
-                                    effect_why(it, doc, tw_us, fin, fout) if why else None, font, grow, rowt))
+                                    effect_why(it, doc, tw_us, fin, fout) if why else None, font, grow, rowt, axis))
     head = {"FlowOCR Script": FORMAT_VERSION, **(info or {})}
-    Path(path).write_text(export.ass_doc(W, H, style_lines(font), lines_out, info=head), encoding="utf-8")
+    Path(path).write_text(export.ass_doc(W, H, style_lines(font, fills), lines_out, info=head), encoding="utf-8")
     return n, widths
 
 
@@ -824,7 +913,7 @@ def build_items(document: dict, options: dict | None, align: bool = True,
 
     matched 的条目：可见、有 `lang` 文本的叠加条目（`project_items`），再加 OCR 原文（`ocr_items`）——
     `unmatched` 组可见时画 `matchedio.fed_rest` 给的 unmatched 事件和**可见、但没有 `lang` 文本**的条目的事件（已被画出的条目用到的除外），
-    `unfed` 组可见时画 unfed 事件。"""
+    `unfed` 组可见时画 unfed 事件。退回画的名牌（名牌层的事件、带建轨名牌标的事件）一律是 `stray_name`。"""
     o = dict(options or {})
     style = str(o.get("style", "on"))
     if style not in STYLE_MODES:
@@ -855,7 +944,14 @@ def build_items(document: dict, options: dict | None, align: bool = True,
         ocr = {i for g, ids in raw.items() if g in vis.groups for i in ids}
         note = f"剧本译文 {lang}，{visible_note(document, vis)}"
         if ocr:
-            items += ocr_items(doc, ocr, [it for it in items if it.kind == "block"])
+            # 退回画 OCR 原文的名牌一律 `stray_name`：`Name` / `Title` 只给挂在台词上、认出了译名的（匹配成功的真名牌，owner 2026-11-05）。
+            # 名牌层的事件不看 tracks 的 kind——那是建轨的 `nameplate` 标，匹配器认的开头行多半没有，会以 `Body` 出现；
+            # 挂上但没译出的也不算：《魔裁》里多是 `19:39`、`NO DATA`、`そう。` 这类（2026-11-05 量，f1–f5 默认叠加共 124 块，也有读错的真名字 `階堂匕口`）
+            heads = {i for it in document["overlay"]["items"] if it["layer"] in ("name", "title") for i in it["events"]}
+            for x in ocr_items(doc, ocr, [it for it in items if it.kind == "block"]):
+                if x.kind == "name" or x.events[0]["id"] in heads:
+                    x.kind = matchedio.STRAY_NAME
+                items.append(x)
             note += "，另画 OCR 原文：" + "、".join(f"{g} {len(ids)} 个事件" for g, ids in raw.items() if g in vis.groups)
         tag = doc.get("tag") or Path(tracks).stem.removesuffix("-refined").removesuffix("-tracks")
         return items, doc, f"{tag}-{lang}", note, f"{tag} {matchedio.SCHEMA}"
@@ -870,7 +966,7 @@ def build_items(document: dict, options: dict | None, align: bool = True,
         need_align(doc, str(doc.get("tag") or "这份 tracks"))
     base = str(doc.get("tag") or "tracks")
     note = f"OCR 原文，{'主轨 + 名牌' if keep == 'main' else '全部区域轨'}"
-    return tracks_items(doc, keep), doc, base, note, f"{base} {tracksio.SCHEMA}"
+    return mark_names(tracks_items(doc, keep)), doc, base, note, f"{base} {tracksio.SCHEMA}"
 
 
 def render_script(document: dict, output_dir, options: dict | None, suffix: str = ""
@@ -900,10 +996,11 @@ def render_script(document: dict, output_dir, options: dict | None, suffix: str 
             "FlowOCR Code": provenance.git_head(), "FlowOCR Note": note, **marks.legend()}
     if (doc.get("provenance") or {}).get("video"):
         info["FlowOCR Video"] = doc["provenance"]["video"]          # 阶段 4 的底板取色读它（已是 portable 的写法）
-    n, widths = export_script(p, items, doc, typewriter, fade, why == "on", info)
-    kinds = "、".join(f"{k} {n[k]}" for k in ("line", "name", "choice", "offmain", "block") if n[k])
+    n, widths = export_script(p, items, doc, typewriter, fade, why == "on", info, name_fills(document))
+    kinds = "、".join(f"{k} {n[k]}" for k in ("line", "name", "title", "plain_name", "stray_name", "choice", "offmain", "block") if n[k])
     aligns = "、".join(f"{a} {n['align_' + a]}" for a in tracksio.ALIGNS if n["align_" + a])
-    styled = (f"、剧本样式 {n['styled']} 条" if n["styled"] else "") + (f"、Ruby {n['ruby']} 处" if n["ruby"] else "")
+    styled = (f"、剧本样式 {n['styled']} 条" if n["styled"] else "") + (f"、Ruby {n['ruby']} 处" if n["ruby"] else "") \
+        + (f"、称号跟名字对齐 {n['stacked']} 条" if n["stacked"] else "")
     print(f"-> {p}（字幕稿，{len(items)} 条：{kinds}；对齐 {aligns}；打字机 {n['typewriter']} 条、淡入淡出 {n['fade']} 条{styled}；{note}）")
     from flowocr.output import timing_check             # 它 import 本模块，放这里免得循环
     sus = timing_check.check(items, doc, typewriter, fade)

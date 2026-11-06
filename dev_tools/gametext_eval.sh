@@ -24,9 +24,7 @@ if [ -n "$BUILD_ARGS" ] && [ -z "$SUFFIX" ]; then
   exit 2
 fi
 CODE=$(cd "$(dirname "$0")/.." && pwd)
-PY="$CODE/.venv/Scripts/python.exe"   # 正式包的开发 venv（uv sync --extra nvidia --group dev）：跑的就是 $CODE/src
-export PYTHONPATH="$(cd "$CODE" && (pwd -W 2>/dev/null || pwd))/src"   # 跑的一定是 $CODE/src：槽里的 .venv 若是指回主 checkout 的 junction，editable 安装会导回主 checkout 的代码
-[ -x "$PY" ] || { echo "没有 $PY：先在 $CODE 里 uv sync --frozen --extra nvidia --group dev" >&2; exit 2; }
+source "$CODE/dev_tools/pyenv.sh"   # PY = pyrun.py 挑的解释器（槽里没有 .venv 就用主 checkout 的），PYTHONPATH 钉到 $CODE/src
 cd "$("$PY" -m flowocr.paths)"
 mkdir -p tmp/gametext out/gametext
 # 文本包：没指定、数据根也没有 gametext/ 时，开发机用 game-text-data 那边 bundle 出的 out/（生产代码不认这个目录布局，只在驱动里设）

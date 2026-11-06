@@ -36,10 +36,11 @@ import copy
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from flowocr import textfold  # noqa: E402
 from flowocr.artifacts import evalkit  # noqa: E402
 from flowocr.analyze import gamescript as GS  # noqa: E402
 from flowocr.analyze import script_align as SA  # noqa: E402
@@ -65,24 +66,28 @@ class Ref:
     role: dict[str, str]
     variant_of: dict[str, str]
     """绝区零变体行 -> 它那组的代表行（gamescript `fold_variants`）。一组只算一个分母条目。"""
+    rows: dict[str, tuple[str, int]] = field(default_factory=dict)
+    """剧本行 key -> (单元, 单元内行序)：行序是这一行在单元 `lines` 里的下标（重演拷贝占着位置、不进表）。夹缝认领（`claim_flanked`）看相邻行用；
+    空表时那一遍不跑。"""
 
 
 def load_ref(p: Path) -> Ref:
     doc = json.loads(p.read_text(encoding="utf-8"))
     if doc.get("schema") != GS.SCHEMA:
         raise SystemExit(f"{p} 的 schema 不是 {GS.SCHEMA}：{doc.get('schema')!r}（重跑 gamescript）")
-    by_key, role, variant_of = {}, {}, {}
+    by_key, role, variant_of, rows = {}, {}, {}, {}
     for u in doc["units"]:
-        for ln in u["lines"]:
+        for li, ln in enumerate(u["lines"]):
             if ln["status"] == "Duplicate":     # 同一个节点的第二份 key 相同，别覆盖原件
                 continue
+            rows[ln["key"]] = (u["uid"], li)
             by_key[ln["key"]] = SA.Entry(key=ln["key"], kind=ln["kind"], cmd="", text=ln["text"],
                                          src=u["uid"], status=ln["status"])
             role[ln["key"]] = ln["role"]
             if ln.get("variant_of"):
                 variant_of[ln["key"]] = ln["variant_of"]
     return Ref(doc=doc, script=[by_key[k] for k, _, _ in doc["sequence"]],
-               windows=[w for _, _, w in doc["sequence"]], role=role, variant_of=variant_of)
+               windows=[w for _, _, w in doc["sequence"]], role=role, variant_of=variant_of, rows=rows)
 
 
 def fresh_script(ref: Ref) -> list[SA.Entry]:
@@ -467,8 +472,73 @@ def claim_infix(script: list[SA.Entry], subs, cand, sub_hit: list[int], sub_extr
     return len(best)
 
 
+FLANK_SHORT = 2
+"""`claim_flanked` 的文字票：读法和剧本行短的那一方不超过这么多个内容字时只许少读、不许读错（0 处差），否则许错 1 处。同名牌投票（`scriptmatch.fuzzy_names`）的口径。"""
+
+
+def flank_fits(r: str, c: str) -> bool:
+    """夹缝认领的文字票：读法 `r` 是剧本行 `c`（两边都已 `GS.cnorm`）的一截（`textfold.fits_within`），
+    错字不超过门（短的一方 ≤ `FLANK_SHORT` 字 0 处、否则 1 处），且占这一行过半。"""
+    return 2 * len(r) > len(c) and textfold.fits_within(r, c, 0 if min(len(r), len(c)) <= FLANK_SHORT else 1)
+
+
+def claim_flanked(script: list[SA.Entry], subs, cand, sub_hit: list[int], sub_extra: list[list[int]],
+                  heads: frozenset[str], cn: list[str], rows: dict[str, tuple[str, int]],
+                  variant_of: dict[str, str], step: float = 0.0) -> list[int]:
+    """第五遍，**夹缝认领**：前四遍都没认上任何行的 cue X，夹在同一单元**相邻两行**的两次认领之间，就认中间那一行。
+    就地改 `sub_hit` / `Entry.matched`，返回认上的 cue 下标（升序）。四条都要成立（shortline-context 计划的判据）：
+
+    1. 单元里行 m 的上一行有一次认领起点 ≤ X 的起点、下一行有一次认领起点 ≥ X 的起点（同刻算两边：同屏的选项按钮）；
+       "同刻"容不到一个采样间隔（`step`，秒）的差：和 X 的起点差不到一个间隔的认领两边都算。同一个菜单的按钮在采样级上起点相等，
+       回抠到帧级后会差两三帧（hsr2 三选一菜单 48.90 / 48.90 / 48.94 s），中间那个按钮的邻行可能早它几帧；`step` 是 0（不知道）时就是原来的比法；
+       取最近的那两次，两次之间（开区间）这个单元**没有别的行**被认领。"认领"是前四遍的主认领和包含认领，本遍新认的不当证据（不连锁）；
+    2. m 是带内行、还没人认（变体组按整组算）、X 的起点在 m 的可认领时段里（`cand(t)`）；
+    3. X 的某种读法（`variants`，开头行先剥）和 m 相容（`flank_fits`：是 m 的一截、错字不超过门、占过半）；
+    4. 一个 X 只认一行：同时对上两行就不认；同一行有几条 X 时认给最早的那条（同一次显示切成几条 cue 时不多出重复认领）。
+
+    为什么（owner 2026-10-24 定方向：短句靠匹配器按上下文和惯性推测）：2–4 个内容字、句尾拖一串标点的行（`でも…`、`そう…`），
+    OCR 常读不出句尾，NFKC 后 `…` 展成 `...`，相似度过不了 `--fuzzy`、整行包含又要 ≥ 3 字，前四遍都够不着。
+    相似度里去句尾标点分不开单独上屏的人名和"人名…？"这种台词（defaults.md 3.1）；这里靠**单元内的行序**挡：
+    地图标记、记录面板说话人栏上的人名，要恰好落在"人名…？"上下两行的认领之间才会被认。"""
+    from collections import defaultdict
+    pos = {i: rows[e.key] for i, e in enumerate(script) if e.key in rows}
+    rep = [variant_of.get(e.key, e.key) for e in script]
+    taken = {rep[i] for i, e in enumerate(script) if e.matched >= 0}
+    seen: dict[str, list[tuple[float, int]]] = defaultdict(list)     # 单元 -> [(认领起点, 行序)]，前四遍的
+    for si, (t, _, _) in enumerate(subs):
+        for i in ([sub_hit[si]] if sub_hit[si] >= 0 else []) + sub_extra[si]:
+            if i in pos:
+                seen[pos[i][0]].append((t, pos[i][1]))
+
+    def flanked(u: str, li: int, t: float) -> bool:
+        cl = seen.get(u, ())
+        ta = max((x for x, r in cl if r == li - 1 and (x <= t or x < t + step)), default=None)
+        tb = min((x for x, r in cl if r == li + 1 and (x >= t or x > t - step)), default=None)
+        if ta is None or tb is None:
+            return False
+        lo, hi = min(ta, tb), max(ta, tb)               # 容差下两端可以倒序（下一行早 X 一两帧、上一行晚一两帧）
+        return not any(lo < x < hi and r not in (li - 1, li + 1) for x, r in cl)
+    best: dict[int, int] = {}                             # 行 -> 最早的 X
+    for si, (t, raw, _) in enumerate(subs):
+        if sub_hit[si] >= 0 or sub_extra[si]:
+            continue
+        rs = [r for r in dict.fromkeys(GS.cnorm(v) for v in variants(raw, heads)) if r]
+        if not rs:
+            continue
+        hits = [i for i in cand(t)
+                if i in pos and band(script[i]) and rep[i] not in taken
+                and any(flank_fits(r, cn[i]) for r in rs) and flanked(*pos[i], t)]
+        if len(hits) == 1 and (hits[0] not in best or (t, si) < (subs[best[hits[0]]][0], best[hits[0]])):
+            best[hits[0]] = si
+    for i, si in best.items():
+        sub_hit[si] = i
+        script[i].matched = si
+    return sorted(best.values())
+
+
 def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float, ends: list[float] | None = None,
-        main: list[bool] | None = None) -> dict:
+        main: list[bool] | None = None, rows: dict[str, tuple[str, int]] | None = None,
+        variant_of: dict[str, str] | None = None, step: float = 0.0) -> dict:
     """**按时间圈候选**的对齐：cue 在 t 秒，只和"t 落在它可认领时段里"的剧本行比
     （时段由 gamescript 从 obs 定，见 `gamescript.sequence`）；精确相等优先，否则取相似度
     最高的（≥ fuzzy）；平手时先给还没被认领的行、再按序列先后。
@@ -477,7 +547,8 @@ def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float, ends: l
     为什么不用 `script_align.align` 的游标：那套在一条字幕带 + 有序剧本上是对的，
     在这里会被短句带跑——一条 `うん` 的精确匹配把游标甩到很远的后面，之后读得几乎一样的
     cue 也够不着（gi1 实测 `カチ一ナちゃんを助けて…` 在主轨里只差一个 `ー`，被记成漏）。
-    这里的剧本行本来就带 obs 时段，用它圈范围更稳；**时间只圈范围，命中仍看文本**。"""
+    这里的剧本行本来就带 obs 时段，用它圈范围更稳；**时间只圈范围，命中仍看文本**。
+    主认领之后四遍补漏（包含、打字机半截、读到一大段、夹缝）；`rows`（`Ref.rows`）不给时夹缝那一遍不跑。"""
     from collections import defaultdict
     for e in script:
         e.matched, e.sim = -1, 0.0
@@ -548,20 +619,22 @@ def run(script: list[SA.Entry], windows: list[list], subs, fuzzy: float, ends: l
     n_contain = sum(1 for h, ex in zip(sub_hit, sub_extra) if h < 0 and ex)
     n_prefix = claim_prefix(script, subs, cand, sub_hit, sub_extra, heads, cn, ends)
     n_infix = claim_infix(script, subs, cand, sub_hit, sub_extra, heads, cn, ends, main)
-    n_fuzzy, n_none = n_fuzzy + n_prefix + n_infix, n_none - n_prefix - n_infix
+    ctx = claim_flanked(script, subs, cand, sub_hit, sub_extra, heads, cn, rows, variant_of or {}, step) if rows else []
+    n_more = n_prefix + n_infix + len(ctx)
+    n_fuzzy, n_none = n_fuzzy + n_more, n_none - n_more
     return {"subs": len(subs), "exact": n_exact, "fuzzy": n_fuzzy, "contain": n_contain,
-            "superset": n_super, "prefix": n_prefix, "infix": n_infix,         # 这三种都已算在 fuzzy 里
-            "unmatched_subs": n_none - n_contain, "jumps": 0,
+            "superset": n_super, "prefix": n_prefix, "infix": n_infix, "context": len(ctx),   # 这四种都已算在 fuzzy 里
+            "context_subs": ctx, "unmatched_subs": n_none - n_contain, "jumps": 0,
             "sub_hit": sub_hit, "sub_extra": sub_extra, "heads": heads}
 
 
 def score(ref: Ref, script: list[SA.Entry], subs, fuzzy: float, ends: list[float] | None = None,
-          main: list[bool] | None = None) -> dict:
+          main: list[bool] | None = None, step: float = 0.0) -> dict:
     """`run` + 把变体组折成一个条目：组里任何一种说法被认领，就记在代表行上
     （`via`：代表行 key -> 实际被认领的那一行）；`sub_hit` 里指向变体的也改指代表行，
     免得同一句话的两种说法各被一条 cue 认领时，重复认领数不出来。
     `script` 可以是 `ref.script` 的深拷贝（两臂各量各的，不互相覆盖 `matched`）。"""
-    st = run(script, ref.windows, subs, fuzzy, ends, main)
+    st = run(script, ref.windows, subs, fuzzy, ends, main, ref.rows, ref.variant_of, step)
     idx = {e.key: i for i, e in enumerate(script)}
     via: dict[str, SA.Entry] = {}
     for e in script:

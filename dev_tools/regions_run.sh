@@ -10,9 +10,7 @@
 # product-goals 第 14 条；组名当标签认不出游戏，所以显式给）。
 set -euo pipefail
 CODE=$(cd "$(dirname "$0")/.." && pwd)
-PY="$CODE/.venv/Scripts/python.exe"
-[ -x "$PY" ] || PY="$CODE/.venv/bin/python"
-export PYTHONPATH="$(cd "$CODE" && (pwd -W 2>/dev/null || pwd))/src"   # 跑的一定是 $CODE/src（同 head2head.sh）
+source "$CODE/dev_tools/pyenv.sh"   # PY = pyrun.py 挑的解释器（槽里没有 .venv 就用主 checkout 的），PYTHONPATH 钉到 $CODE/src
 VIDEO=$1; SPEC=$2; OUT=$3; S=${4:-0}; E=${5:-0}
 mkdir -p "$OUT"
 # 一行一个组名（组名里可以有空格；Windows 的 print 带 CR，去掉）

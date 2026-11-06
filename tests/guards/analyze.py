@@ -423,6 +423,26 @@ def t_typewriter_fuse() -> None:
         _enough = RB.attach_ocr([_j() for _ in range(TF.OCR_SLOPES_MIN)], _p)
     check(f"全片 OCR 打字速度：拟得出斜率的少于 {TF.OCR_SLOPES_MIN} 句就不给（退回逐字格斜率），够了才给",
           _few is None and _enough is not None, (_few, _enough))
+    with tempfile.TemporaryDirectory() as _d:
+        _p = Path(_d) / "o.jsonl"
+        _p.write_text('{"_meta": {}}\n' + _rows(0), encoding="utf-8")
+        _mixed = RB.attach_ocr([_j() for _ in range(TF.OCR_SLOPES_MIN - 1)] + [dict(_j(), effect_pool=False)], _p)
+    check("全片 OCR 打字速度只从正文区域的 job 统计（defaults.md 1.65）：标题 / UI 的 job（effect_pool=False）不凑数",
+          _mixed is None, _mixed)
+
+    # 回抠覆盖全部区域、文字效果只看正文区域（defaults.md 1.65）
+    _sig = inspect.signature(RB.refine_tracks).parameters["labels"].default
+    check("回抠默认覆盖全部区域：DEFAULT_LABELS = all，refine_tracks 的默认就是它",
+          RB.DEFAULT_LABELS == "all" and _sig == RB.DEFAULT_LABELS, (RB.DEFAULT_LABELS, _sig))
+    _tw = [{"text": "あいうえおかきく", "grow_ms": 400 + 10 * k} for k in range(8)]   # 每字 50 ms 上下，很紧
+    _fade = [{"text": "第三章消えた灯台", "grow_ms": g} for g in (0, 0, 0, 0, 0, 0, 30, 60, 900, 1200, 1500, 1800, 2000, 2500)]
+    _base = RB.text_effect_of([{"label": "dialogue-or-caption", "runs": _tw}], 1e6 / 60)
+    _with_ui = RB.text_effect_of([{"label": "dialogue-or-caption", "runs": _tw}, {"label": "misc", "runs": _fade},
+                                  {"label": "noise", "runs": _fade}], 1e6 / 60)
+    _as_main = RB.text_effect_of([{"label": "dialogue-or-caption", "runs": _tw + _fade}], 1e6 / 60)
+    check("文字效果只从正文区域统计：misc / noise 区域里四散的生长不改判定；同样的 run 放进正文区域才会改（对照，守卫本身灵敏）",
+          _base == _with_ui and _base.get("verdict") == "typewriter" and _as_main.get("verdict") != "typewriter",
+          (_base, _with_ui, _as_main))
 
     _bad = TF.ocr_fit([(1_000_000, 3), (1_500_000, 12), (2_000_000, 11)], 24, 2_500_000, 3_000_000, 500_000, 20_000)
     _one = TF.ocr_fit([(1_000_000, 3)], 24, 2_500_000, 3_000_000, 500_000, 20_000)
@@ -832,6 +852,45 @@ def t_edge_refine() -> None:
     check("**从 obs 证据重建后三个时刻落在合成真值上**：首字 30、全字 42、完全显示结束 89、完全消失 90（帧）",
           job["refined"] and abs(run["t_start"] - 30 * us) < 1 and abs(run["t_full"] - 42 * us) < 1
           and abs(run["t_end"] - 90 * us) < 1 and abs(run["t_full_end"] - 89 * us) < 1 and run["t_end_how"] == "curve", run)
+
+    # 末段在动的门（defaults.md 1.65）：同一份证据，run 的采样级终点放在帧 96（晚于真值 90），看终点认不认结尾窗
+    def settle(boxes, starts=True, t_end=96, **job_extra):
+        r = dict(run, t_start=round(30 * us), t_end=round(t_end * us), t_full=None, **({"boxes": boxes} if boxes else {}))
+        r.pop("t_end_how", None), r.pop("t_full_end", None)
+        j = dict(rb.make_job(r, round(6 * us), us), **job_extra)
+        j["measured"] = ER.measured_from_records(on if starts else None, on if starts else None, off, r["t_end"],
+                                                 us, round(6 * us), SG6)
+        rb.apply(j, None, None)
+        return r, j
+    t78, t84 = round(78 * us), round(84 * us)
+    bx = [200, 10, 300, 30]                                                    # 轨迹离屏边远（字高 20 px）
+    mv = lambda k: [bx[0] - k, bx[1], bx[2] - k, bx[3]]                        # 往左飞 k px
+    r_fly, j_fly = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]])                  # 最后一步 20 px = 1 个字高
+    r_slow, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(48)]])                     # 最后一步 8 px = 0.4 个字高
+    r_stop, _ = settle([[round(30 * us), bx], [round(42 * us), mv(40)], [t84, mv(48)]])          # 早停：收尾点隔 7 个间隔、摊下来 0.06
+    r_out, _ = settle([[round(30 * us), bx], [t78, [0, 10, 40, 30]], [t84, [0, 12, 20, 28]]])     # 出屏：左沿贴屏边、右沿走 20 px，框被裁矮
+    r_still, _ = settle(None)
+    r_bare, j_bare = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]], starts=False)
+    r_grow, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, [bx[0] - 40, bx[1], bx[2] + 20, bx[3]]]])   # 只有右沿走 60 px：形变
+    r_late, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]], t_end=84)        # 证据（帧 90）晚于采样级（帧 84）
+    # 收尾点是并集（最后一票在 IoU 门里、并进上一框）：轨迹上只有左沿在长，obs 里最后一次观测的真实框是平移了 20 px 的
+    r_union, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, [bx[0] - 60, bx[1], bx[2] - 40, bx[3]]]], off_box=mv(60))
+    r_right, _ = settle([[round(30 * us), bx], [t78, [150, 10, 195, 30]], [t84, [170, 10, 200, 30]]], frame_size=(200, 100))  # 右沿贴屏边
+    check("**末段在动的 run 终点留采样级**（t_end_how = moving，不填完全显示结束），起点照样回抠到帧 30；出屏的（贴边那条边不动、框被裁矮）也算",
+          r_fly["t_end"] == round(96 * us) and r_fly["t_end_how"] == "moving" and r_fly["t_full_end"] is None
+          and abs(r_fly["t_start"] - 30 * us) < 1 and j_fly["refined"] and j_fly.get("moving_end")
+          and r_out["t_end_how"] == "moving" and r_out["t_end"] == round(96 * us), (r_fly, r_out))
+    check("末段在动的门不碰静止 / 慢移 / 早停 / 只有一条边在动（形变）的 run：终点照旧认证据（帧 90、curve）",
+          all(abs(r["t_end"] - 90 * us) < 1 and r["t_end_how"] == "curve" for r in (r_still, r_slow, r_stop, r_grow)),
+          [(r["t_end"], r.get("t_end_how")) for r in (r_still, r_slow, r_stop, r_grow)])
+    check("末段在动的门只拒收比采样级早的终点：证据晚于采样级的照收（帧 90、curve）",
+          abs(r_late["t_end"] - 90 * us) < 1 and r_late["t_end_how"] == "curve", r_late)
+    check("末段在动的门：收尾点是并集时按 obs 里最后一次观测的真实框判平移；右沿贴屏边（画面尺寸来自产物）只看左沿",
+          r_union["t_end_how"] == "moving" and r_union["t_end"] == round(96 * us)
+          and r_right["t_end_how"] == "moving" and r_right["t_end"] == round(96 * us), (r_union, r_right))
+    check("末段在动、起点也没证据的 run：时刻全不动、不算回抠成功，但 t_end_how 记 moving（数得出来）",
+          r_bare["t_end"] == round(96 * us) and r_bare["t_end_how"] == "moving" and not j_bare["refined"]
+          and j_bare.get("moving_end"), r_bare)
     m_open = ER.measured_from_records(None, None, dict(off, ncc_gone=90, gone=None), run_t_end := round(90 * us), us, round(6 * us), SG6)
     m_ncc = ER.measured_from_records(None, None, dict(off, ncc_gone=89, gone=None), run_t_end, us, round(6 * us), SG6)
     check("**开放边界**（在线证据）：退回判据一路像到链断那个采样点（run 采样级的 t_end）= 窗里没看到消失，记 open、"

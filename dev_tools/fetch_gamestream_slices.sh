@@ -5,8 +5,10 @@
 # 整场那五部下完之后再跑，免得抢带宽。产物写归档目录，不进本项目。
 # 每段下完立刻抽一帧，最后拼成一张 contact sheet——**先摆帧，再决定要不要用**。
 set -uo pipefail
+CODE=$(cd "$(dirname "$0")/.." && pwd)
+source "$CODE/dev_tools/pyenv.sh"   # PY = pyrun.py 挑的解释器（槽里没有 .venv 就用主 checkout 的），PYTHONPATH 钉到 $CODE/src
 # 素材根：FLOWOCR_ARCHIVE，没设就读数据根下的 data/archive-root.txt（一行路径；data/ 只留本地）
-_DATA=$(PYTHONPATH="$(cd "$(dirname "$0")/.." && pwd)/src" python -m flowocr.paths | tr -d '\r')
+_DATA=$("$PY" -m flowocr.paths | tr -d '\r')
 ARCHIVE=${FLOWOCR_ARCHIVE:-$(tr -d '\r' < "$_DATA/data/archive-root.txt" 2>/dev/null)}
 [ -n "$ARCHIVE" ] || { echo "不知道素材在哪：设 FLOWOCR_ARCHIVE，或在数据根的 data/archive-root.txt 里写一行路径" >&2; exit 2; }
 DST="$ARCHIVE/gamestream/slices"

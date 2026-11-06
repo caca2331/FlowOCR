@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-SCHEMA = "flowocr-matched/6"
+SCHEMA = "flowocr-matched/7"
 """`*-matched.json` 的版本。**写它的人必须有个读它的人**（2026-09-15 审计）：
 `/1` → `/2` 升过一次而全仓库没有一处读这个字符串，等于没有版本控制——
 旧产物喂给期待 `overlay` 的代码只会得到 `KeyError`，而不是"这是旧 schema"。
@@ -29,7 +29,11 @@ SCHEMA = "flowocr-matched/6"
 （`gamescript.STATUSES`；之前直接写进 `kind`）。顺序剧本的认领没有 `status`。
 /6（2026-10-07）：显示协议——顶层 `display`、每次认领和每个叠加条目上的 `group` / `fill`、`overlay.fed`（`_check_display` 的说明）。
 /6 之内加的**可选**字段（2026-10-23）：认领和叠加条目的 `jp_rich` / `cn_rich`，带样式的原文模板 / 译文（`flowocr.richtext` 的规范写法，
-和 `jp_tpl or jp` / `cn` 只差标签，不同时才有）。读的一方缺了就是没有样式，所以没升版本。"""
+和 `jp_tpl or jp` / `cn` 只差标签，不同时才有）。读的一方缺了就是没有样式，所以没升版本。
+/7（2026-11-05）：名牌逐块分组——挂在认上的台词上的留在 `name` 组，没挂上的归 `stray_name`（`NAME_GROUPS`）；
+挂上的称号另成一层 `title`（`LAYERS`）。读 /6 的下游会把称号当未知的层、把 `stray_name` 当没声明的组，所以升版本。
+/7 之内加的**可选**字段（2026-11-05）：名牌条目的 `ink`（判过字色：和这款游戏的名牌色对不对得上，`analyze.nameink`）、
+`overlay.name_ink`（判过时各层的名牌色 `#rrggbb`）。读的一方缺了就是没判、照白字画，所以没升版本。"""
 
 TEXT_KEYS = ("jp", "jp_tpl", "cn", "jp_rich", "cn_rich")
 """剧本行带进认领和叠加条目的文本字段（`text_of`）。"""
@@ -72,16 +76,18 @@ REQUIRED = ("schema", "provenance", "stats", "cues", "display")
 """每份 matched.json 都要有的顶层键。`overlay` 不在里头——`--no-overlay` 和非 tracks 输入都没有它，
 要用它的调用方自己检查（`load(..., need_overlay=True)`）。"""
 
-LAYERS = ("body", "extra", "name", "choice", "offmain", "panel")
+LAYERS = ("body", "extra", "name", "title", "choice", "offmain", "panel")
 """`overlay.items` 的层（owner 2026-09-14，product-goals 第 16 条）：判定（`scriptmatch.overlay_items`）写进 JSON。
 层只管**怎么画**（盖在正文行上、独立的块、名牌、阅读面板）；画不画看条目的组（显示协议，`visible`）。属于产物契约，所以放这里——判断和投影两边都读它。
 
 * `body`：主认领那条剧本行，盖在 cue 的正文行上（`body_of`）；
 * `extra`：同一条 cue 装着的第二条剧本行，盖在**它自己的**那几行上——不并进正文、不拆 cue；
 * `name`：名牌（`game_align.head_lines` 认出的开头行），译文先取剧本说话人的中文名（`speaker_names`），
-  查不到再按字形查文本包的短名词表（`term_names`），再查不到、和本段已译出的名牌只差一个字的借它的译文（`fuzzy_names`）；
-  条目的 `name_src` 记是哪一种（`speakers` / `terms` / `fuzzy` / 空）；`overlay.stats.name_translated` 三种来源都算，`name_from_terms` / `name_from_fuzzy` 单列；
-  一个事件一块，在动的事件按位置切成几块（`event_segments`）；
+  查不到再按字形查文本包的短名词表（`term_names`），再查不到的按名牌下面那几条记录的说话人投票、或借本段已译出且只差一个字的名牌（`fuzzy_names`）；
+  条目的 `name_src` 记是哪一种（`speakers` / `terms` / `voted` / `fuzzy` / 空）；`overlay.stats.name_translated` 四种来源都算，`name_from_terms` / `name_from_voted` / `name_from_fuzzy` 单列；
+  一个事件一块，在动的事件按位置切成几块（`event_segments`）；挂在认上的台词上的归 `name` 组，没挂上的归 `stray_name`（`scriptmatch.name_roles`）；
+* `title`：名牌下面（或上面）字小一号的称号（原神的「傭兵」），和 `name` 同一种条目、同样来源，只是字幕稿里另用 `Title` 样式；
+  只在挂上的名牌里分（`scriptmatch.name_roles`），没挂上的都留在 `name` 层；
 * `choice`：主轨外的选项按钮（`choice_items` 里选项类的剧本行，`scriptmatch.choice_like`）；
 * `offmain`：主轨外、逐字等于剧本行的其余文字（台词落到了别的区域、`Loose` 散条目…，`choice_layer`）；
 * `panel`：阅读面板长文本（`readable_items`，选开，要文本包有 `readables` 表，`--readables` + `--obs`）。"""
@@ -119,6 +125,12 @@ RESERVED = ("unmatched", "unfed")
 """每个匹配器都要声明的保留组，内容**由定义推出、不写进产物**（`fed_rest`）：
 * `unmatched`：喂给了匹配器、但没画成译文的文字——`cues[]` 里是 `ref` 为空的记录；叠加里是 `overlay.fed` 的事件中没被任何叠加条目引用的；
 * `unfed`：没喂给匹配器的文字——叠加里是 tracks 中不在 `overlay.fed`、也没被任何叠加条目引用的事件；`cues[]` 里没有这一组。"""
+STRAY_NAME = "stray_name"
+"""没挂在认上的台词上的名牌块归的组（`scriptmatch.name_roles`），默认不画。"""
+NAME_GROUPS = {
+    "name": {"tier": "on", "label": "名牌（挂在认上的台词上，含称号）"},
+    STRAY_NAME: {"tier": "off", "label": "没挂在认上的台词上的名牌样文字（对话记录面板、队伍栏、头顶名字…）"}}
+"""名牌层的两个组（owner 2026-11-05），两个内置匹配器（`gametext`、`naninovel`）的显示声明都带。"""
 KEYWORDS = ("all", "fill")
 """`show` / `hide` 的关键字，不能当组名：`all` 是全部组加填位，`fill` 是填位。"""
 

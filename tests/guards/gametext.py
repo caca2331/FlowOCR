@@ -493,6 +493,7 @@ def t_gametext() -> None:
     from flowocr.analyze import game_align as GA
     import gametext_report as GR
     from flowocr.analyze import script_align as SA
+    from flowocr.artifacts import tracksio
 
     check("原神语音字幕：Normal（字幕带，摆帧过）进分母，Banner 这类不进",
           "Reminder" not in GS.NON_BAND_KINDS and "ReminderUI" in GS.NON_BAND_KINDS)
@@ -913,6 +914,98 @@ def t_gametext() -> None:
     check("读到一大段不认：cue 不在主轨上；同样的字在屏超过 INFIX_MAX_SPAN（30 s）；读法不到 INFIX_MIN 个内容字或占不到一半",
           st_off["sub_hit"] == [-1] and st_hang["sub_hit"] == [-1] and st_short2["sub_hit"] == [-1],
           (st_off["sub_hit"], st_hang["sub_hit"], st_short2["sub_hit"]))
+    # 夹缝认领（shortline-context 计划，owner 2026-10-24）：短句夹在同一单元相邻两行的认领之间，读法是它的一截就认（gi2 `ナヴィア / でも`）
+    from flowocr.artifacts import srtio
+    UP, DOWN = "旅人、こっちだよ。早く来て！", "そろそろ出発しようか、みんな待ってる。"
+
+    def flank(texts, subs, status=None, wins=None, rows=None, variant_of=None, step=0.0):
+        scr = [SA.Entry(key=f"k{i}", kind="Talk", cmd="", text=t, src="u", status=(status or {}).get(i))
+               for i, t in enumerate(texts)]
+        st = GA.run(scr, wins or [[[0.0, 100.0]]] * len(texts), subs, 0.75,
+                    rows=rows or {f"k{i}": ("u", i) for i in range(len(texts))}, variant_of=variant_of or {}, step=step)
+        return st, scr
+    fl_a, fl_b = (10.0, f"ナヴィア\n{UP}", "x"), (14.0, f"ナヴィア\n{DOWN}", "x")
+    fl_x = (12.0, "ナヴィア\nでも", "x")
+    st_fl, scr_fl = flank([UP, "でも…", DOWN], [fl_a, fl_x, fl_b])
+    cref = GA.Ref(doc={"units": [{"uid": "u", "lines": [{"key": e.key, "cn": e.text} for e in scr_fl]}]}, script=scr_fl,
+                  windows=[[[0.0, 100.0]]] * 3, role={}, variant_of={}, rows={f"k{i}": ("u", i) for i in range(3)})
+    crecs, _ = SM.match(cref, [srtio.Cue(t, t + 1.5, tuple(raw.split("\n"))) for t, raw, _ in (fl_a, fl_x, fl_b)], 0.75)
+    cst = SM.match_stats(cref, crecs)
+    check("夹缝认领：上一行 10 s、下一行 14 s 都认了，12 s 的 `ナヴィア / でも` 认中间那行 `でも…`（相似度够不着 --fuzzy），记 context、不进可疑改写",
+          st_fl["sub_hit"] == [0, 1, 2] and st_fl["context"] == 1 and st_fl["context_subs"] == [1]
+          and crecs[1]["how"] == "context" and crecs[1]["ref"]["score"] < SM.SUSPECT and len(cst["scores"]) == 2,
+          (st_fl["sub_hit"], st_fl.get("context_subs"), [r["how"] for r in crecs], cst["scores"]))
+    st_btn, _ = flank(["上の行のせりふです、よろしくね", "そう…", "下の選択肢を選んでください"],
+                      [(10.0, "上の行のせりふです、よろしくね", "x"), (20.0, "下の選択肢を選んでください", "x"), (20.0, "そう", "x")])
+    check("夹缝认领：同刻算两边（同屏的选项按钮和下一行一起上屏，zzz `そう…`）",
+          st_btn["sub_hit"] == [0, 2, 1] and st_btn["context"] == 1, st_btn["sub_hit"])
+    btn = ["上の行のせりふです、よろしくね", "そう…", "下の選択肢を選んでください"]
+
+    def btn_at(t_next, step):
+        return flank(btn, [(10.0, btn[0], "x"), (t_next, btn[2], "x"), (20.0, "そう", "x")], step=step)[0]["sub_hit"]
+    early, far, nostep = btn_at(20.0 - 1 / 60, 0.5), btn_at(19.0, 0.5), btn_at(20.0 - 1 / 60, 0.0)
+    check("夹缝认领：同刻容不到一个采样间隔——回抠后下一行的按钮比 X 早 1 帧也算夹住；差两个采样间隔不算；不给采样间隔时照原来的比法（早 1 帧不算）",
+          early == [0, 2, 1] and far == [0, 2, -1] and nostep == [0, 2, -1], (early, far, nostep))
+    st_rev, _ = flank(btn + ["まったく別のせりふです"],
+                      [(19.8, btn[2], "x"), (20.0, "そう", "x"), (20.1, "まったく別のせりふです", "x"), (20.2, btn[0], "x")], step=0.5)
+    check("夹缝认领：容差下两端倒序（下一行 19.8 s、上一行 20.2 s 都在 20.0 s 的一个间隔内）时，两端之间单元里认了别的行（20.1 s）照样不认",
+          st_rev["sub_hit"][1] == -1, st_rev["sub_hit"])
+    import claim_audit as CA
+    fl_audit = CA.audit(cref, [fl_a, fl_x, fl_b], [11.5, 13.5, 15.5], None, 0.5)[3]
+    check("`claim_audit.audit` 跟得上 `claim_flanked` 的参数（剧本有行序时不报错），列出夹缝认领",
+          [(si, e.key) for si, e in fl_audit] == [(1, "k1")], fl_audit)
+    lc = GS.cnorm("ロマンチックだね…")
+    check("夹缝认领·文字票：≥ 3 字的行读错一个字形、丢一个字、多一个杂字、只读到前一半多一点都认",
+          all(GA.flank_fits(GS.cnorm(r), lc) for r in ("口マンチックだね", "ロマンチクだね", "ロマンチIックだね", "ロマンチッ")),
+          [GA.flank_fits(GS.cnorm(r), lc) for r in ("口マンチックだね", "ロマンチクだね", "ロマンチIックだね", "ロマンチッ")])
+    st_gl, _ = flank([UP, "ロマンだね…", DOWN], [fl_a, (12.0, "ナヴィア\n口マンだね", "x"), fl_b])
+    check("夹缝认领：读错一个字形的 3–5 字的行（相似度、整行包含都够不着门），夹住了就认",
+          st_gl["sub_hit"] == [0, 1, 2] and st_gl["contain"] == 0 and st_gl["context"] == 1, st_gl["sub_hit"])
+    check("夹缝认领·文字票不认：2 字的行读错一个字（`でｔ`）；3 字读法配 2 字的行（`探そう` 对 `そう…`）；"
+          "2 字读法错一处配 3 字的行（`イパ` 对 `キュイ——`）；读法不到这一行一半",
+          not any(GA.flank_fits(GS.cnorm(r), GS.cnorm(c)) for r, c in
+                  (("でｔ", "でも…"), ("探そう", "そう…"), ("イパ", "キュイ——"), ("ナヴィアのや", "ナヴィアのやつは遺跡で足を踏み外して"))))
+    fl_cases = {
+        "中间那行已被认": flank([UP, "でも…", DOWN], [fl_a, (11.0, "でも…", "x"), fl_x, fl_b]),
+        "只一边认了": flank([UP, "でも…", DOWN], [fl_a, fl_x]),
+        "上一行的认领在 X 之后": flank([UP, "でも…", DOWN], [fl_x, (13.0, UP, "x"), fl_b]),
+        "两次认领之间单元里认了别的行": flank([UP, "でも…", DOWN, "まったく別のせりふです"],
+                                     [fl_a, (11.0, "まったく別のせりふです", "x"), fl_x, fl_b]),
+        "2 字的行读错一个字": flank([UP, "でも…", DOWN], [fl_a, (12.0, "ナヴィア\nでｔ", "x"), fl_b]),
+        "中间那行不在带内": flank([UP, "でも…", DOWN], [fl_a, fl_x, fl_b], status={1: "OutOfSpan"}),
+        "X 不在那行的可认领时段里": flank([UP, "でも…", DOWN], [fl_a, fl_x, fl_b],
+                                    wins=[[[0.0, 100.0]], [[50.0, 100.0]], [[0.0, 100.0]]]),
+        "X 同时对上两个单元的夹缝": flank([UP, "でも…", DOWN, UP + "ね", "でも…", DOWN + "ね"],
+                                    [fl_a, (10.0, UP + "ね", "x"), fl_x, fl_b, (14.0, DOWN + "ね", "x")],
+                                    rows={"k0": ("u", 0), "k1": ("u", 1), "k2": ("u", 2), "k3": ("w", 0), "k4": ("w", 1), "k5": ("w", 2)}),
+        "变体组的另一种说法已被认": flank([UP, "でも…", DOWN, "でもね…"], [(11.0, "でもね…", "x"), fl_a, fl_x, fl_b],
+                                    status={3: "Variant"}, variant_of={"k3": "k1"},
+                                    rows={"k0": ("u", 0), "k1": ("u", 1), "k2": ("u", 2), "k3": ("v", 0)}),
+        # 10-24 的两个反例：zzz 地图标记 `ラミル`（`ラミル…？` 已被真按钮那条 cue 认上，上一行全场没人认）、
+        # hsr 记录面板说话人栏 `姫子`（`姫子……？` 上下两行都没人认，单元里被认的是隔着几行的别的行）
+        "地图标记 ラミル": flank(["ここから先は危ないぞ", "ラミル…？", "行ってみようか、気をつけて"],
+                             [(11297.0, "ラミル", "x"), (11311.5, "ラミル…？", "x"), (11313.0, "行ってみようか、気をつけて", "x")],
+                             wins=[[[11000.0, 11400.0]]] * 3),
+        "记录面板 姫子": flank(["列車に戻りましょう、皆さん", "準備はできてるわ", "それでいいのかしら", "姫子……？", "ええ、行くわよ"],
+                           [(1380.0, "列車に戻りましょう、皆さん", "x"), (1388.0, "姫子", "x"), (1390.0, "準備はできてるわ", "x")],
+                           wins=[[[1300.0, 1500.0]]] * 5),
+    }
+    # 每个反例里 X 都没被前四遍认走、上下行至少一边认上了，"不认"才是夹缝这一遍挡的（ラミル 那条 X 是 11297 s 那条）
+    check("夹缝认领不认：" + "；".join(fl_cases),
+          all(st["context"] == 0 and -1 in st["sub_hit"] and any(h >= 0 for h in st["sub_hit"]) for st, _ in fl_cases.values())
+          and fl_cases["地图标记 ラミル"][0]["sub_hit"] == [-1, 1, 2] and fl_cases["记录面板 姫子"][0]["sub_hit"] == [0, -1, 1],
+          {k: (st["sub_hit"], st["sub_extra"]) for k, (st, _) in fl_cases.items()})
+    np_subs = [(40.0 * k, f"ナヴィア\n{b}", "x") for k, b in enumerate(["今日はいい天気だね", "早く行こうよ", "それは本当なの？"], 1)]
+    st_np, _ = flank([UP, "ナヴィア…？", DOWN], [fl_a, (12.0, "ナヴィア", "x"), fl_b] + np_subs)
+    check("夹缝认领不认：只剩名牌的 cue（开头行先剥掉，没有读法）——名牌 `ナヴィア` 不认喊名字的台词 `ナヴィア…？`",
+          st_np["context"] == 0 and st_np["sub_hit"][1] == -1, st_np["sub_hit"])
+    st_twice, _ = flank([UP, "でも…", DOWN], [fl_a, fl_x, (12.5, "ナヴィア\nでも", "x"), fl_b])
+    check("夹缝认领一行只认一次：两条 X 都满足时认最早那条，重复认领不涨",
+          st_twice["sub_hit"] == [0, 1, -1, 2] and GA.repeat_claims(st_twice["sub_hit"]) == (0, 0), st_twice["sub_hit"])
+    st_norows = GA.run([SA.Entry(key=f"k{i}", kind="Talk", cmd="", text=t, src="u") for i, t in enumerate([UP, "でも…", DOWN])],
+                       [[[0.0, 100.0]]] * 3, [fl_a, fl_x, fl_b], 0.75)
+    check("夹缝认领：不给 rows（老调用）时这一遍不跑", st_norows["sub_hit"] == [0, -1, 2] and st_norows["context"] == 0,
+          st_norows["sub_hit"])
     check("开头行：本身逐字是一整条台词的不算（带外的剧本行不挡：名牌 / UI 标签照旧是开头行）",
           GA.head_lines(echo) == frozenset({SA.norm(line)})
           and GA.head_lines(echo, GA.band_lines(band_scr)) == frozenset()
@@ -1226,9 +1319,9 @@ def t_gametext() -> None:
           len(nm) == 1 and nm[0]["jp"] is None and nm[0]["cn"] is None and nm[0]["ocr"] == "カチーナ"
           and items_l[2]["jp"] == "カチーナ", nm)
     check("名牌挂在正文上：正文紧贴在名牌下方、左右对得上才算；并排一行的角色列表 / 离得远的键位不算",
-          SM.name_over_body(evs_l[0], evs_l[1])
-          and not SM.name_over_body(evs_l[0], {"box": [1500, 850, 1700, 880]})
-          and not SM.name_over_body(evs_l[0], {"box": [1100, 800, 1300, 840]}))
+          tracksio.name_over_body(evs_l[0]["box"], evs_l[1]["box"])
+          and not tracksio.name_over_body(evs_l[0]["box"], [1500, 850, 1700, 880])
+          and not tracksio.name_over_body(evs_l[0]["box"], [1100, 800, 1300, 840]))
     check("主轨外逐字等于剧本行的块按剧本行分层：选项类（类型 Choice、或处境 OffBand）进 choice，其余进 offmain；"
           "有别的处境的选项（重演拷贝）不算选项类",
           [SM.choice_layer(SM.choice_like(k, st)) for k, st in
@@ -1563,6 +1656,7 @@ def t_nameplate_terms() -> None:
     """名牌的短名词表（2026-09-26，followups「名牌上的人名没有译名」）：说话人表查不到的名牌查 terms。"""
     print("\n## 名牌的短名词表")
     from types import SimpleNamespace as _NS
+    from flowocr import textfold
     from flowocr.analyze import game_align as GA
     from flowocr.analyze import gamescript as GS
     from flowocr.analyze import script_align as SA
@@ -1629,12 +1723,169 @@ def t_nameplate_terms() -> None:
     nfix = SM.fuzzy_names(fz, sh)
     got = [(it["ocr"], it["cn"], it["name_src"]) for it in fz[4:]]
     check("名牌容错查：差一个字（换 / 漏）、唯一邻居的借译文、记 name_src=fuzzy、jp 取被借的名牌；单字名、两个邻居、不挂在台词上的都不借",
-          nfix == 2 and got == [("カチーノ", "卡齐娜", "fuzzy"), ("カチーノ", "卡齐娜", "fuzzy"), ("冷", None, None),
-                                ("アキロ", None, None), ("カチーラ", None, None), ("チーナ", "卡齐娜", "fuzzy")]
+          nfix == {"voted": 0, "fuzzy": 2} and got == [("カチーノ", "卡齐娜", "fuzzy"), ("カチーノ", "卡齐娜", "fuzzy"), ("冷", None, None),
+                                                      ("アキロ", None, None), ("カチーラ", None, None), ("チーナ", "卡齐娜", "fuzzy")]
           and fz[4]["jp"] == "カチーナ", (nfix, got))
+    # 名牌投票（owner 2026-10-24）：逐字查不到的读数，按它挂着的那几条记录的说话人投票；读数要能是那人名字的一截，≤2 字的只许少读、不许读错
+    HIRO, EMA = ("二階堂ヒロ", "二阶堂希罗"), ("桜羽エマ", "樱羽艾玛")
+    def tally(*who):
+        return {ri: w for ri, w in enumerate(who)}
+    vt = [nit("階堂ヒロ", ev=20), nit("階堂ヒ口", ev=21), nit("ヒロ", ev=22), nit("ヒカ", ev=23), nit("桜羽工マ", ev=24),
+          nit("階堂巳口", ev=25), nit("ええ。", ev=26), nit("羽工マ", ev=27)]
+    vv = {SA.norm("階堂ヒロ"): tally(HIRO, HIRO, HIRO), SA.norm("階堂ヒ口"): tally(HIRO, HIRO, HIRO, EMA),
+          SA.norm("ヒロ"): tally(HIRO, HIRO, HIRO), SA.norm("ヒカ"): tally(*[HIRO] * 5),
+          SA.norm("桜羽工マ"): tally(EMA, EMA), SA.norm("階堂巳口"): tally(HIRO, HIRO, HIRO),
+          SA.norm("ええ。"): tally(EMA, EMA, EMA, EMA), SA.norm("羽工マ"): tally(EMA, EMA, EMA, HIRO, HIRO)}
+    nv = SM.fuzzy_names(vt, {}, vv)
+    got = [(it["ocr"], it["cn"], it["name_src"]) for it in vt]
+    check("名牌投票：少读一截、少读又错一个字形的、2 字少读的按说话人认上（name_src=voted，jp 取说话人的名字）；"
+          "2 字读错一个（短名字错配）、只有 2 票、错两处、字面不是名字、票数占比不到 2/3 的都不认",
+          nv == {"voted": 3, "fuzzy": 0}
+          and got == [("階堂ヒロ", "二阶堂希罗", "voted"), ("階堂ヒ口", "二阶堂希罗", "voted"), ("ヒロ", "二阶堂希罗", "voted"),
+                      ("ヒカ", None, None), ("桜羽工マ", None, None), ("階堂巳口", None, None), ("ええ。", None, None), ("羽工マ", None, None)]
+          and vt[0]["jp"] == "二階堂ヒロ", (nv, got))
+    veto = [nit("カチーナ", "卡齐娜", "speakers", 1), nit("カチーノ", ev=10), nit("カチーラ", ev=11)]
+    SM.fuzzy_names(veto, {SA.norm("カチーノ"): 1.0, SA.norm("カチーラ"): 1.0},
+                   {SA.norm("カチーノ"): tally(HIRO, HIRO, HIRO), SA.norm("カチーラ"): tally(("カチーナ", "卡齐娜"), HIRO)})
+    check("名牌投票：证据充分地指向另一个人时，不再借本段已译出的名牌（`カチーノ` 下面三句都是ヒロ说的）；票不够时照借",
+          [(it["cn"], it["name_src"]) for it in veto[1:]] == [(None, None), ("卡齐娜", "fuzzy")], veto)
+    check("名牌投票·字面：读数是名字的一截（两头没读到的不算差），差的处数按编辑距离算",
+          textfold.fits_within("階堂ヒロ", "二階堂ヒロ", 0) and textfold.fits_within("ケ崎", "城ヶ崎ノア", 0) and textfold.fits_within("階堂ヒ口", "二階堂ヒロ", 1)
+          and not textfold.fits_within("階堂ヒ口", "二階堂ヒロ", 0) and not textfold.fits_within("階堂巳口", "二階堂ヒロ", 1)
+          and not textfold.fits_within("。", "二階堂ヒロ", 1))
     old = GA.Ref(doc={"units": [], "speakers": {}}, script=[], windows=[], role={}, variant_of={})
     check("短名词·旧剧本（没有 terms）照读：表为空、名牌层不出译文",
           SM.term_names(old) == {} and all(it["cn"] is None for it in SM.overlay_items([], doc, evs_of, cues, ref=old)[0]))
+
+
+def t_name_roles() -> None:
+    """名牌逐块分组（owner 2026-11-05）：在屏时正下方有认上的台词的留在 `name`，没有的归 `stray_name`（默认不画）；
+    挂上的名牌里字小一号、叠在名字下面的是称号（层 `title`），称号挂上时名字也算挂上。"""
+    print("\n## 名牌逐块分组")
+    from flowocr.analyze import scriptmatch as SM
+    from flowocr.analyze.matchers import naninovel as NN
+    from flowocr.artifacts import matchedio as MI
+    from flowocr.artifacts import tracksio
+    from flowocr.output import script as SC
+    S = 1_000_000
+
+    def nm(box, a, b, ev):
+        return {"layer": "name", "group": "name", "fill": False, "start_us": a * S, "end_us": b * S, "rows": [box],
+                "events": [ev], "jp": "x", "cn": "x", "name_src": "speakers", "ocr": "x"}
+
+    def line(a, b, top=850, layer="body", group="dialogue", echo=None):
+        return {"layer": layer, "group": group, "start_us": a * S, "end_us": b * S, "rows": [[500, top, 1400, top + 30]], "echo": echo}
+    name, title = [890, 757, 1028, 792], [930, 793, 1024, 823]      # 名字框高 35、称号 30
+    names = [nm([900, 800, 1000, 840], 0, 5, 0), nm([900, 800, 1000, 840], 10, 15, 1), nm([900, 800, 1000, 840], 20, 25, 2),
+             nm([900, 800, 1000, 840], 50, 55, 3), nm([900, 800, 1000, 840], 60, 65, 4),
+             nm(name, 30, 35, 5), nm(title, 30, 35, 6), nm(name, 40, 45, 7), nm(title, 40, 45, 8),
+             {**nm(name, 70, 75, 9), "cn": None}, nm(title, 70, 75, 10),
+             nm(name, 80, 85, 11), nm([930, 722, 1024, 752], 80, 85, 12)]      # 称号在名字上面
+    lines = [line(3, 8), line(20, 25, echo="log"), line(50, 55, layer="extra"), line(60, 65, group="offband"),
+             line(30, 35, top=905), line(70, 75), line(80, 85, top=870)]
+    # 30 s 那对称号在下：称号下沿到台词 82 ≤ 3×30、名字 113 > 3×35；80 s 那对称号在上：名字 78 ≤ 3×35、称号 118 > 3×30——都只有一块直接挂上
+    assert not tracksio.name_over_body(name, lines[4]["rows"][0]) and tracksio.name_over_body(title, lines[4]["rows"][0])
+    assert tracksio.name_over_body(name, lines[6]["rows"][0]) and not tracksio.name_over_body([930, 722, 1024, 752], lines[6]["rows"][0])
+    n = SM.name_roles(names, lines)
+    got = [(it["group"], it["layer"]) for it in names]
+    check("名牌分组：在屏时正下方有认上的台词（正文 / extra、组 dialogue）的留在 name；没有台词、台词是对话记录里的旧行（echo=log）、"
+          "台词在带外（offband）的归 stray_name",
+          got[:5] == [("name", "name"), ("stray_name", "name"), ("stray_name", "name"), ("name", "name"), ("stray_name", "name")], got)
+    check("称号：挂上的名牌里叠在有译文的名字下面（或上面）、字小一号的层改成 title；一对里一块挂上、离台词远的那块也算挂上"
+          "（称号在下时是名字，在上时是称号）；没挂上的一对都留在 name 层；上面那块没有译文（绝区零的招牌「QICAI JIE」）时不算称号",
+          got[5:] == [("name", "name"), ("name", "title"), ("stray_name", "name"), ("stray_name", "name"), ("name", "name"), ("name", "name"),
+                      ("name", "name"), ("name", "title")]
+          and n == {"name": 6, "title": 2, "stray_name": 5}, (got[5:], n))
+    tie = tracksio.stack_partners([(0, 10, name), (0, 10, title), (0, 10, name), (0, 10, [890, 757, 1028, 789]), None])
+    check("称号认名字：重叠一样久取下标小的；字号相同的两行不互认；不参加的是 None", tie == [None, 0, None, None, None], tie)
+    check("显示声明：两个内置匹配器都声明 name（默认画）和 stray_name（默认不画）",
+          all(D["groups"]["name"]["tier"] == "on" and D["groups"][MI.STRAY_NAME]["tier"] == "off" for D in (SM.DISPLAY, NN.DISPLAY)))
+    check("字幕稿：称号层投成 title 条目、样式 Title，名字是 Name；阶段 4 把 Title 当名牌排",
+          SC.style_of(SC.Item(0, 1, [title], ["佣兵"], "title")) == "Title" and "Title" in SC.STYLES
+          and SC.style_of(SC.Item(0, 1, [name], ["施拉姆"], "name")) == "Name")
+    body = SC.Item(0, 5 * S, [[500, 850, 1400, 880]], ["台詞"], "line")
+    tr = SC.mark_names([SC.Item(0, 5 * S, [name], ["シュラム"], "name"), SC.Item(0, 5 * S, [title], ["傭兵"], "name"),
+                         SC.Item(0, 5 * S, [title], ["傭兵"], "name", ui=True), body,
+                         SC.Item(10 * S, 15 * S, [name], ["冒険ランク"], "name"), SC.Item(10 * S, 15 * S, [title], ["45"], "name"),
+                         SC.Item(20 * S, 25 * S, [name], ["シュラム"], "name"), SC.Item(20 * S, 25 * S, [title], ["傭兵"], "name"),
+                         SC.Item(20 * S, 25 * S, [[500, 850, 1400, 880]], ["台詞"], "line", main=False)])
+    check("tracks 的名牌分档：正下方同时有主轨句子的留 name、叠在它下面字小一号的改 title；下面没有句子、句子不在主轨上的改 stray_name"
+          "（样式 StrayName）；UI、正文不动",
+          [it.kind for it in tr] == ["name", "title", "name", "line", "stray_name", "stray_name", "stray_name", "stray_name", "line"]
+          and SC.style_of(tr[4]) == "StrayName", [it.kind for it in tr])
+    gap = [SC.Item(0, 5 * S, [[910, 788, 1004, 818]], ["リン"], "name"), SC.Item(0, 5 * S, [[560, 883, 1340, 917]], ["台詞"], "line")]
+    check("绝区零：名牌下沿到台词上沿 65 px、名牌字高 30（2.2 个字高）也算挂上（`NAME_GAP`），隔 95 px（3.2 个字高）的不算",
+          SC.mark_names(gap)[0].kind == "name" and not tracksio.name_over_body([910, 788, 1004, 818], [560, 913, 1340, 947]))
+    # 绝区零：台词左对齐、名牌居中，首行短时首行够不到名牌下面，按整块的左右比（`block_head`）
+    zname, zrows = [471, 402, 507, 417], [[304, 455, 469, 470], [303, 472, 672, 491]]
+    zn = [nm(zname, 0, 5, 0)]
+    SM.name_roles(zn, [{"layer": "body", "group": "dialogue", "start_us": 0, "end_us": 5 * S, "rows": zrows, "echo": None}])
+    zt = SC.mark_names([SC.Item(0, 5 * S, [zname], ["ラミル"], "name"), SC.Item(0, 5 * S, zrows, ["こんばんは、リンちゃん。", "x"], "line")])
+    check("首行短的台词：名牌按整块台词的左右比（首行够不到名牌正下方也算挂上），匹配器和 tracks 两条路一样",
+          not tracksio.name_over_body(zname, zrows[0]) and tracksio.name_over_body(zname, tracksio.block_head(zrows))
+          and zn[0]["group"] == "name" and zt[0].kind == "name", (zn[0]["group"], zt[0].kind))
+    # 匹配器认开头行时（同一条 cue 的事件还没成块）：从这一行往下连着的几行凑成台词块，同屏右下角的按钮不算进左右
+    button = [1400, 470, 1600, 500]
+    cue_rows = [zrows[0], button, zrows[1]]
+    far = [1500, 402, 1560, 417]
+    check("凑台词块（`rows_below`）：首行短、下一行长连成一块，名牌照样挂上；同一条 cue 里右下角的按钮不连进来、不把左右撑到它下面的空处",
+          tracksio.rows_below(cue_rows, zrows[0]) == zrows
+          and tracksio.name_over_body(zname, tracksio.block_head(tracksio.rows_below(cue_rows, zrows[0]), zrows[0]))
+          and tracksio.name_over_body(far, tracksio.block_head(cue_rows, zrows[0]))
+          and not any(tracksio.name_over_body(far, tracksio.block_head(tracksio.rows_below(cue_rows, b), b)) for b in cue_rows),
+          tracksio.rows_below(cue_rows, zrows[0]))
+    split = [470, 456, 520, 471]                 # 首行被 OCR 切成两个框，后一个框比前一个低 1 px
+    check("凑台词块：同一行被切开的后一个框不算成下一行（上沿没低过已收那几行下沿的一半字高），下一行照样连上",
+          tracksio.rows_below([zrows[0], split, zrows[1]], zrows[0]) == zrows, tracksio.rows_below([zrows[0], split, zrows[1]], zrows[0]))
+    # 连串只看和串里最晚终点的间隔：一路每段都不超过 NAME_INERTIA_US 就一直接下去，重叠的也接上
+    g = tracksio.NAME_INERTIA_US // S
+    box = [930, 790, 1024, 820]
+    chain = [(a * S, b * S, box, "k") for a, b in ((0, 5), (5 + 0.75 * g, 6 + 0.75 * g), (6 + 1.5 * g, 7 + 1.5 * g),
+                                                     (3, 6), (7 + 2.75 * g, 8 + 2.75 * g))]
+    check("时间惯性连串：每段断开都不超过 NAME_INERTIA_US 的一路接下去（离第一块已经远过上限也接）、时间重叠的接上；断开超过的另起一串",
+          tracksio.plate_runs(chain) == [0, 0, 0, 0, 4], tracksio.plate_runs(chain))
+    # 时间惯性：同一块名牌（同名、同一处）断开不超过 NAME_INERTIA_US 的连成一串，一串里有一块挂上整串都算
+    run = [nm(name, 0, 5, 0), nm(name, 5 + g, 6 + g, 1), nm([890, 600, 1028, 635], 6, 7, 2),
+           {**nm(name, 8 + 2 * g, 9 + 2 * g, 3)}, {**nm(name, 5.5, 6.5, 4), "cn": "y"}]
+    SM.name_roles(run, [line(0, 5)])
+    check("时间惯性：同名、同一处、断开不超过 NAME_INERTIA_US 的名牌块跟着挂上的那块算挂上；换了位置、断开更久、名字不同的不算",
+          [it["group"] for it in run] == ["name", "name", "stray_name", "stray_name", "stray_name"], [it["group"] for it in run])
+    from flowocr.artifacts.matchedio import Visible as _Vis
+    tdoc = {"events": [{"id": 0, "region": 0, "box": name, "text": "x", "t_start": 0, "t_end": S}], "provenance": {}}
+    proj = SC.project_items([{**nm(name, 0, 1, 0), "group": MI.STRAY_NAME}, nm(name, 0, 1, 0)], tdoc, "cn",
+                            _Vis(frozenset({"name", MI.STRAY_NAME}), True))
+    check("匹配产物打开 stray_name 组时，这一组的名牌用 StrayName 样式，挂上的照旧是 Name",
+          [SC.style_of(it) for it in proj] == ["StrayName", "Name"], [SC.style_of(it) for it in proj])
+    # 退回画 OCR 原文的名牌（没译出、`unmatched` 可见）：事件 1 挂上、2 没挂上、4 是称号、3 不在名牌层；
+    # 5 / 6 是没带建轨 `nameplate` 标的名牌（挂上 / 没挂上），7 是不在名牌层、没带标的杂字；8 是挂上、有译文的名牌（照画译文）
+    pl = ["nameplate"]
+    oevs = [{"id": i, "region": 0, "box": bx, "t_start": t * S, "t_end": (t + 5) * S, "text": tx, "flags": fl, "conf": 0.9, "n_obs": 10}
+            for i, bx, t, tx, fl in ((0, [500, 850, 1400, 880], 0, "せりふ", []), (1, name, 0, "アンピー", pl), (2, name, 10, "ボタン", pl),
+                                     (3, name, 20, "ミニ", pl), (4, title, 0, "傭兵", pl),
+                                     (5, name, 30, "リン", []), (6, name, 40, "#1", []), (7, name, 60, "ざつおん", []), (8, name, 70, "アキラ", pl))]
+    odoc = {"schema": tracksio.SCHEMA, "tag": "t", "meta": {"src_fps": 30.0}, "frame_us": 500_000, "size": [1920, 1080],
+            "provenance": {"main_track": "r00"}, "events": oevs, "regions": [{"index": 0, "align": "center", "align_how": {"by": "none"}}],
+            "tracks": [{"id": "r00", "kind": "region", "region": 0, "srt": "t-r00.srt", "ui_lines": [],
+                        "cues": [{"id": f"c{e['id']}", "t_start": e["t_start"], "t_end": e["t_end"], "events": [e["id"]]} for e in oevs]}]}
+    ref = {"key": "k0", "jp": "台詞", "cn": "台词", "group": "dialogue", "fill": False}
+    blank = {"jp": None, "cn": None, "name_src": None}
+    oitems = [{"layer": "body", "start_us": 0, "end_us": 5 * S, "rows": [oevs[0]["box"]], "events": [0], **ref, "claim": [0, -1],
+               "echo": None, "echo_of": None},
+              {**nm(name, 0, 5, 1), **blank}, {**nm(name, 10, 15, 2), **blank, "group": MI.STRAY_NAME},
+              {**nm(title, 0, 5, 4), **blank, "layer": "title"}, {**nm(name, 30, 35, 5), **blank},
+              {**nm(name, 40, 45, 6), **blank, "group": MI.STRAY_NAME}, nm(name, 70, 75, 8)]
+    with tempfile.TemporaryDirectory() as td:
+        tp = Path(td) / "t-tracks.json"
+        tracksio.dump(tp, odoc)
+        om = {"schema": MI.SCHEMA, "provenance": {"subs": str(tp)}, "stats": {}, "display": SM.DISPLAY,
+              "cues": [{"start": 0.0, "end": 5.0, "ocr": "せりふ", "ref": ref, "extra": [], "echo": None, "echo_of": None}],
+              "overlay": {"items": oitems, "stats": {}, "fed": list(range(9))}}
+        built = SC.build_items(om, {"lang": "cn", "show": "all"}, align=False)[0]
+        got = {it.events[0]["id"]: SC.style_of(it) for it in built if not it.translated}
+        got[8] = [SC.style_of(it) for it in built if it.translated and it.kind != "line"]
+    check("匹配产物退回画 OCR 原文的名牌一律 StrayName（Name / Title 只给认出了译名的）：名牌层的事件不论挂没挂上、带不带建轨的名牌标，"
+          "不在名牌层但带名牌标的也是；不在名牌层、没带标的照旧 Body",
+          got == {1: "StrayName", 2: "StrayName", 3: "StrayName", 4: "StrayName", 5: "StrayName", 6: "StrayName", 7: "Body", 8: ["Name"]}, got)
 
 
 NANI_A = """; 日本語 <ja> to 简体中文 <zh-Hans> localization document for 'Act/A01' Naninovel scenario script
@@ -1694,6 +1945,141 @@ NANI_B = """# B01_Ema001
 ; だったら見せてみなよ！
 那你拿出来看看！
 """
+def t_name_ink() -> None:
+    """名牌字色（`analyze.nameink`）：同一种名牌先量 3 块、不一致加到 9 块按合标占比定；阶段 3 写名牌色、不上色的用 PlainName。"""
+    import contextlib
+    import io
+
+    import numpy as np
+    from flowocr.analyze import nameink as NI
+    from flowocr.analyze import scriptmatch as SM
+    from flowocr.artifacts import matchedio as MI
+    from flowocr.artifacts import tracksio
+    from flowocr.output import script as SC
+    from flowocr.typeset import core as TC
+    S = 1_000_000
+    gold = NI.INK["genshin"]["name"]
+    rgb_of = lambda lab: [int(NI.to_hex(lab)[k:k + 2], 16) for k in (1, 3, 5)]   # noqa: E731
+    check("名牌色 Lab → #rrggbb → Lab 来回差不到 1",
+          all(float(np.linalg.norm(NI.to_lab(np.array(rgb_of(lab), np.uint8)) - np.array(lab))) < 1.0
+              for g in NI.INK.values() for lab in g.values()))
+    box = [900, 800, 1000, 840]
+
+    def frame(color, bg=(30, 32, 40)):
+        img = np.full((1080, 1920, 3), bg, np.uint8)
+        for x in range(906, 996, 8):                  # 3 px 宽的竖笔画
+            img[806:834, x:x + 3] = color
+        return img
+    W = [235, 240, 245]
+    dimmed = lambda lab: frame([v // 4 for v in rgb_of(lab)], (8, 8, 10))   # noqa: E731  弹窗把整屏压暗：名牌字还在，只是暗
+    colors: dict[int, object] = {}
+    asked: list[int] = []
+
+    def fake_grab(video, t_us, w, h):
+        asked.append(t_us)
+        return colors[t_us]
+    items = []
+
+    top = [900, 40, 1000, 80]                         # 画面顶上别的界面里的同一个名字
+
+    def kind(cn, pattern, layer="name", group="name", base=0, at=box):
+        lab = NI.INK["genshin"][layer]
+        for k, c in enumerate(pattern):
+            a = (base + 10 * k) * S
+            img = {"w": frame(W), "g": frame(rgb_of(lab)), "d": dimmed(lab), "n": None}[c]
+            if img is not None and at is not box:
+                img = np.roll(img, at[1] - box[1], axis=0)
+            colors[a + S // 2] = img
+            items.append({"layer": layer, "group": group, "cn": cn, "start_us": a, "end_us": a + S, "rows": [at]})
+    kind("派蒙", "ggggg", base=0)
+    kind("眼", "wwww", base=1000)
+    kind("卡齐娜", "gggggg" + "w" + "ggggg", base=2000)         # 先挑的 0 / 6 / 11 里有一块白：加到 9 块，白的 1 / 9
+    kind("阿米娜", "gwgwggwggggg", base=3000)                   # 9 块里白的 3 块，合标 6 / 9 < 0.8
+    kind("佣兵", "ggg", layer="title", base=4000)
+    kind("派蒙", "gg", group="stray_name", base=5000)
+    kind("拉马奈", "gggdddggg", base=7000)                      # 先挑的 0 / 4 / 8 里有一块压暗：加到 9 块，压暗的 3 块不算，合标 6 / 6
+    kind("纳西妲", "nnn", base=8000)                            # 一帧都没取到：没有证据，不上色
+    kind("大卫", "ggggg", base=9000)                            # 同一个名字两处：常规位置的照名牌色判，顶上界面里的另判
+    kind("大卫", "ww", base=9500, at=top)
+    items.append({"layer": "name", "group": "name", "cn": None, "start_us": 6000 * S, "end_us": 6001 * S, "rows": [box]})
+    log = io.StringIO()
+    with tempfile.TemporaryDirectory() as td:
+        vid = Path(td) / "v.mp4"
+        vid.write_bytes(b"")
+        doc = {"size": [1920, 1080], "provenance": {"video": str(vid)}}
+        saved, saved_which = NI.grab, NI.shutil.which
+        NI.grab, NI.shutil.which = fake_grab, lambda name: name
+        try:
+            with contextlib.redirect_stdout(log):
+                got = NI.check(items, doc, "genshin")
+                none_game = NI.check([dict(it) for it in items], doc, "zzz")
+                none_vid = NI.check([dict(it) for it in items], {**doc, "provenance": {"video": str(Path(td) / "nope.mp4")}}, "genshin")
+                NI.shutil.which = lambda name: None
+                none_ff = NI.check([dict(it) for it in items], doc, "genshin")
+        finally:
+            NI.grab, NI.shutil.which = saved, saved_which
+    verdict = {}
+    for it in items:
+        key = (it["cn"], it["layer"], it["group"]) + ((it["rows"][0][1],) if it["cn"] == "大卫" else ())
+        verdict.setdefault(key, set()).add(it.get("ink", "-"))
+    check("名牌字色：都合标的上色、都不合标的不上色；3 块不一致时加到 9 块，合标 ≥ 80% 才上色，压暗的块不计；一帧都没取到的不上色；同一个名字在不同位置分开判；没挂上的、没译名的不判",
+          verdict == {("派蒙", "name", "name"): {True}, ("眼", "name", "name"): {False}, ("卡齐娜", "name", "name"): {True},
+                      ("阿米娜", "name", "name"): {False}, ("佣兵", "title", "name"): {True},
+                      ("派蒙", "name", "stray_name"): {"-"}, (None, "name", "name"): {"-"},
+                      ("拉马奈", "name", "name"): {True}, ("纳西妲", "name", "name"): {False},
+                      ("大卫", "name", "name", 800): {True}, ("大卫", "name", "name", 40): {False}}, verdict)
+    check("名牌字色：先每种 3 块（不到 3 块全量），不一致的（含没有证据的块）加量到 9 块；共量 3+3+9+9+3+9+3+3+2 帧，日志分开报没取到帧、画面压暗",
+          len(asked) == 44 and len(set(asked)) == 44 and "没取到帧 3、画面压暗（或框在画面外）3" in log.getvalue(), (len(asked), log.getvalue()))
+    check("名牌字色：产物记各层的名牌色；没有名牌色的游戏（绝区零）、找不到源视频、PATH 上没有 ffmpeg 时什么都不判",
+          got == {"name": NI.to_hex(gold), "title": NI.to_hex(NI.INK["genshin"]["title"])} and none_game is None and none_vid is None
+          and none_ff is None and "没有 ffmpeg" in log.getvalue(), got)
+    plate, lifted, up_top = [886, 847, 1028, 892], [877, 784, 1027, 834], [1074, 81, 1214, 109]   # gi2「派蒙」、hsr「ヨク・タベル」
+    check("名牌的位置（`same_spot`）：对话框里随台词行数上挪 1.4 个字高的还是一处（`same_plate` 不算同一块），画面顶上别的界面另算一处",
+          NI.same_spot(plate, lifted) and not tracksio.same_plate(plate, lifted) and not NI.same_spot([762, 794, 1074, 842], up_top))
+    gold_bg = np.full((1080, 1920, 3), rgb_of(gold), np.uint8)
+    gold_bg[806:834, 906:996:8] = W                                # 金色背景上的白字：背景本身是名牌色
+    check("量字色：框里名牌色笔画的占比减去框外一圈的——金字过、白字不过、金色背景上的白字也不过；整屏压暗的、框在画面外的没有证据（None）",
+          NI.ink_share(frame(rgb_of(gold)), box, gold) >= NI.MIN_SHARE > NI.ink_share(frame(W), box, gold)
+          and NI.ink_share(gold_bg, box, gold) < NI.MIN_SHARE and NI.ink_share(dimmed(gold), box, gold) is None
+          and NI.ink_share(frame(W), [2000, 10, 2100, 40], gold) is None,
+          [NI.ink_share(f, box, gold) for f in (frame(rgb_of(gold)), frame(W), gold_bg, dimmed(gold))])
+    # 阶段 3：判过字色的名牌，不合标的另用 PlainName；Name / Title 样式写名牌色；阶段 4 照名牌排 PlainName
+    tdoc = {"events": [{"id": 0, "region": 0, "box": box, "text": "x", "t_start": 0, "t_end": S}], "provenance": {}}
+    from flowocr.artifacts.matchedio import Visible as _Vis
+    mk = lambda **kw: {"layer": "name", "group": "name", "start_us": 0, "end_us": S, "rows": [box], "events": [0],  # noqa: E731
+                       "jp": "x", "cn": "x", **kw}
+    proj = SC.project_items([mk(ink=True), mk(ink=False), mk(), mk(layer="title", ink=False)], tdoc, "cn", _Vis(frozenset({"name"}), True))
+    fills = SC.name_fills({"overlay": {"name_ink": {"name": "#f6c510", "title": "#cfac2c"}}})
+    sty = {ln.split(",")[0][7:]: ln.split(",")[3] for ln in SC.style_lines(fills=fills)}
+    check("阶段 3：ink 为 False 的名牌（名字、称号）用 PlainName（白），其余照层；Name / Title 样式写名牌色（&H00BBGGRR），别的样式白；阶段 4 按名牌排 PlainName",
+          [SC.style_of(it) for it in proj] == ["Name", "PlainName", "Name", "PlainName"]
+          and sty["Name"] == "&H0010C5F6" and sty["Title"] == "&H002CACCF" and sty["PlainName"] == SC.STYLE_FILL
+          and sty["Body"] == SC.STYLE_FILL and SC.name_fills({"overlay": {}}) == {} and TC.KIND_OF_STYLE["PlainName"] == "name",
+          ([SC.style_of(it) for it in proj], sty))
+    # 接线：匹配产物的 overlay.name_ink 经 render_script 写进字幕稿的样式头，ink 为 False 的那块用 PlainName
+    evs = [{"id": i, "region": 0, "box": box, "t_start": a * S, "t_end": (a + 2) * S, "text": "パイモン", "flags": ["nameplate"],
+            "conf": 0.9, "n_obs": 10} for i, a in ((0, 0), (1, 10))]
+    rdoc = {"schema": tracksio.SCHEMA, "tag": "t", "meta": {"src_fps": 30.0}, "frame_us": 500_000, "size": [1920, 1080],
+            "provenance": {"main_track": "r00"}, "events": evs, "regions": [{"index": 0, "align": "center", "align_how": {"by": "none"}}],
+            "tracks": [{"id": "r00", "kind": "region", "region": 0, "srt": "t-r00.srt", "ui_lines": [],
+                        "cues": [{"id": f"c{e['id']}", "t_start": e["t_start"], "t_end": e["t_end"], "events": [e["id"]]} for e in evs]}]}
+    plate = {"fill": False, "name_src": "speakers", "ocr": "パイモン"}
+    with tempfile.TemporaryDirectory() as td:
+        tp = Path(td) / "t-tracks.json"
+        tracksio.dump(tp, rdoc)
+        om = {"schema": MI.SCHEMA, "provenance": {"subs": str(tp)}, "stats": {}, "display": SM.DISPLAY, "cues": [],
+              "overlay": {"items": [{**mk(ink=True), "start_us": 0, "end_us": 2 * S, "events": [0], "cn": "派蒙", **plate},
+                                    {**mk(ink=False), "start_us": 10 * S, "end_us": 12 * S, "events": [1], "cn": "派蒙", **plate}],
+                          "stats": {}, "fed": [0, 1], "name_ink": {"name": "#f6c510"}}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            p, *_ = SC.render_script(om, td, {"lang": "cn", "show": "all"})
+        ass = Path(p).read_text(encoding="utf-8-sig").splitlines()
+    head = {ln.split(",")[0][7:]: ln.split(",")[3] for ln in ass if ln.startswith("Style: ")}
+    used = [ln.split(",")[3] for ln in ass if ln.startswith("Dialogue: ")]
+    check("接线：render_script 把匹配产物的 overlay.name_ink 写进字幕稿的 Name 样式，不上色的那块用白字的 PlainName",
+          head.get("Name") == "&H0010C5F6" and head.get("PlainName") == SC.STYLE_FILL and used == ["Name", "PlainName"], (head, used))
+
+
 NANI_NAMES = """; 日本語 <ja> to 简体中文 <zh-Hans> localization document for 'CharacterNames' managed text document
 
 ; 桜羽エマ
@@ -1839,6 +2225,89 @@ def t_naninovel() -> None:
         check("没给剧本目录就明确报错", raises(lambda: m.match(doc, {}, {}), ValueError))
         _json.dumps(out, ensure_ascii=False)
 
+        # 名牌粘在主轨 cue 里（名牌在正文上一行）：叠加层的名牌按 CharacterNames 出译文。naninovel 原来调 overlay_items 不交名字表，
+        # 名牌层整层没有译文、叠加画的是 OCR 原文（2026-10-24，宣传片素材的 `セナ` / `リオ`）
+        plate = [(0, "桜羽エマ", "え、な、なに、ここ……？"), (15, "桜羽エマ", "ねえ、ここどこなのかな！？"),
+                 (40, "桜羽エマ", "それはきっと、この証拠品で証明できると思うよ！"),
+                 (50, "デスム", "静かにしてくれないか？"), (65, "デスム", "だったら見せてみなよ！"), (90, "デスム", "そんな証拠、どこにもないじゃん！")]
+        pevs, pcues = [], []
+        for k, (a, nm, body) in enumerate(plate):
+            ids = [len(pevs), len(pevs) + 1]
+            pevs += [{"id": ids[0], "region": 0, "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": nm, "flags": [],
+                      "box": [300, 800, 460, 840]},
+                     {"id": ids[1], "region": 0, "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": body, "flags": [],
+                      "box": [300, 850, 1500, 890]}]
+            pcues.append({"id": f"p{k}", "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "events": ids})
+        pdoc = tracksio.dump(d / "p-tracks.json", {**doc, "events": pevs, "tracks": [{**doc["tracks"][0], "cues": pcues}]})
+        pout = m.match(pdoc, {"script": str(d / "Scripts")}, {})
+        pnames = [(it["ocr"], it["cn"], it["name_src"]) for it in pout["overlay"]["items"] if it["layer"] == "name"]
+        bare = m.match(pdoc, {"script": str(d / "Scripts"), "names": str(d / "no-such-names.bytes")}, {})
+        check("naninovel 叠加层的名牌：名字表里有的出中文名（name_src = speakers），表里没有的照旧没有译文；没有名字表时整层没有译文、ref_has_speakers 记 False",
+              pnames == [("桜羽エマ", "樱羽艾玛", "speakers")] * 3 + [("デスム", None, None)] * 3
+              and pout["overlay"]["stats"]["name_translated"] == 3 and pout["overlay"]["stats"]["ref_has_speakers"] is True
+              and all(it["cn"] is None for it in bare["overlay"]["items"] if it["layer"] == "name")
+              and bare["overlay"]["stats"]["ref_has_speakers"] is False
+              and NV.name_table(NV.load_names(d / "CharacterNames.bytes"))["桜羽エマ"] == "樱羽艾玛",
+              (pnames, pout["overlay"]["stats"]))
+        # 名牌投票走通整条路（`record_speakers` 从 naninovel 的认领取说话人）：读错一个字的 4 字名牌认上，2 字读错一个的不认
+        ema = ["え、な、なに、ここ……？", "ねえ、ここどこなのかな！？", "それはきっと、この証拠品で証明できると思うよ！"]
+        plate2 = [(t, nm, ema[k % 3]) for k, (t, nm) in enumerate(
+            [(0, "桜羽工マ"), (15, "桜羽工マ"), (40, "桜羽工マ"), (50, "エラ"), (65, "エラ"), (90, "エラ")])]
+        q_evs, q_cues = [], []
+        for k, (a, nm, body) in enumerate(plate2):
+            ids = [len(q_evs), len(q_evs) + 1]
+            q_evs += [{**pevs[0], "id": ids[0], "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": nm},
+                      {**pevs[1], "id": ids[1], "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": body}]
+            q_cues.append({"id": f"q{k}", "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "events": ids})
+        qdoc = tracksio.dump(d / "q-tracks.json", {**doc, "events": q_evs, "tracks": [{**doc["tracks"][0], "cues": q_cues}]})
+        qout = m.match(qdoc, {"script": str(d / "Scripts")}, {})
+        qnames = [(it["ocr"], it["cn"], it["name_src"]) for it in qout["overlay"]["items"] if it["layer"] == "name"]
+        check("naninovel 名牌投票（整条路）：`桜羽工マ` 下面三句都是エマ说的 -> 樱羽艾玛（voted）；2 字的 `エラ` 读错一个字，同样三票也不认；stats 记 name_from_voted",
+              qnames == [("桜羽工マ", "樱羽艾玛", "voted")] * 3 + [("エラ", None, None)] * 3
+              and qout["overlay"]["stats"]["name_from_voted"] == 3, (qnames, [(r["ref"] or {}).get("speaker") for r in qout["cues"]]))
+
+        # 开头行排掉本身是整条台词的行（`naninovel.head_script_lines`，2026-10-24）：短台词 `ああ。` 落在三条两行 cue 的首行、配过三种末行，
+        # 不交剧本台词时它被认成名牌、叠加画出 OCR 原文（《魔裁》f3 14 块）；剧本里另有一整条台词恰好就是名字 `桜羽エマ`，名牌不许跟着被排掉
+        import shutil as _sh
+
+        import miss_detect as MD
+        from flowocr.analyze import game_align as GA
+        from flowocr.analyze import script_align as SA
+        from flowocr.analyze import scriptmatch as SM
+        _sh.copytree(d / "Scripts", d / "Scripts3")
+        (d / "Scripts3" / "Act" / "D01.bytes").write_text(
+            "# D01_Coco001\n; > Coco: |#D01_Coco001|\n; 桜羽エマ\n艾玛\n\n"
+            "# D01_Hiro001\n; > Hiro: |#D01_Hiro001|\n; ああ。\n啊。\n", encoding="utf-8")
+        hplate = [(0, "ああ。", "静かにしてくれないか？"), (20, "ああ。", "だったら見せてみなよ！"), (45, "ああ。", "そんな証拠、どこにもないじゃん！"),
+                  (60, "桜羽エマ", ema[0]), (80, "桜羽エマ", ema[1]), (105, "桜羽エマ", ema[2])]
+        h_evs, h_cues = [], []
+        for k, (a, nm, body) in enumerate(hplate):
+            ids = [len(h_evs), len(h_evs) + 1]
+            h_evs += [{**pevs[0], "id": ids[0], "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": nm},
+                      {**pevs[1], "id": ids[1], "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": body}]
+            h_cues.append({"id": f"h{k}", "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "events": ids})
+        hdoc = tracksio.dump(d / "h-tracks.json", {**doc, "events": h_evs, "tracks": [{**doc["tracks"][0], "cues": h_cues}]})
+        hnames = NV.load_names(d / "CharacterNames.bytes")
+        hlines = NV.load_script(d / "Scripts3", hnames)
+        hout = m.match(hdoc, {"script": str(d / "Scripts3")}, {})
+        hgot = [(it["ocr"], it["cn"]) for it in hout["overlay"]["items"] if it["layer"] == "name"]
+        hfeed = MD.NaniFeed(hdoc, hout, NV.head_script_lines(hlines, hnames))
+        check("naninovel 开头行：一整条台词（`ああ。`）落在 cue 首行、配过多种末行也不当名牌；剧本里和角色名逐字相同的台词（`桜羽エマ`）不挡名牌；"
+              "疑似漏字幕判断器的 naninovel 适配层用同一份开头行",
+              hgot == [("桜羽エマ", "樱羽艾玛")] * 3
+              and SA.norm("ああ。") in NV.head_script_lines(hlines, hnames)
+              and SA.norm("桜羽エマ") not in NV.head_script_lines(hlines, hnames)
+              and hfeed.heads == frozenset({SA.norm("桜羽エマ")}), (hgot, hfeed.heads))
+        # gametext 不变：不交 `script_lines` 时照旧取 `GA.band_lines(ref.script)`，带内台词全排、不为角色名开例外
+        hcues, hevs_of, _ = NV.main_cues(hdoc)
+        def g_names(texts: list[str]) -> list[str]:
+            gref = GA.Ref(doc={"units": [], "speakers": {"桜羽エマ": "樱羽艾玛"}}, windows=[], role={}, variant_of={},
+                          script=[SA.Entry(key=f"g{i}", kind="Talk", cmd="", text=t, src="u") for i, t in enumerate(texts)])
+            return [it["ocr"] for it in SM.overlay_items([], hdoc, hevs_of, hcues, ref=gref)[0] if it["layer"] == "name"]
+        check("gametext 开头行不变：带内台词逐字相等的排掉（含和说话人同名的那行）；不在剧本里的照旧是名牌",
+              g_names(["ああ。", "桜羽エマ"]) == [] and g_names(["ああ。"]) == ["桜羽エマ"] * 3
+              and g_names([]) == ["ああ。"] * 3 + ["桜羽エマ"] * 3, (g_names(["ああ。", "桜羽エマ"]), g_names([])))
+
         # ---- 疑似漏字幕判断器的 naninovel 适配层（miss-detector 计划 S5）：同一份剧本，另加一条主轨外的区域和 obs
         import contextlib
         import io
@@ -1897,7 +2366,7 @@ def t_naninovel() -> None:
                "tracks": [{"id": "main", "kind": "main", "regions": [0, 1], "cues": [{"id": "m0", "t_start": 0, "t_end": 1_000_000,
                                                                                         "events": [0, 1], "hide": [0]}]},
                           {"id": "r01", "kind": "region", "region": 1, "cues": [{"id": "o0", "events": [2]}]}]}
-        nf = MD.NaniFeed(agg, {"provenance": {"params": {}}, "stats": {"cues_raw": 1}, "cues": []})
+        nf = MD.NaniFeed(agg, {"provenance": {"params": {}}, "stats": {"cues_raw": 1}, "cues": []}, frozenset())
         check("检测器·naninovel 的没喂原因：主轨是几块区域并成的聚合轨时，在主轨 cue 里的按 cue 报（hide 等），不在的才是主轨以外",
               [nf.why_not_fed({"id": i, "text": "x", "flags": []}) for i in (0, 2)]
               == ["cue 里藏起的行（hide：打字机半截 / 杂行）", "主轨以外的区域（naninovel 只喂主轨）"])
@@ -1934,6 +2403,30 @@ def t_echo() -> None:
     check("四种形态：同一次出现的另一区域 same_time、别的出现里面板样或成批旧行 log、同区域隔开 replay、其余 other；echo_of 指主那次认领 [记录, slot]（slot −1 = ref）",
           got == [(None, None), ("same_time", [0, -1]), ("replay", [0, -1]), ("log", [0, -1]), ("other", [0, -1]), (None, None), (None, None),
                   ("log", [0, -1]), ("log", [5, -1]), ("log", [6, -1]), ("other", [0, -1]), (None, None)], got)
+    def batch(starts, grid):
+        """k1 / k2 / k3 先各出现一次，400 s 前后另一区域成批再认一遍（starts 是那三次的起点）；返回那三次的形态。"""
+        rs = [rec("k1", 10, 12, 0), rec("k2", 50, 52, 9), rec("k3", 51, 53, 9)] + \
+             [rec(k, t, 402, c) for k, t, c in zip(("k1", "k2", "k3"), starts, (5, 6, 7))]
+        EC.mark(rs, [c[0] for c in cue], [c[1] for c in cue], [c[2] for c in cue], {"k1": 10.0}, grid=grid)
+        return [r["echo"] for r in rs[3:]]
+    g60 = EC.grid_of({"meta": {"src_fps": 60.0, "stride": 30}})          # 60 fps 按 2 fps 采，等距
+    fr, fr0, ong, onl = (batch((400.0, 398.72, 398.75), g60), batch((400.0, 398.72, 398.75), None),
+                         batch((400.0, 398.5, 398.5), g60), batch((400.0, 398.5, 398.5), None))
+    check("成批旧行的「这一刻」按采样格号比：回抠后邻行起点差 1.28 s（采样级差 2 格）仍算同一刻（log）；没有网格照原来的 ±1 s（other）；"
+          "采样级起点上差 3 格（1.5 s）有没有网格都不算",
+          fr == ["log", "log", "log"] and fr0 == ["other", "other", "other"] and ong == onl == ["other", "other", "other"],
+          (fr, fr0, ong, onl))
+    import math
+    g22 = EC.grid_of({"meta": {"src_fps": 60.0, "sample_fps": 2.2}})     # 60 fps 按 2.2 fps 采：间隔 27 / 28 帧交替
+    real = [math.ceil(k * 60 / 2.2) / 60 for k in range(40)]
+    keys = [g22[0](t) for t in real]
+    spans = [EC.in_window(keys, keys[i], g22[1]) for i in range(5, 35)]
+    g25 = EC.grid_of({"meta": {"src_fps": 25.0, "sample_fps": 2.0}})     # 25 fps 按 2 fps 采：间隔 12 / 13 帧交替
+    b25 = [g25[0](t) for t in (100.04, 101.52, 100.52, 102.0)]          # 回抠后 100.04（采样级 100.52）对 101.52；采样级 100.52 对 102.0（差 3 格）
+    check("「这一刻」在不等距的网格上：60 fps 按 2.2 fps 采时采样级起点差 2 格都算同一刻、差 3 格都不算（最近的 3 格只差 1.35 s）；"
+          "25 fps 按 2 fps 采时回抠后差 1.48 s 的两行（采样级差 2 格）算，采样级差 3 格、同样差 1.48 s 的不算",
+          spans == [(i - 2, i + 3) for i in range(5, 35)] and b25[1] - b25[0] == 2 and b25[3] - b25[2] == 3 and g25[1] == 2,
+          ([(i, sp) for i, sp in zip(range(5, 35), spans) if sp != (i - 2, i + 3)], b25, g25[1]))
     recs6 = [rec("s1", 10, 12, 0), rec("s1", 400, 402, 2), rec("s2", 50, 52, 0), rec("s2", 400, 402, 5),
              rec("s3", 51, 53, 0), rec("s3", 400.5, 402, 6)]
     EC.mark(recs6, [c[0] for c in cue], [c[1] for c in cue], [c[2] for c in cue], None)
@@ -2036,10 +2529,10 @@ def t_echo() -> None:
           EC.anchors([["v2", 9.0, []], ["v1", 10.0, []], ["w2", 7.0, []], ["w3", 5.0, []]], lambda k: {"v2": "v1", "w2": "w1", "w3": "w1"}.get(k, k))
           == {"v1": 10.0, "w1": 5.0})
     # 产物：schema 升版，旧版明确报错；字段每条都有
-    check("matched schema 是 /6；读到 /5 明确报错、提示重跑匹配",
-          matchedio.SCHEMA == "flowocr-matched/6"
-          and raises(lambda: matchedio.validate({"schema": "flowocr-matched/5", "provenance": {}, "stats": {}, "cues": []}),
-                     matchedio.MatchedSchemaError))
+    check("matched schema 是 /7；读到 /6、/5 明确报错、提示重跑匹配",
+          matchedio.SCHEMA == "flowocr-matched/7"
+          and all(raises(lambda v=v: matchedio.validate({"schema": f"flowocr-matched/{v}", "provenance": {}, "stats": {}, "cues": []}),
+                         matchedio.MatchedSchemaError) for v in (5, 6)))
     try:
         matchedio.validate({"schema": "flowocr-matched/3", "provenance": {}, "stats": {}, "cues": []})
         msg = ""
@@ -2050,7 +2543,9 @@ def t_echo() -> None:
           [matchedio.echo_kept({"echo": e}) for e in (None, *matchedio.ECHOES)] == [True, False, False, True, True]
           and all(matchedio.echo_kept({"echo": e}, "keep") for e in matchedio.ECHOES)
           and raises(lambda: matchedio.echo_kept({}, "all"), ValueError))
-    check("scriptmatch 的代码指纹含回显判定（改判据换指纹）", "src/flowocr/analyze/echo.py" in SM.CODE_FP_FILES)
+    check("scriptmatch / naninovel 的代码指纹含回显判定和它按格号比用的采样网格（改判据换指纹）",
+          all({"src/flowocr/analyze/echo.py", "src/flowocr/extract/framegrid.py"} <= set(m_.CODE_FP_FILES)
+              for m_ in (SM, importlib.import_module("flowocr.analyze.matchers.naninovel"))))
     # 契约：真的 run_match（全量喂入）-> match_stats，带内各形态之和 == repeat_extra_band
     import contextlib
     import io
@@ -2101,6 +2596,7 @@ def t_body_start() -> None:
     from flowocr.artifacts import tracksio
 
     S, F = 1_000_000, 500_000
+    start = lambda *a: SM.body_start(*a)[0]                  # noqa: E731（借来的读数由 t_body_lent 守）
     T = int(SM.BODY_SHIFT_TOL * F)                           # 采样级的容差（1.5 个采样间隔）
     r1, name_box, far = [100, 900, 700, 940], [100, 840, 300, 880], [1000, 100, 1300, 130]
 
@@ -2110,23 +2606,23 @@ def t_body_start() -> None:
     body = ev(1, r1, 24, 30, JP)
     name, counter = ev(0, name_box, 0, 30, "カチーナ"), ev(2, far, 0, 30, "19000/24829")
     idx = tracksio.EventIndex([name, body, counter], SM.BODY_LOOKBACK_US)
-    check("被同一条 cue 里的名牌、计数器拉早的正文，起点挪到正文出现", SM.body_start(0, [body], JP, idx, T) == 24 * S)
+    check("被同一条 cue 里的名牌、计数器拉早的正文，起点挪到正文出现", start(0, [body], JP, idx, T) == 24 * S)
     variant = ev(3, r1, 0, 24, "その継承者っていうのが。")
     check("同一处更早就在屏的同一句变体（多读一个句号）算这句字出现：起点不挪",
-          SM.body_start(0, [body], JP, tracksio.EventIndex([name, body, variant], SM.BODY_LOOKBACK_US), T) == 0)
+          start(0, [body], JP, tracksio.EventIndex([name, body, variant], SM.BODY_LOOKBACK_US), T) == 0)
     typing = ev(4, r1, 20, 24, "そ")
-    check("同一处打字刚出的一个字算这句字出现：挪到它", SM.body_start(0, [body], JP, tracksio.EventIndex([name, body, typing], SM.BODY_LOOKBACK_US), T) == 20 * S)
+    check("同一处打字刚出的一个字算这句字出现：挪到它", start(0, [body], JP, tracksio.EventIndex([name, body, typing], SM.BODY_LOOKBACK_US), T) == 20 * S)
     elsewhere = ev(5, far, 10, 30, "その継承者っていうのが")
-    check("别处的同一句字不算（只认正文位置上的）", SM.body_start(0, [body], JP, tracksio.EventIndex([name, body, elsewhere], SM.BODY_LOOKBACK_US), T) == 24 * S)
+    check("别处的同一句字不算（只认正文位置上的）", start(0, [body], JP, tracksio.EventIndex([name, body, elsewhere], SM.BODY_LOOKBACK_US), T) == 24 * S)
     old = ev(6, r1, -300, 30, "その継承者っていうのが。")
     check("比回看窗口还早就在屏、一直挂过起点的同一句变体也算（长事件另存）：起点不挪",
-          SM.body_start(0, [body], JP, tracksio.EventIndex([name, body, old], SM.BODY_LOOKBACK_US), T) == 0)
+          start(0, [body], JP, tracksio.EventIndex([name, body, old], SM.BODY_LOOKBACK_US), T) == 0)
     misread, exact = ev(7, r1, 24, 30, "SKILL INFD"), ev(8, r1, 6, 20, "SKILL INFO")
     check("正文事件读错、同一处更早有和剧本原文同文的读数：挪到那个读数，不挪到读错的正文",
-          SM.body_start(0, [misread], "SKILL INFO", tracksio.EventIndex([name, misread, exact], SM.BODY_LOOKBACK_US), T) == 6 * S
-          and SM.body_start(0, [misread], "", tracksio.EventIndex([name, misread, exact], SM.BODY_LOOKBACK_US), T) == 24 * S)
+          start(0, [misread], "SKILL INFO", tracksio.EventIndex([name, misread, exact], SM.BODY_LOOKBACK_US), T) == 6 * S
+          and start(0, [misread], "", tracksio.EventIndex([name, misread, exact], SM.BODY_LOOKBACK_US), T) == 24 * S)
     check("只差一个采样间隔的不挪；起点本来就晚的不往前推",
-          SM.body_start(int(23.5 * S), [body], JP, idx, T) == int(23.5 * S) and SM.body_start(25 * S, [body], JP, idx, T) == 25 * S)
+          start(int(23.5 * S), [body], JP, idx, T) == int(23.5 * S) and start(25 * S, [body], JP, idx, T) == 25 * S)
     check("终点：夹到正文最晚的消失（同一条 cue 里晚消失的名牌不再拖晚），不早于起点；开放边界的不夹",
           SM.body_end(31 * S, 24 * S, [body]) == 30 * S and SM.body_end(29 * S, 24 * S, [body]) == 29 * S
           and SM.body_end(31 * S, 32 * S, [body]) == 32 * S
@@ -2140,3 +2636,42 @@ def t_body_start() -> None:
     check("终点：记录里正文位置上的同一句变体（不在正文里，yuka-f3「裁判の後。」）也算这句字还在；别处、别的字（名牌）不算",
           SM.body_end(40 * S, 24 * S, [body], [body, tail_variant, tail_name], JP) == 40 * S
           and SM.body_end(40 * S, 24 * S, [body], [body, tail_name], JP) == 30 * S)
+
+
+def t_body_lent() -> None:
+    """正文块定起点借来的读数记进它的 `events`（2026-10-24，defaults.md 1.66）：正文事件读错（zzz `SKILL INFD`），
+    起点挪到同一处更早、和剧本原文同文的读数上——那个读数要在 body 条目的 `events` 里；选项路不再拿它在同一处再出一块；
+    打字机看得见这句字早就在屏，不把整句判成从起点慢慢打出（原来 66.5 s）。"""
+    print("正文块借来的读数")
+    from types import SimpleNamespace as _NS
+    from flowocr.analyze import game_align as GA
+    from flowocr.analyze import scriptmatch as SM
+    from flowocr.output import script as OS
+
+    S, box = 1_000_000, [237, 111, 309, 124]
+    ref = GA.Ref(doc={"units": [{"uid": "u", "lines": [
+        {"key": "si", "kind": "Loose", "status": None, "role": "UIText", "text": "SKILL INFO", "cn": "技能信息",
+         "anchor": {"episodes": [[6.0, 30.0]]}}]}]}, script=[], windows=[], role={}, variant_of={})
+    exact = {"id": 0, "region": 5, "text": "SKILL INFO", "box": box, "t_start": 6 * S, "t_end": 20 * S, "t_full_sampled": 6 * S}
+    misread = {"id": 1, "region": 0, "text": "SKILL INFD", "box": box, "t_start": 24 * S, "t_end": 30 * S, "t_full_sampled": 24 * S}
+    doc = {"events": [exact, misread], "size": [1280, 720], "frame_us": 500_000, "provenance": {}}
+    cues = [_NS(start=6.0, end=30.0, lines=["SKILL INFD"])]
+    recs = [{"start": 6.0, "end": 30.0, "cues": [0], "extra": [], "how": "fuzzy",
+             "ref": {"key": "si", "kind": "Loose", "jp": "SKILL INFO", "cn": "技能信息", "score": 0.9}}]
+    SM.mark_display(recs, cues, lambda c: "ui")
+    items, _ = SM.overlay_items(recs, doc, [[misread]], cues, ref=ref)
+    body = [it for it in items if it["layer"] == "body"]
+    check("正文块借来定起点的同一句读数记进它的 events（排在正文事件后面，区域仍取正文事件的）；选项路不再拿它出块",
+          [(it["start_us"], it["events"]) for it in body] == [(6 * S, [1, 0])]
+          and not [it for it in items if it["layer"] in ("choice", "offmain")],
+          [(it["layer"], it["start_us"], it["events"]) for it in items])
+
+    def tw(ids):
+        it = OS.Item(6 * S, 30 * S, [box], ["技能信息"], "line", events=[doc["events"][i] for i in ids])
+        return OS.effect_times(it, doc, doc["frame_us"])[0]
+    check("打字机：只看正文事件时整句被判成从起点打了 18 s；记进借来的读数后看得见它早就在屏，不打字",
+          tw([1]) == 18 * S and tw(body[0]["events"] if body else [1]) == 0, (tw([1]), body))
+    names = [{"layer": "name", "events": [0], "ocr": "SKILL INFO"}, {"layer": "name", "events": [7], "ocr": "リン"}]
+    kept, n = SM.yield_to_body(names, body)
+    check("名牌层让出已记进正文块 events 的事件（借来定起点的读数被认成了名牌：《魔裁》f3「裁判の後。」在同一个框里叠画 OCR 原文）；别的名牌照留",
+          [it["events"] for it in kept] == [[7]] and n == 1, (kept, n))

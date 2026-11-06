@@ -1,6 +1,6 @@
 # flowocr 使用手册
 
-> 对应 0.2.0。在 Windows 10 + RTX 5070 Ti、ffmpeg 8.0 上跑过（CPU 路径是同一台机器关掉显卡跑的），Linux 在同一台机器的 WSL2（Ubuntu 24.04）上跑过；别的显卡、老卡、真没有显卡的机器、原生 Linux 还没试过，遇到问题请开 issue。
+> 手册对应 0.3.0。项目在 Windows 10 + RTX 5070 Ti、ffmpeg 8.0 上跑过（CPU 路径是同一台机器关掉显卡跑的），Linux 在同一台机器的 WSL2（Ubuntu 24.04）上跑过；别的显卡、老卡、真没有显卡的机器、原生 Linux 还没试过，遇到问题请开 issue。
 > 开发与调参看 [开发指南](../dev-guide/README.md)。
 
 flowocr 从视频里把**出现过的所有文字**读出来，每条带起止时间，再按位置和时间聚成若干条"文字轨"（对白、字幕、UI、水印……），
@@ -116,6 +116,7 @@ flowocr-render out\v\v-tracks.json                        # 3. 输出：默认�
 - 第 2、3 步快得多。改参数重跑第 2 步不用重跑第 1 步，换预设重跑第 3 步不用重跑前两步。
 - 起止时间默认精确到一两帧（`--quality high` 精确到帧），逐字打出来的文字（打字机效果）也能还原出来。观测文件太旧时第 2 步会提示（见[排错](#排错)），用默认设置重跑第 1 步即可。
 - 第 3 步的默认预设写两份：能在 Aegisub 里改的字幕稿 `v-default.script.ass`，和加好特效的 `v-default.ass`（见[改字幕再出特效](#改字幕再出特效)）。
+  加 `--burn plate|inpaint|hq` 接着把 `v-default.ass` 烧进视频（见[烧进视频](#烧进视频)）。
 
 ## 产物怎么读
 
@@ -145,7 +146,7 @@ flowocr-render out\v\v-tracks.json                        # 3. 输出：默认�
 
 | 预设 | 出什么 |
 | --- | --- |
-| `default`（不给时就是它） | 字幕稿 + 叠加 ASS，成品样式：底板颜色取自画面（要读源视频，见[改字幕再出特效](#改字幕再出特效)）。`*-tracks.json` 只画主轨和名牌；匹配产物画匹配器定的默认内容（见[匹配产物画哪些](#匹配产物画哪些show--hide)） |
+| `default`（不给时就是它） | 字幕稿 + 叠加 ASS，成品样式：近黑半透明底板（要取画面的颜色见[改字幕再出特效](#改字幕再出特效)）。`*-tracks.json` 只画主轨和名牌；匹配产物画匹配器定的默认内容（见[匹配产物画哪些](#匹配产物画哪些show--hide)） |
 | `default_all` | 字幕稿 + 叠加 ASS，全部都画：`*-tracks.json` 画全部区域（常驻 UI 也画，要不要删自己判断）；匹配产物等于 `--opt show=all` |
 | `dev` | 同 `default_all` 的范围，非主轨浅蓝、底板右上角红字标区域号，看聚类用 |
 | `script` | 只写字幕稿（`*-tracks.json` 用 `--opt keep=main` 或 `keep=all`，匹配产物用 `show` / `hide`），改完自己跑 `flowocr-typeset` |
@@ -177,10 +178,17 @@ flowocr-render out\v\v-tracks.json                        # 3. 输出：默认�
 
 | 匹配器 | 默认画 | 默认不画 |
 | --- | --- | --- |
-| `gametext` | `dialogue` 台词（一定画）、`name` 名牌、`choice` 选项按钮、`offband` 字幕带外的台词（含绝区零的选项按钮、居中旁白）、`cutscene` 过场字幕、`narration` 黑屏旁白 | `ui` 界面文字（技能说明、帖子、提示…）、`elsewhere` 别处重现的台词（对话记录面板等）、`panel` 阅读面板长文本、`unmatched`、`unfed` |
-| `naninovel` | `dialogue` 台词（一定画）、`name` 名牌、`unmatched` | `unfed` |
+| `gametext` | `dialogue` 台词（一定画）、`name` 名牌（含称号）、`choice` 选项按钮、`offband` 字幕带外的台词（含绝区零的选项按钮、居中旁白）、`cutscene` 过场字幕、`narration` 黑屏旁白 | `ui` 界面文字（技能说明、帖子、提示…）、`elsewhere` 别处重现的台词（对话记录面板等）、`stray_name` 没挂在台词上的名字、`panel` 阅读面板长文本、`unmatched`、`unfed` |
+| `naninovel` | `dialogue` 台词（一定画）、`name` 名牌、`unmatched` | `stray_name` 没挂在台词上的名字、`unfed` |
 
 两个匹配器的填位都默认画。
+
+名牌一块一块看：画面上它正下方同时有一句认上了的台词，才算这句台词的名牌、归 `name`；
+队伍栏、好友列表、角色头顶、对话记录面板里那些长得像名牌的字归 `stray_name`，默认不画（要看就 `--opt show=stray_name`）。
+台词没认上时，它上面的名牌也跟着不画。名牌下面字小一号的称号（原神的「佣兵」）在字幕稿里用单独的 `Title` 样式，打开 `stray_name` 时那些字用 `StrayName` 样式；没译出、退回画 OCR 原文的名牌都用 `StrayName`（`Name` 只给挂在台词上、认出了中文名的）。
+原神、星铁的名牌照游戏里的颜色画：匹配时读源视频，每种名牌（同一个名字在画面不同位置的分开算）抽几帧量原文的字色，和这款游戏的名牌色（原神名字金色、称号暗金，星铁米金）对得上的，
+字幕稿的 `Name` / `Title` 样式就是这个颜色；对不上的（原神「グライアイの眼」那种蓝底白字面板）改用 `PlainName` 样式、白字。在 Aegisub 里改这几个样式的颜色就全改。偶尔量错，那种名牌会画成白字。
+找不到源视频、只有 `*-tracks.json`、或不是这两款游戏时名牌照旧白字（绝区零的名牌本来就是白字）。
 
 **振り仮名**（汉字上方的小假名注音）在第 2 步按位置打了标：主轨和逐区域 SRT、`default`、`default_srt`、匹配都不单独出它；
 `default_all` / `dev` 照画（`dev` 按常驻 UI 的样子标出来）。判据是按位置猜的，偶尔会把任务栏之类的假名当成注音，
@@ -191,7 +199,7 @@ flowocr-render out\v\v-tracks.json                        # 3. 输出：默认�
 
 ### 改字幕再出特效
 
-字幕稿（`*.script.ass`）是一份普通的 ASS：一条字幕一行——画面上一次显示的一句话是一条，几行之间用 `\N` 隔开，翻译时整句改、换行随意——样式按角色分（`Body` 正文、`Name` 名牌、`Choice` 选项、`UI` 常驻 UI……），
+字幕稿（`*.script.ass`）是一份普通的 ASS：一条字幕一行——画面上一次显示的一句话是一条，几行之间用 `\N` 隔开，翻译时整句改、换行随意——样式按角色分（`Body` 正文、`Name` 名牌、`Title` 名牌下面的称号、`PlainName` 字色和游戏名牌色对不上的名牌、`StrayName` 像名牌、但没挂在台词上或没认出中文名的字、`Choice` 选项、`UI` 常驻 UI……），
 Actor 列是区域号（`r3`）。正文是纯文字，前面一个位置、字号的 tag 块；特效（Effect）列里的 `fo:…` 是给第 4 步看的参数（原文框、打字机时长、轨迹……），不用管它。
 字幕稿里预览不到打字机（最终 ASS 里有）；要自己调某一行的节奏，在那一行写卡拉OK计时（`\k`），Aegisub 的卡拉OK模式里可以逐字调。
 
@@ -205,7 +213,9 @@ flowocr-typeset out\v\v-default.ass --restore             # 只有特效版时�
 - 改文字、改时间直接生效；改了译文，字号和底板会重新适配。
 - 拖了位置、改了字号：以你改的为准，这一行不再按原框自动摆 / 适配，第 4 步会打一行提示。
 - 自己注释掉的行、别的工具生成的特效行不会被动。第 4 步可以反复跑，也可以直接跑在它自己的输出上。
-- 第 4 步（`dev` 之外）会读源视频，给底板取画面的背景色、正文按底板深浅改黑字或白字；读视频的时间约是视频时长的十分之一（对话越密越长；有 N 卡时用硬解，CPU 占得少）。视频的位置第 3 步记在字幕稿里，挪了地方就加 `--video <视频>`；不要取色（手边没有视频、或想快）加 `--opt plate_color=off`，底板回到近黑半透明。
+- 底板默认是近黑半透明的。近黑底板压在浅色对话框上太显眼时，加 `--opt plate_color=on` 让第 4 步读源视频、给底板取画面的背景色，正文按底板深浅改黑字或白字；
+  读视频的时间约是视频时长的十分之一（对话越密越长；有 N 卡时用硬解，CPU 占得少）。视频的位置第 3 步记在字幕稿里，挪了地方就加 `--video <视频>`。
+  要用 inpainting 烧进视频（`flowocr-burn --inpaint`）的稿不要取色。
 - 格式细节见 [artifacts.md 的字幕稿一节](../architecture/artifacts.md#5-字幕稿阶段-3-写阶段-4-读)。
 
 ### 时间可能错了的字幕
@@ -246,15 +256,45 @@ flowocr-render out\v\v-tracks.json --preset default_all   # 写 v-default_all.sc
 
 1. 用 Aegisub 打开 `v-default_all.script.ass`（可以同时载入视频对照），把每行的原文改成译文；不要的行（常驻 UI、水印……）删掉或注释掉。
 2. `flowocr-typeset out\v\v-default_all.script.ass`，重新出 `v-default_all.ass`：译文按原文框重新排字号和底板，打字机、移动照旧。
-3. 看效果：mpv 里 `mpv video.mp4 --sub-file=out\v\v-default_all.ass`；要烧进视频：
+3. 看效果：mpv 里 `mpv video.mp4 --sub-file=out\v\v-default_all.ass`；满意了烧进视频（见[烧进视频](#烧进视频)）：
 
 ```powershell
-cd out\v
-ffmpeg -i ..\..\video.mp4 -vf "ass=v-default_all.ass" -c:a copy v-translated.mp4
+flowocr-burn out\v\v-default_all.ass             # 原样烧：译文压在底板上，写 out\v\v-default_all.mp4
+flowocr-burn out\v\v-default_all.ass --inpaint   # 先抹掉原文再写译文，写 out\v\v-default_all.inpaint.mp4
 ```
 
-在字幕所在的目录里运行、`ass=` 后面只写文件名：滤镜参数里的盘符冒号和反斜杠要另行转义，只写文件名就避开了。`-i` 后面的视频路径照常写（视频在别处就写它的完整路径）。
-要带 libass 的 ffmpeg（gyan.dev 的 full 构建有；`ffmpeg -filters` 里能找到 `ass`）。
+要抹掉原文时，第 2 步加 `--opt plate=src`（`flowocr-typeset out\v\v-default_all.script.ass --opt plate=src`）：底板只盖原文，抹的也就只是原文。
+不改字幕、一步到底时用 `flowocr-render out\v\v-tracks.json --preset default_all --burn inpaint`，它会替你带上 `plate=src`。
+
+## 烧进视频
+
+第 5 步 `flowocr-burn <叠加 ASS>` 把第 3、4 步出的叠加 ASS 烧进源视频。源视频的位置第 3 步记在字幕稿里，挪了地方就加 `--video <视频>`。
+输出默认和 ASS 放在一起（`x.ass` → `x.mp4`，inpainting 是 `x.inpaint.mp4`），`-o` 另给；跑到一半失败或按 Ctrl-C 不留半成品。
+
+两条路：
+
+- **原样烧**（默认）：叠加 ASS 怎么显示就怎么烧，译文压在半透明底板上，原文从底板下面透出一点。CPU 上也快。
+- **inpainting**（`--inpaint`）：先用 LaMa 模型把底板盖住的地方补成背景（原文没了），再烧译文；底板本身不画，译文是白字黑边。
+  涂抹跟着打字机逐字展开，比底板早 0.25 秒开始、晚 0.25 秒收起，盖住比底板早出、晚消的原文。
+  - 两档：`--inpaint`（default，快）和 `--inpaint hq`（补得细一些，慢约七成）。镜头、人物在动时，补过的地方看得出和周围画面略微错开。
+  - 只抹打了标的底板（第 4 步自己画的）；取过色的稿（`--opt plate_color=on`）、旧版第 4 步出的稿读不出底板，会报错，按提示重出。
+  - 模型第一次用时自动取（约 200 MB，Hugging Face 上 Carve 转的 ONNX 版 big-lama，许可见 `LICENSES\LaMa-NOTICE.md`），连同两档的派生图在模型目录里共约 590 MB。
+    GitHub Release 的模型包不含 LaMa。离线使用时，先在联网机器上跑 `flowocr-models fetch lama`，再把模型根下的 `LaMa-ONNX/` 拷进离线机器的模型根；首次烧录会在本地生成派生图。
+  - 设备：装了 TensorRT（见[TensorRT](#tensorrt可选gpu-上再快一些)）就用它，每档第一次用先建引擎（约 1 分钟，之后读缓存）；没装用 CUDA，打一行提示；没有 N 卡用 CPU。
+    原神一段 3 分钟的 1080p60 录像、default 档，在 RTX 5070 Ti 上：TensorRT 约 100 秒，CUDA 约 230 秒；CPU 上每秒视频约 10 秒（前 5 秒用了 51 秒）。
+    显存约 0.8 GB（CUDA 约 1.5 GB），内存约 2 GB（含解码、编码两个 ffmpeg）。
+
+输出的规格：
+
+- 分辨率、帧率按源，音轨照拷（mp4 装不下的编码重编成 AAC）。`--size 宽x高`、`--fps` 改。
+- 编码器 `--codec auto`（默认）按先后挑第一个能用的：H.265 硬件编码（如 NVIDIA 的 `hevc_nvenc`）→ H.264 硬件编码 → libx264（CPU）。也可以直接写编码器名，如 `--codec libx265`。
+- 质量 `--quality <n>`：硬件编码器的恒定质量值 / libx264 的 CRF，越大文件越小。不给时：
+  - 不到 30 分钟的视频用保守的默认值（硬件 26、libx264 14），画质和源接近，文件往往比源大；
+  - 30 分钟以上先在源视频上抽样试压，找画质分数（VMAF）刚到 95 的质量值，约 2 分钟，换来的文件小一到三成。`--quality auto` 不论长短都找，`--target` 改目标分数。
+    要带 libvmaf 的 ffmpeg（gyan.dev 的 full 构建有）；没有时用默认值并提示。
+- `--start` / `--end`（秒）只烧一段，先看效果用；字幕按原片的时间对上。源视频起始时间戳不为 0 时，整片烧录与截段烧录的字幕时刻可能不一致，先试烧一段核对。
+- `--inpaint` 写在 ASS 后面（`flowocr-burn x.ass --inpaint`）：写在前面时 ASS 会被当成档名。
+- 输出一律是 8 bit（yuv420p）；10 bit / HDR 的源没试过，会降成 8 bit。
 
 ## 设备：GPU 还是 CPU
 
@@ -330,9 +370,11 @@ SRT（`matched_srt`、`default_srt`）默认不出 `same_time` 和 `log`，一�
 
 游戏文本包由另一个项目 [game-text-data](https://github.com/caca2331/game-text-data) 从社区解包数据中提取。
 **文本版权归游戏的权利人，包不公开分发**：按 game-text-data 的说明自己打包。
-包是 `<游戏>-<版本>-<指纹>.zip`（如 `genshin-7.1.0-76ad9320868e.zip`），放进数据目录的 `gametext\` 即可，**不用解压**
+要用原神 7.2.0，请检出 game-text-data 的 `v0.2.1` 标签，再按[打包原神 7.2.0](https://github.com/caca2331/game-text-data/blob/v0.2.1/docs/genshin/README.md#打包原神-720)生成文本包。
+换包后重跑 `flowocr-gamescript` 和匹配，已有的观测和轨道文件可继续用。
+包是 `<游戏>-<版本>-<指纹>.zip`（如 `genshin-7.2.0-c95edd4bc412.zip`），放进数据目录的 `gametext\` 即可，**不用解压**
 （或用 `--gametext <文件或目录>` / 环境变量 `FLOWOCR_GAMETEXT` 指过去）。解压了也行：解压到 `gametext\` 下，
-不管是 `gametext\genshin\` 还是右键"全部解压缩"默认的 `gametext\genshin-7.1.0-76ad9320868e\genshin\` 都认。
+不管是 `gametext\genshin\` 还是右键"全部解压缩"默认的 `gametext\genshin-7.2.0-c95edd4bc412\genshin\` 都认。
 同一款游戏放了两份不同版本会报错，只留要用的那份；zip 和它解压出的目录并存不算两份。
 
 ```powershell
@@ -372,7 +414,8 @@ flowocr-render out\v\v-matched.json --preset matched_srt --opt lang=cn
 - 同一句原文在画面上换了位置（跟着角色走的气泡、同时出现在对话框和对话记录里）时，叠加按位置分段画，每段画在它自己的位置上；
   字在移动的那段空档不画。
 - **名牌的译名**：先查剧本里的说话人；查不到的（名字隐藏的 NPC、绝区零这类行上没有说话人的场景）再按屏幕上的字
-  逐字查包里的**短名词表**（`terms`，游戏文本里的短串及其译文），`matched.json` 里名牌条目的 `name_src` 记是哪一种。
+  逐字查包里的**短名词表**（`terms`，游戏文本里的短串及其译文）；逐字都查不到的（OCR 把名字读错了字、只读到半截），
+  按名牌下面那几句台词的说话人投票认，或借这段视频里已译出、只差一个字的名牌。`matched.json` 里名牌条目的 `name_src` 记是哪一种。
   这张表是按字形查的：查到的是游戏自己的译法，但那块字不一定是人名（任务目标、称号也会查到）。
 
 ### 顺序剧本（Naninovel 引擎，如《魔法少女ノ魔女裁判》）
@@ -390,7 +433,7 @@ flowocr-render out\v\v-matched.json            # 匹配器推荐 matched_srt --o
 - 建轨时的 `--matcher naninovel --matcher-ctx game=mocai` 是给《魔法少女ノ魔女裁判》的：主轨按时间窗判并带，字幕带被缝进别的区域的那几段也喂得到匹配器；别的 Naninovel 游戏不写 `game` 就是默认建轨。剧本按文件顺序走，跳着玩、回放、分支都能接上。
 - `matched.json` 里每条认上的记录带剧本行的 `key`、原文 `jp`、译文 `cn` 和**说话人** `speaker` / `speaker_cn`（旁白是空）。
   说话人的名字从剧本目录上一级的 `CharacterNames.bytes` 查（在别处就加 `--ctx names=<文件>`）；名牌显示成 `？？？` 的台词，
-  脚本里注记了真名的记真名。
+  脚本里注记了真名的记真名。叠加里粘在台词上方的名牌也按这张表出中文名；逐字查不到的（OCR 把名字读错了字、只读到半截），按名牌下面那几句台词的说话人投票认，认不出的默认画 OCR 原文。
 - 记录的时间取字幕在画面上出现到消失；同一句隔了 2 秒以上再显示（比如选错证据之后）是两条记录，`--opt merge_gap=<秒>` 可改。
 - 只想匹配一段：`--opt start=<秒> --opt end=<秒>`。
 
@@ -429,7 +472,7 @@ flowocr-typeset out\v\v-default.script.ass --fx D:\mine\fx.py
 | `[后端] ⚠ --backend …：…，用 CUDA EP` / `[trt] det 退回 CUDA EP：…` | TensorRT 没用上，原因在这一行里（没装、版本对不上、建引擎或自检出错）。结果照常可用；`flowocr-trt status` 看库和缓存，删掉重装用 `flowocr-trt remove` 再 `install` |
 | `[后端] ⚠ … 次形状超出 TensorRT 引擎的范围、… 次 TensorRT 报错…` | 有几批超出了引擎的形状范围（多半是调大了 `--det-batch` 或识别批），或 TensorRT 运行中报错；这几批用 CUDA 跑了，结果照常可用。报错反复出现时先用 `--backend cuda`，并开 issue 附上那一行 |
 | 第 2 步打印 `obs 里没有在线回抠的证据…产物停在采样级` | 观测文件太旧（或第 1 步关掉了这项），起止时间只精确到 ±0.25 秒、打字机不逐字显出。用默认设置重跑第 1 步，再跑第 2 步 |
-| 模型下载失败 | 网络问题。连不上 Hugging Face 时设环境变量 `HF_ENDPOINT` 指向镜像；或用 GitHub Release 上的模型包 `flowocr-models install`（见[模型](#模型)） |
+| 模型下载失败 | 连不上 Hugging Face 时可用 `HF_ENDPOINT` 指向镜像。离线用默认 OCR 模型时装 [GitHub Release 的模型包](#模型)；用 LaMa 时按[烧进视频](#烧进视频)里的步骤单独准备。 |
 | `没找到 <游戏> 的游戏文本包` | 包没放进 `gametext\`，或 `--gametext` 指错了 |
 | `文本包 … 和清单对不上（sha256）` | 包拷坏了或被改过，重新拿一份 |
 | `文本包 … 缺 …×ja` | 这份包是收窄语种打出来的，缺日文；要一份带中日文的包 |

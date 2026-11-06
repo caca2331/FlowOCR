@@ -4,13 +4,14 @@
     python -m flowocr.output.render out/x/x-tracks.json --preset default_srt --outdir tmp/x
     python -m flowocr.output.render out/x/x-matched.json --preset dev --outdir tmp/x --opt lang=cn
     python -m flowocr.output.render out/x/x-tracks.json --preset D:/mine/preset.py --outdir tmp/x --opt start=full
+    python -m flowocr.output.render out/x/x-matched.json --opt lang=cn --burn inpaint                    # 3、4、5 连跑
 
 吃两种产物（2026-09-22 起，Codex 审计 P2：原来写死 `tracksio.load`，匹配结果连预设的门都进不去）：
 
 | schema | 读法 | 内置预设 |
 | --- | --- | --- |
 | `flowocr-tracks/1` | `tracksio.load` | 叠加三个（`default` / `default_all` / `dev`，叠 OCR 原文）、`script`（只写字幕稿）、`default_srt`（主轨一份 SRT） |
-| `flowocr-matched/6` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`default_srt`（叠上去的译文一份 SRT）、`matched_srt`（拍平成 SRT） |
+| `flowocr-matched/7` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`default_srt`（叠上去的译文一份 SRT）、`matched_srt`（拍平成 SRT） |
 | 别的（用户匹配器自己的格式） | 原样 `json.load`，**不校验** | 只有声明了这个 schema 的预设收（见 `ACCEPTS`） |
 
 不给 `--preset` 时：匹配产物里有匹配器的推荐（`provenance.recommend`，`flowocr.extensions.recommendation`）就用它（命令行 `--opt` 优先），
@@ -24,6 +25,9 @@
 预设可以声明 `ACCEPTS = ("flowocr-tracks/1", …)`：喂进来的产物不在里头就**当场报错**，
 而不是让它在预设内部以 `KeyError` 的形式炸（"失败不冒充成功"，计划）。不声明就是什么都收。
 `--opt k=v` 原样交给预设的 `options`（值是字符串，预设自己解释）；预设要什么参数、默认多少，是它自己的事。
+
+`--burn plate|inpaint|hq` 在叠加预设之后接着跑阶段 5（`flowocr.burn`），把预设返回的最终 ASS 烧进源视频，编码参数全用阶段 5 的默认；
+只配内置的叠加预设。`inpaint` / `hq` 走 inpainting：没给 `plate` 时替用户带上 `plate=src`（底板只盖原文，抹的也只是原文）。
 """
 from __future__ import annotations
 
@@ -33,6 +37,10 @@ from pathlib import Path
 
 from flowocr import extensions, paths, provenance
 from flowocr.artifacts import matchedio, tracksio
+from flowocr.output.presets import _overlay
+
+BURN = {"plate": None, "inpaint": "default", "hq": "hq"}
+"""`--burn` 的取值 -> 阶段 5 的 inpainting 档（None 是底板路线，原样烧）。"""
 
 
 def load_doc(path: Path) -> dict:
@@ -72,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
                          "没有推荐就是 default；显式给了就照用，推荐的选项不带上" % "、".join(extensions.builtin_names("preset")))
     ap.add_argument("--outdir", default="", help="默认写在产物旁边")
     ap.add_argument("--opt", action="append", default=[], metavar="K=V", help="给预设的选项，可多次")
+    ap.add_argument("--burn", choices=tuple(BURN),
+                    help="叠加预设写完接着跑阶段 5，把最终 ASS 烧进源视频：plate 原样烧；inpaint / hq 先抹掉底板盖住的原文"
+                         "（没给 plate 时带上 plate=src）。编码参数用阶段 5 的默认，要改就对最终 ASS 另跑 flowocr-burn")
     a = ap.parse_args(argv)
     opts = {}
     for kv in a.opt:
@@ -94,12 +105,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"按匹配器 {rec.get('by')} 的推荐用预设 {spec}" + (f"（{rec['opts']}）" if rec.get("opts") else ""))
         else:
             spec = "default"
+    if a.burn:
+        if spec not in _overlay.PRESETS:
+            raise SystemExit(f"--burn 只配内置的叠加预设（{'、'.join(_overlay.PRESETS)}）：{spec}")
+        if BURN[a.burn]:
+            opts.setdefault("plate", "src")
+            if opts.get("plate_color") == "on":
+                raise SystemExit("inpainting 读不出取过色的底板：--burn inpaint / hq 时去掉 --opt plate_color=on")
     preset = extensions.load(spec, "preset")
     check_accepts(preset, doc, spec)
     outdir = Path(a.outdir) if a.outdir else src.parent
     written = preset.render(doc, outdir, opts)
     for p in written:
         print(p)
+    if a.burn:
+        from flowocr.burn import __main__ as burn, pipeline       # 只有连跑才要阶段 5 的依赖
+        try:
+            pipeline.video_of(written[0])
+        except ValueError as ex:                        # 这里没有 --video：告诉用户对写好的最终 ASS 另跑
+            raise SystemExit(f"{ex}：最终 ASS 已经写好，另跑 flowocr-burn {written[0]} --video <源视频>")
+        return burn.main([str(written[0]), *(["--inpaint", BURN[a.burn]] if BURN[a.burn] else [])])
     return 0
 
 

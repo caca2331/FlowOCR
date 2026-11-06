@@ -10,7 +10,7 @@
 
 产物拿去阶段 3：`python -m flowocr.output.render <out.json> --preset matched_srt|default|dev`；
 匹配器声明了推荐预设（`PRESET`，`extensions.recommendation`）时它记在产物的 `provenance.recommend`，不给 `--preset` 就照它渲
-（内置匹配器 `gametext` / `naninovel` 写的是 `flowocr-matched/6`；用户匹配器写自己的格式，配自己的预设）。
+（内置匹配器 `gametext` / `naninovel` 写的是 `flowocr-matched/7`；用户匹配器写自己的格式，配自己的预设）。
 ⚠ 换预设不重跑匹配、换匹配器不重跑提取——这就是三个阶段各写一份产物的意义。
 
 `scriptmatch` 的 CLI 仍在（它带着评测口径的报表和一堆 ASS 旋钮）；这里是**通用**那条，

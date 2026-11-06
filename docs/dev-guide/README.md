@@ -16,7 +16,8 @@ uv sync --frozen --extra nvidia --group dev     # 建 / 更新 .venv（锁是 uv
   ORT 的 GPU 进程（`ort_server.py`）自己 `preload_dlls()`；CUDA 13 的 DLL 目录别加进 `PATH`：子进程继承了它，ORT 每个新形状首跑会从 0.15 s 变成 2 s。
 - `uv sync` 默认不装 dev 组（`pyproject.toml` 的 `default-groups = []`），开发要显式 `--group dev`。
 - `FLOWOCR_ORT_PYTHON=<别的 venv 的 python>` 把 ORT worker 钉到另一个解释器（换 ORT 版本做 A/B 时用）。
-- ONNX 模型全用官方发布的（owner 2026-09-22）：`flowocr.models` 按钉死的提交号 + sha256 取到数据根的 `models/`，
+- OCR 的 ONNX 模型全用官方发布的（owner 2026-09-22）；阶段 5 的 LaMa 是例外，上游只发 PyTorch 权重，用 Hugging Face 上第三方转换的那份（owner 2026-10-31）。
+  都由 `flowocr.models` 按钉死的提交号 + sha256 取到数据根的 `models/`，
   缺了管线当场取，也可以 `python -m flowocr.models fetch`。许可与改动说明在 `LICENSES/`。
 - TensorRT 后端可选、不进 `pyproject.toml`：`flowocr-trt install` 把 NVIDIA 的库（版本和每个文件的 sha256 钉在 `src/flowocr/trt.py`）和引擎缓存放进数据根的 `trt/<版本>/`（`FLOWOCR_TRT` 可改），worktree 共用主 checkout 那一份；装了以后 GPU 上默认走它，A/B 要比 CUDA EP 就给 `--backend cuda`。升级 onnxruntime 时查 `flowocr.trt.ORT_TRT` 的版本对照（[推理服务](../architecture/README.md#推理服务)）。
 - 游戏文本包（`gtd-bundle/1`）默认在数据根的 `gametext/`；没有这个目录、又把 game-text-data 克隆在 flowocr 旁边时，`explore/env.sh` / `env.ps1` 把 `FLOWOCR_GAMETEXT` 指到
@@ -37,24 +38,27 @@ python dev_tools\residue_scan.py diff --before before-<name> --after after-<name
 
 ## 常用命令
 
-四个阶段各有入口（9 个 console script 见 `pyproject.toml` 的 `[project.scripts]`）：
+五个阶段各有入口（console script 见 `pyproject.toml` 的 `[project.scripts]`）：
 
 ```powershell
 # 阶段 1：视频 -> obs
-.venv\Scripts\python.exe -m flowocr.extract.run_ocr2 <video> --out <obs.jsonl>          # 或 flowocr-ocr；开发和基线一律 --quality high（驱动都已带上，放在 $OCR_ARGS 前面）
-.venv\Scripts\python.exe -m flowocr.extract.run_groups ...                                # 自选范围多组同时跑（见使用手册「只识别画面的一部分」）
+python dev_tools\pyrun.py -m flowocr.extract.run_ocr2 <video> --out <obs.jsonl>          # 或 flowocr-ocr；开发和基线一律 --quality high（驱动都已带上，放在 $OCR_ARGS 前面）
+python dev_tools\pyrun.py -m flowocr.extract.run_groups ...                                # 自选范围多组同时跑（见使用手册「只识别画面的一部分」）
 # 阶段 2：obs -> tracks.json（一级产物）；匹配器
-.venv\Scripts\python.exe -m flowocr.analyze.build_tracks <obs.jsonl> --outdir <dir> --tag <tag>
-.venv\Scripts\python.exe -m flowocr.analyze.match <tracks.json> --matcher gametext --ctx ref=<ref.json> --out <matched.json>
+python dev_tools\pyrun.py -m flowocr.analyze.build_tracks <obs.jsonl> --outdir <dir> --tag <tag>
+python dev_tools\pyrun.py -m flowocr.analyze.match <tracks.json> --matcher gametext --ctx ref=<ref.json> --out <matched.json>
 # 阶段 3：出字幕 / 字幕稿（见 docs/architecture/artifacts.md 的导出与字幕稿两节）
-.venv\Scripts\python.exe -m flowocr.output.render <matched.json> --preset matched_srt --opt lang=cn
-.venv\Scripts\python.exe -m flowocr.output.render <tracks.json> --preset script --opt keep=all --outdir <dir>   # 只写字幕稿
-.venv\Scripts\python.exe -m flowocr.output.export <tracks.json> --outdir <dir>                # 逐轨 SRT
+python dev_tools\pyrun.py -m flowocr.output.render <matched.json> --preset matched_srt --opt lang=cn
+python dev_tools\pyrun.py -m flowocr.output.render <tracks.json> --preset script --opt keep=all --outdir <dir>   # 只写字幕稿
+python dev_tools\pyrun.py -m flowocr.output.export <tracks.json> --outdir <dir>                # 逐轨 SRT
 python -m flowocr.artifacts.tracksio <tracks.json> main_srt    # 从一级产物取值，别自己 json.load
 # 阶段 4：字幕稿 -> 最终叠加 ASS（可以反复重跑；--restore 还原字幕稿）
-.venv\Scripts\python.exe -m flowocr.typeset <x.script.ass> [--preset dev] [--fx <扩展效果>]
+python dev_tools\pyrun.py -m flowocr.typeset <x.script.ass> [--preset dev] [--fx <扩展效果>]
 # 阶段 3 + 4 连跑：叠加预设 default / default_all / dev 两份都写（字幕稿 + 最终 ASS）
-.venv\Scripts\python.exe -m flowocr.output.render <tracks.json> --preset dev --outdir <dir>   # 不给 --preset 是 default
+python dev_tools\pyrun.py -m flowocr.output.render <tracks.json> --preset dev --outdir <dir>   # 不给 --preset 是 default
+# 阶段 5：叠加 ASS -> 视频（默认原样烧；--inpaint [hq] 先修补掉底板盖住的原文；--start / --end 只烧一段）
+python dev_tools\pyrun.py -m flowocr.burn <x.ass> [--inpaint] [--start <秒> --end <秒>]
+python dev_tools\pyrun.py -m flowocr.output.render <tracks.json> --burn inpaint --outdir <dir>   # 3、4、5 连跑
 ```
 
 用户扩展（匹配器 / 输出预设 / 阶段 4 的扩展效果）的入口形状见 `src/flowocr/extensions.py` 文件头，可复制的例子在 `examples/`；内置实现和用户代码走同一条路。
@@ -68,7 +72,7 @@ python -m flowocr.artifacts.tracksio <tracks.json> main_srt    # 从一级产物
 多数评测驱动要本地的素材与真值（`data/`，不进版本库；素材根由 `FLOWOCR_ARCHIVE` 或 `data/archive-root.txt` 给），公开仓库里拿不到，照着它们的写法换成自己的素材即可。
 
 ```bash
-.venv/Scripts/python.exe tests/test_guards.py       # 共享层守卫，改完代码先跑（秒级）；用 venv，系统 python 会带出依赖版本的假报错
+python dev_tools/pyrun.py tests/test_guards.py     # 共享层守卫，改完代码先跑（秒级）；pyrun 挑的是项目的 venv，直接用系统 python 会带出依赖版本的假报错
 bash dev_tools/sampleset.sh list|quick|evidence|holdout2|zh   # 代表性片段；跑之前先打总时长
 bash dev_tools/head2head.sh 1 2 3 4 5 && python dev_tools/h2h_report.py tmp/h2h      # 五部整片头对头（非必要不跑）
 python dev_tools/arm_table.py tmp/h2h --arms=,-<臂> --base=                         # 臂间：命中三档 + 检测器覆盖（head2head 第 4 步的产物）
@@ -83,7 +87,7 @@ python dev_tools/main_invariants.py "<目录>/*/*-tracks.json"   # 主轨的不�
 python dev_tools/typewriter_eval.py <tracks.json> data/gt/typewriter-<tag>.json --split validation   # 默认建轨已回抠；--refine off 的产物加 --sampled
 python dev_tools/refine_offline_probe.py <--refine off 的 tracks.json> --video <mp4>   # 回抠的在线证据 vs 开视频离线测量，逐事件比三个时刻（不写产物）
 python -m flowocr.analyze.slot_pairs score data/gt/slotpairs-*.json --split dev    # 聚类的尺；改聚类先跑
-python dev_tools/delivery_cases.py score data/gt/delivery-<片段>.json <最终 .ass> …   # 交付病例：标注时刻的整句、画的位置、上下屏时刻，按对白 / 名牌 / UI / 主播字幕 / 评论墙分项（量最终 ASS，不量字幕稿）
+python dev_tools/delivery_cases.py score data/gt/delivery-<片段>.json <最终 .ass> …   # 交付病例：标注时刻的整句、画的位置、上下屏时刻，按对白 / 名牌 / 选项 / UI / 主播字幕 / 评论墙分项（量最终 ASS，不量字幕稿）
 python dev_tools/evalset.py run <清单.json> --arm <臂> --out <x.jsonl> && python dev_tools/evalset.py compare <a.jsonl> <b.jsonl>   # 逐条记录、两臂逐条配对（共同集合 + 判定转移）
 python dev_tools/ass_framediff.py <a.ass> <b.ass> [--start <秒> --end <秒>] [--dump <目录>]   # 两份 ASS 用 libass 逐帧比像素；改 \t / \fad / 切段时验收用（--selftest 复现两次回归）
 python dev_tools/hit_delta.py 1 2 3 4 5 --b=<臂后缀>  # 跨臂的命中集合差（按三档拆）+ 重复认领
@@ -118,9 +122,9 @@ python dev_tools/preview.py <tracks.json|matched.json> --preset dev [--opt lang=
 - 注音判据（`--ruby-mark`）的检验：`dev_tools/probe_ruby.py`（读 `--refine off` 的 tracks，列出每条假名候选卡在哪条判据，可出摆帧联系表、按标注文件算准确率）。
   召回的分母含主轨里的名字 run；`--exclude-main` 是另一种口径，两种不能混着引。`--sweep-cover 0,.3,.5,.7` 看阈值坐不坐在平台上。
 - 文字怎么动：`dev_tools/probe_motion.py <obs.jsonl> --out <tsv>`。
-- CI（`.github/workflows/ci.yml`）分 Windows + CPU 和 Linux + CPU 两个 job（Linux 那个的 ffmpeg 用 BtbN 的 8.1 静态构建，不打包、不查文档）。除守卫与文档检查外：`dev_tools/ci_smoke.py`（生成一段带字幕的视频走完三步）；`uv build` 打 sdist 与 wheel 并 `twine check`；`dev_tools/ci_extensions.py`（在 wheel 装进的全新 venv 里，
+- CI（`.github/workflows/ci.yml`）分 Windows + CPU 和 Linux + CPU 两个 job（Linux 那个的 ffmpeg 用 BtbN 的 8.1 静态构建，不打包、不查文档）。除守卫与文档检查外：`dev_tools/ci_smoke.py`（生成带字幕的视频，走完提取、建轨、输出、渲染、底板烧录）；`uv build` 打 sdist 与 wheel 并 `twine check`；`dev_tools/ci_extensions.py`（在 wheel 装进的全新 venv 里，
   用装好的命令加载 `examples/` 的匹配器和预设；要非 editable 的环境，本地验证可以 `uv build --wheel` 之后 `--no-deps` 装进临时 venv）。
-- 发版（`.github/workflows/release.yml`，手动派发）：从 `main` 或 tag 构建，在全新 venv 里装 wheel 跑冒烟、装模型包离线跑第 1 步，再按 target 传 TestPyPI，或建 GitHub Release 后传 PyPI。用法见文件头。
+- 发版（`.github/workflows/release.yml`，手动派发）：从 `main` 或 tag 构建，在全新 venv 里装 wheel 跑冒烟。离线冒烟用模型包装 OCR 模型，另预取 LaMa，禁掉下载后也跑一小段 inpainting。再按 target 传 TestPyPI，或建 GitHub Release 后传 PyPI。用法见文件头。
 
 各工具的用法在它自己的文件头。
 
@@ -134,11 +138,14 @@ python dev_tools/preview.py <tracks.json|matched.json> --preset dev [--opt lang=
   - 读 `data/` 一律走 `data_root()`；按代码根拼出来的路径在槽里不存在。
   - 模型缓存同理：`explore/env.sh` / `env.ps1` 把 explore 的 `_cache/` 指到数据根。
   - 代码在哪、产物在哪是两件事，判据只有一份：`src/flowocr/paths.py`。`CODE_ROOT` 是这份代码所在的 checkout；`data_root()` 在 linked worktree 里解析回主 checkout（读 `.git` 文件的 `gitdir:`）。`FLOWOCR_DATA_ROOT` 可以覆盖产物根。
-  - 驱动脚本一律 `CODE=$(cd "$(dirname "$0")/.." && pwd)` + `PY="$CODE/.venv/Scripts/python.exe"` + `cd "$("$PY" -m flowocr.paths)"`：
+  - 挑解释器的判据只有一份：`dev_tools/pyrun.py`（本 checkout 的 `.venv`，没有就用主 checkout 的；Windows 的 `Scripts/python.exe`、Linux 的 `bin/python`），
+    并把本 checkout 的 `src` 排在 `PYTHONPATH` 最前：槽里的 `.venv` 若是指回主 checkout 的 junction，editable 安装会导回主 checkout 的代码，跑出来的不是槽里的改动。
+    手敲命令用 `python dev_tools/pyrun.py <参数>`；`--which` 只打印会用哪个解释器和哪份代码。
+    `dev_tools/` 里要起开发 venv 子进程的 Python 工具从它取：`from pyrun import interpreter, code_env`（守卫查没有别处自己拼 `.venv` 里的解释器路径）。
+  - 驱动脚本一律 `CODE=$(cd "$(dirname "$0")/.." && pwd)` + `source "$CODE/dev_tools/pyenv.sh"` + `cd "$("$PY" -m flowocr.paths)"`：
+    `pyenv.sh` 取 `pyrun.py --which` 给的解释器设 `PY`，把 `PYTHONPATH` 钉成 `$CODE/src`，所以没有 `.venv` 的槽也能直接跑；它要 PATH 上有一个 `python`（或 `python3`，≥ 3.9）来跑 pyrun。
     槽里改完就能直接跑整片，跑的是槽里的代码、读写的是主 checkout 的素材与产物，provenance 的 `git_head` 仍是槽自己那棵树。
-    驱动紧接着 `export PYTHONPATH="$CODE/src"`（`PYTHONPATH` 排在 editable 安装前面）：槽里的 `.venv` 若是指回主 checkout 的 junction，
-    editable 安装会导回主 checkout 的代码，跑出来的不是槽里的改动（守卫查每个驱动都钉了）。槽里没有 `.venv` 时，用主 checkout 的 `.venv` 加 `PYTHONPATH=<槽>/src`。
-    手敲命令用 `python dev_tools/pyrun.py <参数>` 可以省掉这两步：它挑解释器（本 checkout 的 `.venv`，没有就用主 checkout 的）并把本 checkout 的 `src` 排在 `PYTHONPATH` 最前；`--which` 只打印会用哪个。
+    守卫查用 `$PY` 的驱动都 source 了 `pyenv.sh`，且没有一个写死 `.venv` 里的解释器路径、自己设 `PY` 或 `PYTHONPATH`。
 - `git worktree remove` 之前先分诊槽里被 ignore 的文件（`git -C <slot> clean -xdn`）：未提交、未合并的改动 git 会挡住，被 ignore 的文件它一声不响就删。
   槽里的 `.venv` 若是指回主 checkout 的 junction，**先拆掉 junction 再删槽**（Git Bash 里 `cmd //c rmdir <slot>\.venv`，PowerShell 里 `cmd /c rmdir <slot>\.venv`；只删链接本身）：`git worktree remove` 会顺着 junction 把主 checkout 的 `.venv` 删空（2026-10-06 出过一次，`uv sync` 重建）。
 - 槽从本地 HEAD 分叉（维护者的 Claude Code 项目设置里 `worktree.baseRef: "head"`，不在公开仓库里）。

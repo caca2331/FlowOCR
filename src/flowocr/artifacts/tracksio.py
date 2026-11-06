@@ -29,7 +29,7 @@ events[]   : id, region, t_start, t_full, t_end, box, text, conf, n_obs,
              n_independent, flags[], boxes[]?（只有 moving 的才落）, texts[]?（可选）,
              t_full_sampled?（采样级"全字出现"，build_tracks.sampled_full；t_full 只由回抠填）,
              t_full_how?（回抠填：{"first", "full"} 各是 agree / single / none，全字还可能是 capped，见 typewriter_fuse）,
-             t_full_end?（回抠填：完全显示结束，淡出开始的前一帧；没淡出时 ≈ t_end）, t_end_how?（curve / ncc / open：open = 窗里没看到消失，t_end 只是下界）
+             t_full_end?（回抠填：完全显示结束，淡出开始的前一帧；没淡出时 ≈ t_end）, t_end_how?（curve / ncc / open / moving：open = 窗里没看到消失，t_end 只是下界；moving = 末段在平移、结尾窗给的终点早于采样级，t_end 留采样级、不填 t_full_end）
 text_effect? : 回抠写的整段素材的效果统计：samples, verdict?（instant / typewriter / likely-typewriter；
              样本 < 8 时不写）, ms_per_char_median?, iqr_over_median?, fade_out_*?
 ```
@@ -79,6 +79,125 @@ def same_row(a, b) -> bool:
 def boxes_cross(a, b) -> bool:
     """两个框（`[x0, y0, x1, y1]`）相交（两个方向都有重叠）。"""
     return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
+NAME_GAP = 3.0
+"""名牌下沿到下面那行台词上沿最多隔几个名牌字高（`name_over_body` 用）。2026-11-05 量：
+原神、星铁的名牌离台词 ≤ 1.5 个字高，星铁对话记录面板里的字在 5 以上；绝区零 zzz-s2（安比那段）的名牌离台词 2.1–2.2 个字高（63–67 px，名牌 30 px），
+原来的 2.0 下匹配器收不进这些名牌、tracks 里 40 块有 21 块挂不上（3.0 时 3 块）。
+从 2.0 放到 3.0：匹配器 11 段（四场整场、《魔裁》f1–f5、gi-s2、zzz-s2）的记录、选项和名牌以外的条目逐条不变，默认画出的名牌多 29 块，
+除一块绝区零聊天面板的「ラミル」都是真名牌（绝区零的铃、哲、比利）；多收进来的界面字归 `stray_name`、默认不画。"""
+
+
+def name_over_body(nb: list[float], bb: list[float]) -> bool:
+    """名牌（框 `nb`）挂在这行正文（框 `bb`）上：正文在名牌中线以下、上沿离名牌下沿不超过 `NAME_GAP` 个字高，
+    左右有重叠或左边缘相距不超过两个字高（居中的名牌、左对齐的名牌都算）。
+    只看几何、不看名字（不为单个病例加特判）；并排一行的角色列表、离得远的键位和菜单标题对不上这个形状。
+    匹配器认开头行时比同一条 cue 里的事件、给名牌分组（`scriptmatch.name_roles`）时比叠加块的首行；阶段 3 给 tracks 的名牌分档（`output.script.mark_names`）时比主轨的句条目。"""
+    h = max(1, nb[3] - nb[1])
+    if not (bb[1] >= (nb[1] + nb[3]) / 2 and bb[1] - nb[3] <= NAME_GAP * h):
+        return False
+    return min(nb[2], bb[2]) - max(nb[0], bb[0]) > 0 or abs(nb[0] - bb[0]) <= 2 * h
+
+
+def block_head(rows: list[list[float]], top: list[float] | None = None) -> list[float]:
+    """一块台词给名牌比的那一行（`name_over_body` 的 `bb`）：上下取 `top`（默认首行），左右取整块所有行的范围。
+    左右只看首行会漏：绝区零的台词左对齐、名牌居中，首行短（「こんばんは、リンちゃん。」「じゃあまた。」）时首行够不到名牌正下方，
+    2026-11-05 整场 15 块真名牌这样没挂上；按整块比，四场整场、《魔裁》、gi-s2、zzz-s2 没有多挂上有译文的界面字。"""
+    top = rows[0] if top is None else top
+    return [min(r[0] for r in rows), top[1], max(r[2] for r in rows), top[3]]
+
+
+def rows_below(rows: list[list[float]], top: list[float]) -> list[list[float]]:
+    """`rows` 里从 `top`（`rows` 里的一行）往下连着排的几行，含 `top`：下一行的上沿离已收那几行的下沿不超过一个 `top` 的字高、
+    左右和已收的范围有重叠。给还没成块的一堆行（匹配器认开头行时同一条 cue 的事件）凑出 `top` 所在的那块台词，再交 `block_head`——
+    整条 cue 的范围会把同屏右下角的按钮、水印也算进台词块的左右。"""
+    h = max(1.0, top[3] - top[1])
+    got, x0, x1, y1 = [top], top[0], top[2], top[3]
+    for r in sorted((r for r in rows if r is not top and r[1] > top[1]), key=lambda r: r[1]):
+        if r[1] - y1 > h:
+            break
+        if r[1] >= y1 - 0.5 * h and min(x1, r[2]) - max(x0, r[0]) > 0:
+            got.append(r)
+            x0, x1, y1 = min(x0, r[0]), max(x1, r[2]), max(y1, r[3])
+    return got
+
+
+NAME_INERTIA_US = 2_000_000
+"""同一块名牌前后两次出现隔不超过这么久（μs）就连成一串（`plate_runs`）：换下一句台词、OCR 漏读一两帧时名牌会断开一下。
+2026-11-05 在 11 段匹配产物上量：2 s 把星铁 3 块（姬子、丹恒：下面的台词被认成对话记录面板里的旧行，或没认上）、绝区零 1 块
+（名牌比台词早出现半秒）挂回来，没有多挂上有译文的界面字；放到 5 s 只再多 2 块半秒的。"""
+
+
+def same_plate(a: list[float], b: list[float]) -> bool:
+    """两个名牌框是同一处：中心横向差不超过一个字高、上沿差不超过半个字高（字高取小的那个）。"""
+    h = max(1.0, min(a[3] - a[1], b[3] - b[1]))
+    return abs((a[0] + a[2]) - (b[0] + b[2])) / 2 <= h and abs(a[1] - b[1]) <= 0.5 * h
+
+
+def plate_runs(items: list[tuple[int, int, list[float], str]], gap_us: int = NAME_INERTIA_US) -> list[int]:
+    """名牌块按"是不是同一块名牌的几次出现"连成串：`items[i]` = (起, 止, 框, 名字)，名字相同（有译名用译名，没有用归一后的读数）、
+    同一处（`same_plate`，和串里上一块比）、和串里最晚的终点隔不超过 `gap_us` 的归一串。返回每块所在串的编号（串里最早那块的下标）。
+    给名牌分档的时间惯性用（`spread`）：一串里有一块挂在台词上，整串都是那块名牌。"""
+    rid = list(range(len(items)))
+    by: dict[str, list[int]] = {}
+    for i, it in enumerate(items):
+        by.setdefault(it[3], []).append(i)
+    for ids in by.values():
+        open_: list[list] = []                       # [串编号, 上一块的框, 最晚的终点]
+        for i in sorted(ids, key=lambda i: (items[i][0], i)):
+            s, e, box, _ = items[i]
+            open_ = [o for o in open_ if s - o[2] <= gap_us]          # 按起点扫：断开太久的串不会再接上
+            run = next((o for o in open_ if same_plate(o[1], box)), None)
+            if run is None:
+                open_.append([i, box, e])
+            else:
+                rid[i] = run[0]
+                run[1], run[2] = box, max(run[2], e)
+    return rid
+
+
+def spread(flags: list[bool], runs: list[int]) -> list[bool]:
+    """一串（`plate_runs`）里有一块为真，整串都为真。"""
+    good = {runs[i] for i, f in enumerate(flags) if f}
+    return [f or runs[i] in good for i, f in enumerate(flags)]
+
+
+STACK_GAP = 0.5
+"""名牌和称号上下相邻的判据：两框竖直方向的空隙（叠了为负）在称号框高的 ±这么多倍以内（原神真名牌在 −0.22–0.36）。"""
+STACK_SMALLER = 0.9
+"""称号的框高不超过名字框高的这么多倍：称号的字比名字小一档（原神 0.42–0.86，一例 0.97 是名字框偏矮）。
+被误标成名牌的 UI 上下两行多是同一字号（星铁菜单「固有名詞」「37/37」0.97、日志面板「選択肢」「姫子」0.91），靠这条挡住。"""
+
+
+def stacked_on(b, c) -> bool:
+    """框 `b` 是叠在框 `c` 上面或下面的小一号的字（称号对名字）：竖直上紧挨着（`STACK_GAP`）、字明显比 `c` 小（`STACK_SMALLER`）、
+    两框的中心互相落在对方框里。不看上下：原神的称号在名字下面，判据不靠这个。"""
+    h = b[3] - b[1]
+    gap = max(b[1] - c[3], c[1] - b[3])
+    a = (c[0] + c[2]) / 2
+    return (h <= STACK_SMALLER * (c[3] - c[1]) and abs(gap) <= STACK_GAP * h
+            and b[0] <= a <= b[2] and c[0] <= (b[0] + b[2]) / 2 <= c[2])
+
+
+def stack_partners(items: list[tuple[int, int, list[float]] | None]) -> list[int | None]:
+    """名牌下面的称号认它的名字：`items[i]` = (起, 止, 框)，不参加的给 None。一条在时间上和它重叠、`stacked_on` 成立的条目里取重叠最久的
+    （一样久取下标小的），返回它的下标；找不到、或不参加是 None。字大的那块（名字）自己没有伙伴。
+    匹配器给名牌分名字 / 称号（`scriptmatch.name_roles`）、阶段 3 给 tracks 分称号（`output.script.mark_names`）、阶段 3 / 4 让称号跟名字共用锚轴（`output.layout.stacked_axes`）都用这一份。
+    按起点扫、只和同时在屏的比，整场几千块名牌也是线性的量级。"""
+    out: list[int | None] = [None] * len(items)
+    best = [0] * len(items)
+    active: list[int] = []
+    for i in sorted((i for i, it in enumerate(items) if it is not None), key=lambda i: (items[i][0], i)):
+        s, e, b = items[i]
+        active = [j for j in active if items[j][1] > s]
+        for j in active:
+            ov = min(e, items[j][1]) - s
+            for x, y in ((i, j), (j, i)):
+                if (ov > best[x] or ov == best[x] and out[x] is not None and y < out[x]) and stacked_on(items[x][2], items[y][2]):
+                    best[x], out[x] = ov, y
+        active.append(i)
+    return out
 
 
 class EventIndex:

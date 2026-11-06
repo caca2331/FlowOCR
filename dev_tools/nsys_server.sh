@@ -22,9 +22,7 @@ OUT=$1; TAG=$2; VIDEO=$3; shift 3
 # nsys_report.py 按 CUDA EP 的核名分 det / rec：没显式给 --backend 时固定走 CUDA EP（装了 TensorRT 时 auto 会走 TRT）
 case " $* " in *" --backend "*|*" --backend="*) ;; *) set -- --backend cuda "$@" ;; esac
 CODE=$(cd "$(dirname "$0")/.." && pwd)
-PY="$CODE/.venv/Scripts/python.exe"
-[ -x "$PY" ] || PY="$CODE/.venv/bin/python"
-export PYTHONPATH="$(cd "$CODE" && (pwd -W 2>/dev/null || pwd))/src"   # 槽里的 .venv 若是指回主 checkout 的 junction，editable 安装会导回主 checkout 的代码
+source "$CODE/dev_tools/pyenv.sh"   # PY = pyrun.py 挑的解释器（槽里没有 .venv 就用主 checkout 的），PYTHONPATH 钉到 $CODE/src
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 win() { cygpath -m "$1" 2>/dev/null || echo "$1"; }

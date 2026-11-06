@@ -116,7 +116,7 @@ jobs:
           $LASTEXITCODE = 0
           if ($out -notmatch '没装推理后端') { throw "不带 extra 时没打出选 extra 的提示：`n$out" }
 
-      - name: "[cpu] 装：三步冒烟"
+      - name: "[cpu] 装：流程冒烟"
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
@@ -126,7 +126,13 @@ jobs:
           tmp\v-cpu\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-cpu
           if ($LASTEXITCODE) { throw "冒烟失败" }
 
-      - name: 模型包离线装：不联网跑第 1 步
+      - name: 预取离线修补用的 LaMa（不进发布模型包）
+        shell: pwsh
+        env:
+          FLOWOCR_MODELS: ${{ github.workspace }}\tmp\offline-models
+        run: tmp\v-cpu\Scripts\flowocr-models.exe fetch lama
+
+      - name: 离线冒烟：安装 OCR 模型包并跑短段 inpainting
         shell: pwsh
         env:
           VERSION: ${{ steps.check.outputs.version }}
@@ -137,7 +143,7 @@ jobs:
           New-Item -ItemType Directory -Force $env:FLOWOCR_MODELS | Out-Null
           tmp\v-cpu\Scripts\flowocr-models.exe install "dist\flowocr-models-$($env:VERSION).zip"
           if ($LASTEXITCODE) { throw "装模型包失败" }
-          tmp\v-cpu\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-offline
+          tmp\v-cpu\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-offline --inpaint
           if ($LASTEXITCODE) { throw "离线冒烟失败" }
 
       - name: 附件恰好是 wheel、sdist、模型包

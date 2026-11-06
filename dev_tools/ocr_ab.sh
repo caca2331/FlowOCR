@@ -24,9 +24,7 @@
 # **跑着的时候不要改 dev_tools/ 与 explore/ 目录，也不要提交**（开发指南「长任务的纪律」：产物会记两个 git_head）。
 set -uo pipefail
 CODE=$(cd "$(dirname "$0")/.." && pwd)
-PY="$CODE/.venv/Scripts/python.exe"   # 正式包的开发 venv（uv sync --extra nvidia --group dev）：跑的就是 $CODE/src
-export PYTHONPATH="$(cd "$CODE" && (pwd -W 2>/dev/null || pwd))/src"   # 跑的一定是 $CODE/src：槽里的 .venv 若是指回主 checkout 的 junction，editable 安装会导回主 checkout 的代码
-[ -x "$PY" ] || { echo "没有 $PY：先在 $CODE 里 uv sync --frozen --extra nvidia --group dev" >&2; exit 2; }
+source "$CODE/dev_tools/pyenv.sh"   # PY = pyrun.py 挑的解释器（槽里没有 .venv 就用主 checkout 的），PYTHONPATH 钉到 $CODE/src
 cd "$("$PY" -m flowocr.paths)"
 source "$CODE/explore/env.sh"
 

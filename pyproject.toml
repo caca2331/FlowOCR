@@ -13,12 +13,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowocr"
-version = "0.2.0"
+version = "0.3.0"
 description = "从视频里抽全部屏幕文字、带起止时间、按区域聚类，导出 SRT / ASS"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "GPL-3.0-or-later"
-license-files = ["LICENSE", "LICENSES/*"]   # 本项目的 GPL 与第三方模型（PP-OCRv6，Apache-2.0）的许可与改动说明，随 wheel / sdist 走
+license-files = ["LICENSE", "LICENSES/*"]   # 本项目的 GPL 与第三方模型（PP-OCRv6、LaMa，Apache-2.0）的许可与改动说明，随 wheel / sdist 走
 authors = [{ name = "caca2331" }]
 keywords = ["ocr", "subtitle", "video", "srt", "ass", "onnxruntime"]
 classifiers = [
@@ -78,6 +78,7 @@ flowocr-match = "flowocr.analyze.match:main"        # 通用匹配入口（内�
 flowocr-export = "flowocr.output.export:main"
 flowocr-render = "flowocr.output.render:main"
 flowocr-typeset = "flowocr.typeset.__main__:main"     # 阶段 4：字幕稿 -> 最终叠加 ASS
+flowocr-burn = "flowocr.burn.__main__:main"           # 阶段 5：叠加 ASS 烧进视频（底板 / inpainting）
 flowocr-paths = "flowocr.paths:main"
 flowocr-models = "flowocr.models:main"      # 取官方 ONNX 模型（缺了管线也会自己取；离线机器先在联网处取好）
 flowocr-trt = "flowocr.trt:main"            # 装 / 查 / 删 TensorRT 后端的库和引擎缓存（可选后端，不进依赖）

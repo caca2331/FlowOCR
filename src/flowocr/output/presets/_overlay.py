@@ -2,7 +2,7 @@
 
 | 预设 | 阶段 3（留哪些：tracks / matched） | 阶段 4（长什么样） |
 | --- | --- | --- |
-| `default` | `keep=main`：主轨 + 名牌轨 / 匹配器声明的默认可见组（显示协议） | `default`：底板颜色取自画面（读源视频），取不到样的 α 0x20 近黑 |
+| `default` | `keep=main`：主轨 + 名牌轨 / 匹配器声明的默认可见组（显示协议） | `default`：近黑底板 α 0x20（`plate_color=on` 时颜色取自画面） |
 | `default_all` | `keep=all`：全部区域轨 / `show=all`：全部组加填位（含 `unmatched` / `unfed` 的 OCR 原文） | `default` |
 | `dev` | 同 `default_all`，另写 `why` | `dev`：底板 α 0x80、UI 黄字、非主轨浅蓝、区域号 |
 

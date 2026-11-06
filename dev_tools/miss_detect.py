@@ -320,7 +320,7 @@ class GametextAdapter:
 class NaniFeed(Feed):
     """naninovel 的喂法：只喂主轨导出了的 cue（`naninovel.main_cues`），记录的 `cues` 是它的下标。其余同 `Feed`。"""
 
-    def __init__(self, doc: dict, matched: dict):
+    def __init__(self, doc: dict, matched: dict, script_lines: frozenset[str]):
         pr = matched["provenance"]["params"]
         self.doc = doc
         self.cues, evs_of, _ = NN.main_cues(doc, pr.get("start"), pr.get("end"))
@@ -332,8 +332,8 @@ class NaniFeed(Feed):
             for e in evs:
                 self.fed_cue.setdefault(e["id"], i)
         self.rec_of = {i: r for r in matched["cues"] for i in r["cues"]}
-        # 和叠加层用的同一份开头行（naninovel 调 `overlay_items` 时不带剧本）
-        self.heads = GA.head_lines([(c.start, "\n".join(c.lines), "") for c in self.cues])
+        # 和叠加层用的同一份开头行（`script_lines` 是 `naninovel.head_script_lines`，匹配器交给 `overlay_items` 的那份）
+        self.heads = GA.head_lines([(c.start, "\n".join(c.lines), "") for c in self.cues], script_lines)
         self.label = {r["index"]: r.get("label") for r in doc["regions"]}
         # 主轨可能是几块区域并成的聚合轨（`kind == "main"`，《魔裁》），区域轨的 `where` 里没有它：事件在主轨哪条 cue 里另记
         self.main_tr = tracksio.main_track(doc) or {"cues": []}
@@ -398,7 +398,7 @@ class NaninovelAdapter:
         # "另一版本"要说话人相同（旁白是 None）：顺序剧本没有按主角分的版本，字相近、说话人不同的是另一个人的另一句
         # （《魔裁》第 5 部漏报：レイア的 `エマくん。` 被ミリア的 `エマちゃん。` 顶掉、エマ的 `ヒロ……ちゃん……。` 被下一句旁白顶掉）
         self.speaker = {x.key: x.speaker for x in script}
-        self.feed = NaniFeed(doc, m)
+        self.feed = NaniFeed(doc, m, NN.head_script_lines(script, names))
         self.names = {GS.cnorm(jp) for jp, _ in names.values()} - {""}
         self.obs_path = resolve((doc.get("provenance") or {})["obs"])
         self._norm = [GS.cnorm(x.jp) for x in script]
@@ -744,7 +744,7 @@ class Detector:
             return "只在屏上一个采样点"
         # 同 `overlay_items` 传给 `choice_items` 的 taken：正文 / 第二条认领 / 译出了的名牌
         used = [it for it in self.items_ev.get(e["id"], ())
-                if it["layer"] in ("body", "extra") or (it["layer"] == "name" and it.get("cn"))]
+                if it["layer"] in ("body", "extra") or (it["layer"] in ("name", "title") and it.get("cn"))]
         if used:
             return f"事件已被别的条目用掉（{used[0]['group']}/{used[0]['layer']}）"
         return "过了各道门、块没出（并段 / 被阅读面板扣掉）"

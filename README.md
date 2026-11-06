@@ -1,7 +1,7 @@
 # flowocr
 
 把视频里**出现过的所有文字**读出来——不只是底部字幕，还有对话框、名牌、画面上的标注——每条带起止时间（精确到帧），
-并按位置自动分成若干条"文字轨"（对白、字幕、界面、水印……）。产物是 SRT，或叠加在原画面上、每条字留在原位的 ASS 字幕。
+并按位置自动分成若干条"文字轨"（对白、字幕、界面、水印……）。产物是 SRT，或叠加在原画面上、每条字留在原位的 ASS 字幕，也能直接烧进视频（可以先把原文抹掉）。
 
 ## 用来做什么
 
@@ -40,6 +40,7 @@ flowocr-render out\v\v-matched.json --preset script # 阶段 3：只写 v-jp-mai
 
 ```powershell
 flowocr-typeset out\v\v-jp-main.script.ass --preset default # 阶段 4：写 v-jp-main.ass
+flowocr-burn out\v\v-jp-main.ass                            # 阶段 5（可选）：烧进视频，写 v-jp-main.mp4；--inpaint 先抹掉原文
 ```
 
 原神 / 绝区零把 `starrail` 换成 `genshin` / `zzz`；没有剧本时省略剧本提取与匹配，用 `flowocr-tracks` 不带匹配参数建轨，再对 `v-tracks.json` 运行阶段 3，字幕稿为 `v-main.script.ass`。

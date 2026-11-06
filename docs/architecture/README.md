@@ -3,12 +3,13 @@
 系统怎么分工、哪些行为必须成立、为什么这样设计。怎么搭环境和跑验证见 [开发指南](../dev-guide/README.md)。
 
 ```text
-视频 ──阶段 1 提取──> obs.jsonl ──阶段 2 分析──> <tag>-tracks.json（一级产物）──阶段 3 输出──> SRT / 字幕稿 ──阶段 4 特效──> 叠加 ASS
-        flowocr.extract              flowocr.analyze（建轨、匹配、回抠）          flowocr.output（导出器、预设）   flowocr.typeset
+视频 ──阶段 1 提取──> obs.jsonl ──阶段 2 分析──> <tag>-tracks.json（一级产物）──阶段 3 输出──> SRT / 字幕稿 ──阶段 4 特效──> 叠加 ASS ──阶段 5 烧录──> 视频
+        flowocr.extract              flowocr.analyze（建轨、匹配、回抠）          flowocr.output（导出器、预设）   flowocr.typeset             flowocr.burn
 ```
 
-四个阶段各写一份产物、各有独立入口：换预设不重跑匹配，换匹配器不重跑提取，改字幕稿不重跑阶段 3。
-阶段 3 的字幕稿是人工编辑层（在 Aegisub 里预览、编辑），阶段 4 只读它、可以反复重跑（[字幕稿](artifacts.md#5-字幕稿阶段-3-写阶段-4-读)）。
+五个阶段各写一份产物、各有独立入口：换预设不重跑匹配，换匹配器不重跑提取，改字幕稿不重跑阶段 3。
+阶段 3 的字幕稿是人工编辑层（在 Aegisub 里预览、编辑），阶段 4 只读它、可以反复重跑（[字幕稿](artifacts.md#5-字幕稿阶段-3-写阶段-4-读)）；
+阶段 5 只读阶段 4 的叠加 ASS 和源视频，人工改过的叠加 ASS 照样能烧。阶段 3 的叠加预设可以 `--burn` 把 3、4、5 连跑。
 匹配器、输出预设、阶段 4 的扩展效果都是用户可写的 Python 模块（`flowocr.extensions`）。
 
 ## 模块与文档
@@ -26,6 +27,7 @@
 | `flowocr.artifacts.tracksio` / `srtio` / `evalkit` | 一级产物与字幕的读写、评测自检 | [artifacts.md](artifacts.md) |
 | `flowocr.output.export` / `script` / `layout` / `render` / `presets/` | 阶段 3：从一级产物投影出 SRT 和字幕稿（预设 `script`；两步连跑的 `default` / `default_all` / `dev`）；`layout` 是阶段 3、4 共用的排版 | [artifacts.md](artifacts.md) |
 | `flowocr.typeset`（`core` / `assfile` / `fx/`） | 阶段 4：字幕稿 -> 最终叠加 ASS（排版 → 元素 → 运动 → 时间效果）、`restore`、扩展效果 | [字幕稿](artifacts.md#5-字幕稿阶段-3-写阶段-4-读)、`examples/fx_minimal.py` |
+| `flowocr.burn`（`pipeline` / `encode` / `plates` / `inpaint` / `lamagraph`） | 阶段 5：叠加 ASS 烧进源视频；底板路线原样烧，inpainting 路线先用 LaMa 修补掉底板盖住的原文 | [烧进视频](#烧进视频阶段-5)、[defaults.md](defaults.md#170-阶段-5-的默认烧录路线编码质量修补两档2026-10-31) |
 | `flowocr.paths` / `provenance` | 代码根 / 数据根的唯一解析入口；git HEAD、`+dirty`、代码指纹 | [开发指南](../dev-guide/README.md#在-worktree-里并行开发)、[验证与报数](../dev-guide/verification.md#追溯产物要能追溯到是哪一版代码产的) |
 
 当前默认值、依据和量过没采纳的在 [defaults.md](defaults.md)。
@@ -41,6 +43,25 @@
 - provenance 已经并进这份 JSON；下游取值用 `python -m flowocr.artifacts.tracksio <tracks.json> main_srt`，别自己 `json.load`。
 
 细节见 [artifacts.md](artifacts.md)。
+
+## 烧进视频（阶段 5）
+
+两条路线：底板路线是一个 ffmpeg 进程（`subtitles` 滤镜原样烧）；inpainting 路线边解码边修补边编码，整片不进内存。下面几条必须成立：
+
+- **只认标抹底板**：要抹的区域只来自 Effect `fo-fx|plate` 的行（[字幕稿](artifacts.md#5-字幕稿阶段-3-写阶段-4-读)的底板的标），每帧取底板矩形（`\move` 按时段插值）与那一刻 `\clip` 的交（跟着打字机展开）。
+  稿里没有标却有 `\p1` 绘图（旧阶段 4 出的）、标着的行不是一整块矩形（取过色）都报错，不静默地什么都不抹。
+- **流式**：解码、编码是两个 ffmpeg 进程，bgr24 原始帧走管道；读、写管道各一个线程，主线程只修补，两头的队列各最多攒 4 帧。
+  显存不随片长涨；内存随片长涨的主要是 ffmpeg 里 libass 的缓存（涨速越来越慢），另有 mp4 索引和音轨按片长匀速涨（每小时约 23 MB）；60 分钟比 10 分钟的峰值多约 10%，11 小时的整片没实测。
+- **色彩不偏**：YUV ↔ RGB 两头按源的色彩矩阵和范围精确转换，输出帧标上同样的色彩信息；源没标的按高 ≥ 720 当 BT.709、否则 BT.601。
+  ffmpeg 默认的转换回到 YUV 时按 BT.601、舍入也粗，BT.709 的源整片每帧偏 1–2 级；改了之后和不经 RGB 的底板路线一样（±0.03 级）。
+  精确要 swscale 的 `accurate_rnd`、`full_chroma_int`、`full_chroma_inp` 三个一起开：只开 `accurate_rnd` 仍偏约 0.65 级，后两个不配它时不起作用；只换矩阵不开这三个，亮度反而偏得更多（−1.6 级）。
+  代价是 CPU：原神 3 分钟 1080p60 整树多约 260 CPU 秒、墙钟多约 6%。换 `zscale`（zimg）精度相同、精确转换多出的 CPU 少约四成（只做往返的 30 s：比默认转换多 30 对 50 CPU 秒），但整条流水线的墙钟没变快，没用。
+- **不留半成品、不碰输入**：先写 `<输出>.part`，成功了再改名；失败或 Ctrl-C 删掉，两个 ffmpeg 进程一并结束。输出就是源视频或 ASS 时报错。
+- **时间基准**：烧一段时解码从起点开始、时间戳从 0 算，烧字幕前加回起点（ASS 的时间是原片的）。前提是源的时间从 0 起（现有素材都是）；
+  不是的话整段烧和烧一段会差那么多，和阶段 1 带前摇的 av1（见[帧身份与解码](#帧身份与解码)）也没对过。
+- **后端**：同阶段 1 的规矩（[TensorRT 后端](defaults.md#160-tensorrt-后端--backend-auto--trt-precision-fp32rec-池-1-个det-profile-上限批-42026-10-16-owner-定trt-后端计划)）但不给开关：
+  装了 TensorRT 走 TRT EP fp16，引擎缓存和阶段 1 的放在一起（`flowocr-trt remove` 一并删）；没装走 CUDA EP fp32（显存池上限 2 GiB）并提示；没有 GPU 走 CPU。
+  fp16 出 NaN 的窗按需建 fp32 会话重算；各后端都数出 NaN 的窗，有就写在结尾那行。
 
 ## 帧身份与解码
 

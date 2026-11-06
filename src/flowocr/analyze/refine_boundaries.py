@@ -128,6 +128,7 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
                     ov = edge_refine.overlap_match(box, rb_)
                     if ov and ov > j.get("ev_off_ov", 0.0):
                         j["ev_off"], j["ev_off_ov"] = use, ov
+                        j["off_box"] = box             # 最后一次观测的真实框（末段在动的门用，`moving_at_end`）
                         j["ev_off_salvaged"] = salvage
     got_first = got_last = got_off = 0
     for j in jobs:
@@ -157,6 +158,44 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
         out.update(off_rows_salvaged=n_salvage, jobs_with_off_salvaged=got_salvaged)
     return out
 
+MOVING_END_SHIFT = 0.5
+"""末段在动的门（defaults.md 1.65）：最后一步每个采样间隔平移超过这么多个字高，结尾窗给的、比采样级早的终点就不认。
+贴屏边也按它判：框的一条边离画面边缘不到这么多个字高，就算被屏边裁住。"""
+
+
+def moving_at_end(run: dict, frame_us: int, last_box: list | None = None, frame_size: tuple | None = None) -> bool:
+    """这条 run 到最后一个采样点还在**平移**（弹幕飞、评论墙滚、地图拖动）：最后一步每个采样间隔平移超过 `MOVING_END_SHIFT` 个字高。
+
+    结尾窗的证据（`curve` / `ncc`）量的是**最后那一格框**里的像素：字一移出那格就记成消失，可它还在屏上飞，
+    终点判早（z-shuigong 的弹幕早到 28 帧）。过门的 run 只拒收比采样级早的终点（`apply`），起点照旧回抠。
+    * 最后一步 = 轨迹 `boxes` 的倒数第二点到最后一次观测的框。最后一次观测的框优先用 obs 里那一行的真实框（`last_box`，
+      `refine_from_obs` 认领结尾证据时记下）：build_tracks 收尾补的轨迹点是并集框（最后几票都在 IoU 门里时并进上一框），
+      并集只有一条边在长，看不出平移；没有就退回轨迹的最后一点。轨迹只有 moving 的 run 才有，静止的 run 永远不过这道门。
+    * **判平移、不判形变**：x、y 两轴各看一对对边，两条边同向挪才算平移、取两者里小的那个；一条边贴着屏边（被裁住）时只看另一条。
+      原地淡出、det 把旁边的图标并进来（gi1「シヴァル」）、打字机长宽，都只有一条边在动，不过门。
+      贴屏边的距离和平移门同一个（`MOVING_END_SHIFT` 个字高）：左沿 / 上沿离屏边不到这么近、最后一步只有远端那条边在长的移动 run，会被当成平移；只在过了门的 moving run 上碰得到，没见过实例。
+    * 按两点之间隔了几个采样间隔归一；字高取两框里高的那个（出屏的字框被屏边裁矮）。"""
+    pts = run.get("boxes") or []
+    if len(pts) < 2:
+        return False
+    (t0, a), (t1, b) = pts[-2], pts[-1]
+    if last_box is not None:
+        b = last_box
+    h = max(a[3] - a[1], b[3] - b[1])
+    edge = MOVING_END_SHIFT * h
+    shifts = []
+    for lo, hi, lim in ((0, 2, frame_size[0] if frame_size else None), (1, 3, frame_size[1] if frame_size else None)):
+        d_lo, d_hi = b[lo] - a[lo], b[hi] - a[hi]
+        cut_lo = min(a[lo], b[lo]) <= edge
+        cut_hi = lim is not None and max(a[hi], b[hi]) >= lim - edge
+        if cut_lo != cut_hi:
+            shifts.append(abs(d_hi) if cut_lo else abs(d_lo))
+        else:
+            shifts.append(min(abs(d_lo), abs(d_hi)) if d_lo * d_hi > 0 else 0)
+    steps = max(1, round((t1 - t0) / frame_us))
+    return max(shifts) / steps > edge
+
+
 def apply(job: dict, v_ocr: float | None, v_cell: float | None) -> None:
     """全片解码完再调：首字外推要借全片的打字速度中位数（`v_cell` 来自各条的逐字格斜率），所以融合放在这里。"""
     if "measured" not in job:
@@ -164,6 +203,12 @@ def apply(job: dict, v_ocr: float | None, v_cell: float | None) -> None:
     new_e, ok_gone, sig, last_full, end_how = job.pop("measured")
     run = job["run"]
     old_s, old_e = run["t_start"], run["t_end"]
+    if end_how is not None and new_e < old_e and moving_at_end(run, job["frame_us"], job.get("off_box"), job.get("frame_size")):
+        # 末段在动、结尾窗给的终点比采样级早：字可能只是移出了那一格，终点和完全显示结束都不认，留采样级（`t_end_how = moving`）。
+        # 不早于采样级的照收（`open` 的下界、曲线量出的消失落在采样点之后）：门防的错只会把终点判早。治标，见 `moving_at_end`
+        new_e, ok_gone, last_full, end_how = old_e, False, None, "moving"
+        run["t_end_how"] = end_how
+        job["moving_end"] = True
     est = None
     if sig is not None:
         tfs = run.get("t_full_sampled")
@@ -208,6 +253,7 @@ def apply(job: dict, v_ocr: float | None, v_cell: float | None) -> None:
 
 def attach_ocr(jobs: list[dict], obs_path: Path) -> float | None:
     """把每条 job 打字机窗里的 OCR 观测挂上去（`typewriter_fuse.ocr_points`），返回这段视频的典型打字速度（µs/字）。
+    速度只从正文那几类区域的 job 统计（`job["effect_pool"]`，见 `EFFECT_LABELS`；没有这个键的算）。
     obs 只流式扫一遍：按窗口并集二分，不整份读进内存。"""
     wins = sorted(((j["run"]["t_start"], j["run"].get("t_full_sampled") or j["run"]["t_start"], j) for j in jobs),
                   key=lambda w: w[:2])
@@ -235,12 +281,55 @@ def attach_ocr(jobs: list[dict], obs_path: Path) -> float | None:
         a, b = bisect.bisect_left(ts_sorted, s), bisect.bisect_right(ts_sorted, e)
         cand = [r for t in ts_sorted[a:b] for r in rows[t]]
         j["ocr"] = TF.ocr_points(cand, j["box"], TF.chars(j["run"]["text"]))
-    vs = [v for j in jobs if (v := TF.ocr_slope(j["ocr"], len(TF.chars(j["run"]["text"]))))]
+    vs = [v for j in jobs if j.get("effect_pool", True)
+          and (v := TF.ocr_slope(j["ocr"], len(TF.chars(j["run"]["text"]))))]
     # 样本太少不给（`TF.OCR_SLOPES_MIN` 的来历）：两三句的中位数就是那两三句自己，一句假读数就能把全片速度定歪
     return statistics.median(vs) if len(vs) >= TF.OCR_SLOPES_MIN else None
 
-DEFAULT_LABELS = "subtitle,dialogue-or-caption"
-"""默认只回抠这些标签的区域（CLI `--labels` 的默认值；build_tracks 的 `--refine auto` 用同一个）。"""
+DEFAULT_LABELS = "all"
+"""默认回抠哪些标签的区域：全部（defaults.md 1.65）。时刻是逐条量出来的事实，标题、选项、提示、UI 量到证据就该是帧级；
+2026-10-24 以前只回抠下面两类，那是开视频回抠的年代按条目数付 seek 钱时留下的，现在结算只读 obs 里阶段 1 已经量好的证据。"""
+
+EFFECT_LABELS = frozenset({"subtitle", "dialogue-or-caption"})
+"""整段素材的**文字效果**（`text_effect`：打字机判定、淡出时长）和**典型打字速度**（首字 / 全字外推借的 `v_ocr` / `v_cell`）
+只从这几类区域统计。它们说的是正文怎么出现：淡入的标题、即时出现的 UI 混进来会把判定和速度带偏
+（宣传片合成素材上全部区域一起统计时，离散度 0.2 → 1.0、判定从 typewriter 掉到 likely-typewriter）。"""
+
+
+def text_effect_of(regions_view: list[dict], us_per_frame: float) -> dict:
+    """整段素材的文字效果 `text_effect`（打字机判定 + 淡出时长），只从 `EFFECT_LABELS` 那几类区域里结算过的 run 统计。"""
+    # 打字机是**整段素材的属性**，不是逐条猜出来的。
+    # 判据是"每字生长时间"的离散度：真打字机的速度是常数，分布很紧；
+    # 淡入、场景切换这类杂音测出来的 grow 则四散。
+    effect_regions = [reg for reg in regions_view if reg["label"] in EFFECT_LABELS]
+    rates, grows = [], []
+    for reg in effect_regions:
+        for r in reg["runs"]:
+            n = len(TF.chars(r.get("text", "")))
+            if "grow_ms" in r and n >= 4:
+                rates.append(r["grow_ms"] / n)
+                grows.append(r["grow_ms"])
+    effect = {"samples": len(rates)}
+    if len(rates) >= 8:
+        rates.sort()
+        q1, med, q3 = (rates[len(rates)//4], statistics.median(rates), rates[3*len(rates)//4])
+        spread = (q3 - q1) / med if med > 0 else float("inf")
+        # 分三档而不是二值：owner 说判读不求完美，标出"可能是"就够。
+        # **不设 ms/char 的绝对下限**（owner 2026-09-04）；唯一的物理下限是"生长必须长到视频帧分辨得出来"。
+        med_grow = statistics.median(grows) if grows else 0
+        verdict = ("instant" if med_grow < us_per_frame / 1000 else
+                   "typewriter" if spread <= 0.7 else
+                   "likely-typewriter" if spread <= 1.0 else "instant")
+        effect.update({"ms_per_char_median": round(med, 1), "iqr_over_median": round(spread, 2),
+                       "verdict": verdict})
+    # 淡出：整段素材的属性，和打字机并列记（有 t_full_end 的条目里，完全显示结束到完全消失的中位时长）
+    fades = sorted((r["t_end"] - r["t_full_end"]) / 1000 for reg in effect_regions for r in reg["runs"]
+                   if r.get("t_full_end") is not None and r.get("t_end_how") == "curve")
+    if fades:
+        effect["fade_out_ms_median"] = round(statistics.median(fades), 1)
+        effect["fade_out_ms_p75"] = round(fades[3 * len(fades) // 4], 1)
+        effect["fade_out_samples"] = len(fades)
+    return effect
 
 
 def obs_evidence(obs_path: Path) -> tuple[dict, bool]:
@@ -288,7 +377,8 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
     print(f"  [时钟] {len(clock)} 个 pts 锚点"
           + ("（帧号 × 1/src_fps，旧时间轴）" if not len(clock) else
              f"；不锚的话首尾差 {(clock.t_of(clock.f[-1]) - clock.f[-1] * us_per_frame) / 1000:+.1f} ms"), flush=True)
-    jobs = [make_job(run, frame_us, us_per_frame, clock)
+    jobs = [dict(make_job(run, frame_us, us_per_frame, clock), effect_pool=region["label"] in EFFECT_LABELS,
+                 frame_size=tuple(data["size"]) if data.get("size") else None)
             for region in regions_view
             if (only is None or region["index"] in only)
             and (only is not None or want is None or region["label"] in want)
@@ -325,7 +415,7 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
         refine_sequential(video, jobs, thr, progress_every)
     # 打字速度：OCR 中途读数拟得出来就用它；拟不出来（魔裁：打字快，中途读数都只有一个）
     # 借逐字格直线斜率的全片中位数——**只给首字外推用**，借给全字外推在淡入字体上系统性偏晚
-    speeds = [v for j in jobs if (v := TF.cell_speed(j["measured"][2] if "measured" in j else None))]
+    speeds = [v for j in jobs if j.get("effect_pool", True) and (v := TF.cell_speed(j["measured"][2] if "measured" in j else None))]
     v_cell = statistics.median(speeds) if speeds else None
     for j in jobs:
         apply(j, v_ocr, v_cell)
@@ -340,52 +430,25 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
         how[f"首字 {h['first']}" if h else "首字 未量"] += 1
         how[f"全字 {h['full']}" if h else "全字 未量"] += 1
         how[f"消失 {j['run'].get('t_end_how', '未量')}"] += 1     # open = 窗里没看到消失，t_end 只是下界
+    # 末段在动、终点留采样级的（`t_end_how = moving`）另数：起点也没量到的那些不算回抠成功，上面的 `how` 数不到
+    n_moving_end = sum(1 for j in jobs if j.get("moving_end"))
 
-    # 打字机是**整段素材的属性**，不是逐条猜出来的。
-    # 判据是"每字生长时间"的离散度：真打字机的速度是常数，分布很紧；
-    # 淡入、场景切换这类杂音测出来的 grow 则四散。
-    rates, grows = [], []
-    for reg in regions_view:
-        for r in reg["runs"]:
-            n = len(TF.chars(r.get("text", "")))
-            if "grow_ms" in r and n >= 4:
-                rates.append(r["grow_ms"] / n)
-                grows.append(r["grow_ms"])
-    effect = {"samples": len(rates)}
-    if len(rates) >= 8:
-        rates.sort()
-        q1, med, q3 = (rates[len(rates)//4], statistics.median(rates), rates[3*len(rates)//4])
-        spread = (q3 - q1) / med if med > 0 else float("inf")
-        # 分三档而不是二值：owner 说判读不求完美，标出"可能是"就够。
-        # **不设 ms/char 的绝对下限**（owner 2026-09-04）；唯一的物理下限是"生长必须长到视频帧分辨得出来"。
-        med_grow = statistics.median(grows) if grows else 0
-        verdict = ("instant" if med_grow < us_per_frame / 1000 else
-                   "typewriter" if spread <= 0.7 else
-                   "likely-typewriter" if spread <= 1.0 else "instant")
-        effect.update({"ms_per_char_median": round(med, 1), "iqr_over_median": round(spread, 2),
-                       "verdict": verdict})
-    # 淡出：整段素材的属性，和打字机并列记（有 t_full_end 的条目里，完全显示结束到完全消失的中位时长）
-    fades = sorted((r["t_end"] - r["t_full_end"]) / 1000 for reg in regions_view for r in reg["runs"]
-                   if r.get("t_full_end") is not None and r.get("t_end_how") == "curve")
-    if fades:
-        effect["fade_out_ms_median"] = round(statistics.median(fades), 1)
-        effect["fade_out_ms_p75"] = round(fades[3 * len(fades) // 4], 1)
-        effect["fade_out_samples"] = len(fades)
-    data["text_effect"] = effect
+    data["text_effect"] = text_effect_of(regions_view, us_per_frame)
     mean_start = sum(start_shifts) / len(start_shifts) if start_shifts else 0.0
     mean_end = sum(end_shifts) / len(end_shifts) if end_shifts else 0.0
     data["boundary_refined"] = {"thr": thr, "labels": labels, "regions": regions or "all",
                                 "typewriter": "fuse", "code_fp": bt.code_fp(CODE_FP_FILES),
                                 "decoder": decoder, "step": step, "scale": scale,
                                 **({"evidence": evidence} if decoder == "obs" else {}),
-                                "runs": n_runs, "moved": n_moved, "how": dict(how),
+                                "runs": n_runs, "moved": n_moved, "how": dict(how), "end_moving": n_moving_end,
                                 # 起点/终点分开报，别再合成一个"平均移动"
                                 "mean_start_shift_s": round(mean_start, 4),
                                 "mean_end_shift_s": round(mean_end, 4)}
     # 回抠**只更新时间**：cue 的首尾按成员重算，切分本身一个字不动（audit-4 C6）。
     # 起点口径（first / full）**不写进 JSON**，交给导出器投影——写回去就切不回来了
     tracksio.refresh_cue_bounds(data, before)
-    return {"runs": n_runs, "moved": n_moved, "mean_start": mean_start, "mean_end": mean_end, "how": dict(how)}
+    return {"runs": n_runs, "moved": n_moved, "mean_start": mean_start, "mean_end": mean_end, "how": dict(how),
+            "end_moving": n_moving_end}
 
 
 def refine_code_changed(doc: dict) -> str | None:
@@ -406,6 +469,8 @@ def summary_lines(tag: str, st: dict, data: dict, fps: float, decoder: str) -> l
            f"（{fps:.0f} fps，采样间隔 {data['frame_us']/1e6:.2f}s，{decoder}）"]
     if st["how"]:
         out.append("   首字 / 全字 / 消失从哪来：" + "、".join(f"{k} {v}" for k, v in sorted(st["how"].items())))
+    if st.get("end_moving"):
+        out.append(f"   末段在动、终点留采样级（t_end_how = moving）：{st['end_moving']} 条")
     eff = data["text_effect"]
     if "verdict" in eff:
         out.append(f"   文字效果：**{eff['verdict']}** —— 每字生长 {eff['ms_per_char_median']} ms/char，"

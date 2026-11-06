@@ -1,4 +1,4 @@
-"""共享层的自检测试。`.venv/Scripts/python.exe tests/test_guards.py` 直接跑，不依赖 pytest（用项目的 venv：系统 python 的依赖版本不同会带出假报错）。
+"""共享层的自检测试。`python dev_tools/pyrun.py tests/test_guards.py` 直接跑，不依赖 pytest（pyrun 挑的是项目的 venv：系统 python 的依赖版本不同会带出假报错）。
 
 为什么有这个文件（methodology-audit 报告建议 2 / 4）：
 项目此前**一行自动化验证都没有**，所有等价性检查都是手搓的一次性脚本，跑完就散。
@@ -17,10 +17,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from guards import analyze, extract, gametext, infra, output  # noqa: E402
+from guards import analyze, burn, extract, gametext, infra, output  # noqa: E402
 from guards._common import FAILED  # noqa: E402
 
-MODULES = (infra, extract, analyze, gametext, output)
+MODULES = (infra, extract, analyze, gametext, output, burn)
 
 
 def main() -> int:

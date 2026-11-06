@@ -13,7 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", default="", help="默认 x.script.ass -> x.ass，其余 x.ass -> x.fx.ass；--restore 时 -> x.script.ass")
     ap.add_argument("--preset", default="default", choices=list(core.LOOKS), help="长什么样")
     ap.add_argument("--opt", action="append", default=[], metavar="K=V",
-                    help="plate（box / rows / text）、plate_alpha（如 0x20，只管近黑底板）、plate_color（on / off：底板颜色取自画面，要读源视频）、"
+                    help="plate（box / rows / text / src）、plate_alpha（如 0x20，只管近黑底板）、plate_color（on / off：底板颜色取自画面，要读源视频）、"
                          "typewriter（on / dim / off）、fade（on / off）、unknown（error / ignore：不认识的 fo 参数）")
     ap.add_argument("--video", default="", help="底板取色读的源视频（默认按字幕稿 [Script Info] 的 FlowOCR Video）")
     ap.add_argument("--fx", action="append", default=[], metavar="模块",

@@ -129,7 +129,9 @@ KNOWN_VALUES = {
         "RobotAbyssalNarrate", "RobotAbyssalNarrateBroken", "CommonSpecialReminderNormal",
         "MarionetteTeaTimeReminder", "RankedMatchFeverReminder", "PenumbraTarget", "PenumbraInfo",
         "CommonSpecialReminderWarning", "RobotAbyssalWarning", "VarkaReminderLocked", "SneakLEReminder",
-        "NarrationChat", "RedBanner"}),
+        "NarrationChat", "RedBanner", "CombatChatWithName", "ClueDecryptionChat",
+        "CryoDragonReminder", "ClueDecryptionLocationDiscuss", "ClueDecryptionLocationConfirm",
+        "ClueDecryptionLocationWrong", "RankedMatchLevelChallengeBanner"}),
     "starrail.events[].kind": frozenset({"talk", "option", "trigger", "wait"}),
     # 绝区零不在这里：散条目按 `head` 分类，`head` 在契约里是自由取值（种类上千）；`loose.reason` 这里不读
 }

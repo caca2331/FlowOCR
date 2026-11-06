@@ -44,6 +44,8 @@ class Model:
     files: dict[str, str] = field(default_factory=dict)
     """文件名 -> sha256。下载完逐个核，对不上就删掉、报错。"""
     fuse_argmax: bool = False
+    main: str = "inference.onnx"
+    """`files` 里管线要加载（或从它派生）的那个 ONNX。"""
 
     @property
     def dir(self) -> Path:
@@ -53,7 +55,7 @@ class Model:
     def onnx(self) -> Path:
         """管线真正加载的那个文件。派生图的文件名带融合做法的版本（`FUSE_VERSION`）：几个 worktree / 分支共用一个模型根，
         做法不同的代码各用各的文件，不会互相把对方的派生图判成过期、来回重做。"""
-        return self.dir / (f"inference_argmax{FUSE_VERSION}.onnx" if self.fuse_argmax else "inference.onnx")
+        return self.dir / (f"inference_argmax{FUSE_VERSION}.onnx" if self.fuse_argmax else self.main)
 
 
 MODELS = {
@@ -86,6 +88,13 @@ MODELS.update({
 })
 """按语言另下的 rec（2026-10-05 取的提交号；onnx 的 sha256 是 Hugging Face 上 LFS 记的 oid，yml 是取下来时算的）。
 俄语用 `eslav`（俄 / 乌 / 白）不用 `cyrillic`（字表大一倍、覆盖更多语言，俄语用不上）。许可都是 Apache-2.0（模型卡）。"""
+
+MODELS["lama"] = Model("Carve/LaMa-ONNX", "c3c0c9e468934d62e79c329e35d82dd09ff8c444", {
+    "lama_fp32.onnx": "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6",
+}, main="lama_fp32.onnx")
+"""阶段 5 inpainting 用的 LaMa（big-lama，512×512 输入）。**"全用官方发布的"的例外**（owner 2026-10-31："就用 Hugging Face 上的就好"）：
+上游（advimman/lama）只发 PyTorch 权重，这份是 Carve 转的 ONNX（Apache-2.0，模型卡说傅里叶单元换了自己的写法、结果和原模型相同）。
+sha256 是 Hugging Face 上 LFS 记的 oid。阶段 5 第一次用时才取；派生图（折叠、扁窗、激活缩放）由 `flowocr.burn.lamagraph` 做。"""
 
 LANG_REC = {"zh": "rec", "ko": "rec-ko", "ru": "rec-ru", "th": "rec-th"}
 """`--ocr-lang` -> 用哪个 rec。`zh` 是默认模型（覆盖简中、繁中、英、日、德、法、西、葡、意、土、印尼）。"""
@@ -212,7 +221,7 @@ def _src_mark(m: Model) -> Path:
 
 def _mark_text(m: Model) -> str:
     """来源标记的内容：源文件的 sha256 + 融合做法的版本（`FUSE_VERSION`）。没有版本的旧标记对不上，于是重做。"""
-    return f"{m.files['inference.onnx']} fuse{FUSE_VERSION}"
+    return f"{m.files[m.main]} fuse{FUSE_VERSION}"
 
 
 def derived_stale(m: Model) -> bool:
@@ -235,7 +244,7 @@ def ensure(m: Model) -> Path:
             continue
         _download(f"{base}/{m.repo}/resolve/{m.rev}/{fn}", p, want)
     if derived_stale(m):
-        fuse_argmax(m.dir / "inference.onnx", m.onnx, mark=_src_mark(m), want=_mark_text(m))
+        fuse_argmax(m.dir / m.main, m.onnx, mark=_src_mark(m), want=_mark_text(m))
         print(f"[模型] {m.onnx.name}：融进 argmax（{m.onnx.stat().st_size / 2**20:.1f} MB）", flush=True)
     return m.onnx
 
@@ -289,8 +298,10 @@ def path(name: str) -> str:
     try:
         _ready[name] = str(ensure(m))
     except Exception as exc:
+        offline = ("或用 GitHub Release 上的模型包 `flowocr-models install`" if name in DEFAULT
+                   else f"离线使用时把联网机器模型根下的 {m.dir.name}/ 拷进本机模型根")
         raise RuntimeError(f"默认 {name} 模型不在（或核不上）{m.onnx}，自动下载失败：{exc}。"
-                           f"联网后跑 `flowocr-models fetch {name}`（镜像用 HF_ENDPOINT），或用 GitHub Release 上的模型包 `flowocr-models install`") from exc
+                           f"联网后跑 `flowocr-models fetch {name}`（镜像用 HF_ENDPOINT）；{offline}") from exc
     return _ready[name]
 
 

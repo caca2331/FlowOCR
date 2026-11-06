@@ -21,11 +21,11 @@
    每条局部认不上的 cue 都要和三万行逐条比，非主轨喂入时慢到跑不动。
 6. **说话人**：每条剧本行带 `speaker` / `speaker_cn`（字段名同 `gamescript` 的剧本行），由行上的 `; > Id: |#key|` 与
    `CharacterNames.bytes` 给出；旁白是 None。名牌隐藏成 `？？？` 的行（`Unknown`）若脚本里有 `; > ＠名前` 注记，
-   或 key 的后缀是角色名，记**真正说话的那个人**，否则记 `？？？`。
+   或 key 的后缀是角色名，记**真正说话的那个人**，否则记 `？？？`。叠加层的名牌（主轨里认成开头行的事件）也按这张名字表出译文（`name_table`）。
 7. **时间**：不从剧本合成（原版按 0.02 s/字往前挪起点、把 1 s 内的空档填平，这里都不做）；起点取 cue 里字最早出现的时刻
    （`main_cues`），连续认上同一行、间隔不超过 `MERGE_GAP` 的 cue 并成一条记录（`records`）。
 
-产物（`flowocr-matched/6`）里每条记录：`start` / `end`（秒）、`ocr`（并进来的 cue 里最长的 OCR 原文）、`ref`（认上的剧本行：
+产物（`flowocr-matched/7`）里每条记录：`start` / `end`（秒）、`ocr`（并进来的 cue 里最长的 OCR 原文）、`ref`（认上的剧本行：
 `key` / `kind`（key 的后缀）/ `unit`（脚本文件）/ `jp` / `cn` / `score`（本句相似度）/ `speaker` / `speaker_cn`；没认上是 None）、
 `how`（`exact` / `fuzzy` / `context`：本句不到门、靠后文认上的 / `none`）、`conf`、`via`（`lock` / `local` / `jump`）、
 `cues`（由第几条 cue 组成，下标按 `main_cues` 的顺序）、`n_cues`、`extra`（恒为空：这一作一条 cue 只装一行）、
@@ -35,7 +35,7 @@
 * `cluster_patch(context, options)`：按游戏给建轨的参数覆盖（表是 `PATCHES`，《魔裁》= `game=mocai` 打开按窗并带）。
 * `match(document, context, options)`：`document` 是 `*-tracks.json` 的 dict，喂它的**主轨**；
   `context["script"]` 是剧本目录（含 `*.bytes` 的 `Scripts`），`context["names"]` 是 `CharacterNames.bytes`
-  （不给就找剧本目录的上一级）。返回 `flowocr-matched/6`（`matchedio`）。
+  （不给就找剧本目录的上一级）。返回 `flowocr-matched/7`（`matchedio`）。
   `options`：`start` / `end`（秒，只匹配起点落在这段里的 cue）、`merge_gap`（秒，默认 `MERGE_GAP`）、
   `overlay`（默认开，判叠加层，同 `scriptmatch`）。
 
@@ -115,6 +115,25 @@ def load_names(path: Path | None) -> dict[str, tuple[str, str | None]]:
             out[k.strip()] = (jp, v.strip() or None)
             jp = None
     return out
+
+
+def name_table(names: dict[str, tuple[str, str | None]]) -> dict[str, str]:
+    """名字表投成叠加层名牌的说话人表（`scriptmatch.overlay_items` 的 `speakers`）：日文名（`SA.norm` 归一，名牌事件按同一个归一查）-> 中文名。
+    没有中文名的 id 不收。"""
+    from flowocr.analyze import script_align as SA
+    return {k: cn for jp, cn in names.values() if cn and (k := SA.norm(jp))}
+
+
+def head_script_lines(lines: list[Line], names: dict[str, tuple[str, str | None]]) -> frozenset[str]:
+    """开头行要排掉的剧本台词（`game_align.head_lines` 的 `script_lines`）：字幕带剧本行的 `SA.norm`（同 `GA.band_lines` 的口径，留标点），
+    **角色名表里的名字除外**。叠加层（`match`）和疑似漏字幕判断器（`dev_tools/miss_detect.py`）用这同一份。
+
+    为什么（2026-10-24）：不交这份时，短台词恰好落在两行 cue 的第一行、配过几种末行，就被认成名牌，`default` 叠加在台词上方
+    画它的 OCR 原文（《魔裁》f1–f5 名牌层 226 块里 49 块是 `ええ。`、`ああ。`、`裁判の後。` 这类，defaults.md 1.69）。
+    名字除外：剧本里有一整条台词只是喊了一声名字、恰好和名牌逐字相同时，排掉它就连真名牌一起排掉了。"""
+    from flowocr.analyze import script_align as SA
+    plates = {SA.norm(jp) for jp, _ in names.values()}
+    return frozenset(k for ln in lines if ln.band and (k := SA.norm(ln.jp)) not in plates)
 
 
 def load_script(root: Path, names: dict[str, tuple[str, str | None]] | None = None) -> list[Line]:
@@ -414,7 +433,8 @@ MERGE_GAP = 2.0
 
 CODE_FP_FILES = ("src/flowocr/analyze/matchers/naninovel.py", "src/flowocr/artifacts/matchedio.py",
                  "src/flowocr/artifacts/evalkit.py", "src/flowocr/artifacts/tracksio.py", "src/flowocr/artifacts/srtio.py",
-                 "src/flowocr/textfold.py", "src/flowocr/richtext.py", "src/flowocr/analyze/echo.py")
+                 "src/flowocr/textfold.py", "src/flowocr/richtext.py", "src/flowocr/analyze/echo.py",
+                 "src/flowocr/extract/framegrid.py")
 """本文件 + 它 import 的本地模块（仓库相对路径）；叠加层的判定借 `scriptmatch`，它的那张表在 `match` 里并进来。"""
 
 
@@ -445,7 +465,7 @@ def main_cues(doc: dict, start: float | None = None, end: float | None = None
 DISPLAY = {
     "groups": {
         "dialogue": {"tier": "always", "label": "台词"},
-        "name": {"tier": "on", "label": "名牌"},
+        **matchedio.NAME_GROUPS,
         "unmatched": {"tier": "on", "label": "主轨上没画成译文的文字"},
         "unfed": {"tier": "off", "label": "主轨以外的文字"}},
     "fill": {"tier": "on"}}
@@ -548,11 +568,13 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
     merge_gap = float(o.get("merge_gap", MERGE_GAP))
     recs = records(refs, cues, res, m.cn, merge_gap)
     # 回显判定（`flowocr.analyze.echo`，和 gametext 共用）：只喂主轨，全在主轨上、同一个来源；顺序剧本没有锚点时刻，每行取最早那次出现当主
-    EC.mark(recs, [c.source for c in cues], [True] * len(cues), panel_of, None)
+    EC.mark(recs, [c.source for c in cues], [True] * len(cues), panel_of, None, grid=EC.grid_of(document))
     SM.mark_display(recs, cues, lambda c: "dialogue")
     items = ov_stats = None
     if _flag(o.get("overlay", True)):
-        items, ov_stats = SM.overlay_items(recs, document, evs_of, cues)
+        # 没有 `GA.Ref`：名牌的译名（名字表）和开头行要排掉的剧本台词（`head_script_lines`）由这里交进去
+        items, ov_stats = SM.overlay_items(recs, document, evs_of, cues, speakers=name_table(names),
+                                           script_lines=head_script_lines(lines, names))
     tracks_path = str(context.get("tracks_path") or "")
     prov = document.get("provenance") or {}
     return {"schema": matchedio.SCHEMA,
