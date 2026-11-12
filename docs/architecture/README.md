@@ -21,8 +21,8 @@
 | `flowocr.extract.ort_server` / `ortclient` / `recort` / `recpool` / `fast_det` / `detpost` | ORT 推理服务与 rec 组批；det 的前处理、配置与后处理 | [推理服务](#推理服务) |
 | `flowocr.extract.ocr_args` / `ocr_complete` | 参数解析（唯一一份）与 obs 复用判据 | [obs 复用判据](#obs-复用判据) |
 | `flowocr.analyze.build_tracks` / `uigate` / `nameplate` / `align` | run -> 区域 -> 槽位 -> 轨，常驻 UI 与名牌打标，区域的对齐方式 | [defaults.md](defaults.md)、[已知的坑](../dev-guide/pitfalls.md) |
-| `flowocr.analyze.match` / `scriptmatch` / `matchers/` | 匹配器入口、内置匹配器（`gametext`：游戏文本库；`naninovel`：Naninovel 顺序剧本，游标 + 局部窗 + 全局跳转 + 上下文加权，记剧本行的说话人）、按游戏补丁（`matchers.gametext` 的 `PATCHES` / `cluster_patch`；生效顺序是默认 → 匹配器补丁 → 命令行显式，覆盖了什么会打印并写进 provenance） | [使用手册·匹配原文](../manual/README.md#匹配原文)、`examples/matcher_minimal.py` |
-| `flowocr.analyze.gamescript` / `gtdbundle` / `game_align` | 游戏文本包（`gtd-bundle/1`：一款游戏一个 zip，私下获得，放数据根的 `gametext/`）-> 这段视频的剧本；读包时核两种哈希、剧本与匹配产物记包的内容指纹；用途 2 的尺 | [使用手册·匹配原文](../manual/README.md#匹配原文)（协议全文在 game-text-data 的 `docs/architecture.md` 里「产物包协议（gtd-bundle/1）」一节，每张表字段的含义在那边的内容契约里） |
+| `flowocr.analyze.match` / `scriptmatch` / `matchers/` | 匹配器入口、内置匹配器（`gametext`：游戏文本库；`naninovel`：Naninovel 顺序剧本，游标 + 局部窗 + 全局跳转 + 上下文加权，记剧本行的说话人）、按游戏补丁（`matchers.gametext` 的 `PATCHES` / `cluster_patch`；生效顺序是默认 → 匹配器补丁 → 命令行显式，覆盖了什么会打印并写进 provenance） | [使用手册·对上原文](../manual/matching.md)、`examples/matcher_minimal.py` |
+| `flowocr.analyze.gamescript` / `gtdbundle` / `game_align` | 游戏文本包（`gtd-bundle/1`：一款游戏一个 zip，私下获得，放数据根的 `gametext/`）-> 这段视频的剧本；读包时核两种哈希、剧本与匹配产物记包的内容指纹；用途 2 的尺 | [使用手册·对上原文](../manual/matching.md)（协议全文在 game-text-data 的 `docs/architecture.md` 里「产物包协议（gtd-bundle/1）」一节，每张表字段的含义在那边的内容契约里） |
 | `flowocr.analyze.refine_boundaries` | 打字机首字 / 全字 / 消失的回抠结算（没有命令行入口）：`build_tracks` 默认（`--refine auto`）在建轨末尾用阶段 1 量好的 obs 证据结算；开视频的离线测量只给开发探针 | [defaults.md](defaults.md) |
 | `flowocr.artifacts.tracksio` / `srtio` / `evalkit` | 一级产物与字幕的读写、评测自检 | [artifacts.md](artifacts.md) |
 | `flowocr.output.export` / `script` / `layout` / `render` / `presets/` | 阶段 3：从一级产物投影出 SRT 和字幕稿（预设 `script`；两步连跑的 `default` / `default_all` / `dev`）；`layout` 是阶段 3、4 共用的排版 | [artifacts.md](artifacts.md) |

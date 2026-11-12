@@ -68,10 +68,10 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
               "fuzzy": float(o.get("fuzzy", 0.75)), "merge_gap": float(o.get("merge_gap", SM.MERGE_GAP))}
     res = SM.run_match(ref, tracks_path, params["feed"], params["feed_panel"], params["fuzzy"], params["merge_gap"],
                        overlay=_flag(o.get("overlay", True)), readables=params["readables"],
-                       obs=o.get("obs"), doc=document, events=needs_events(ref))
+                       obs=o.get("obs"), doc=document, events=needs_events(ref), layout=context.get("layout"), viewport=context.get("viewport"))
     st = SM.match_stats(ref, res["recs"], res["suspect_raw"])
     return SM.matched_doc(ref, res["recs"], res["n_raw"], st, str(ref_path), res["subs_path"], res["tp"],
-                          list(context.get("argv") or []), params, res["items"], res["ov_stats"], res["evs"],
+                          list(context.get("argv") or []), params, res["items"], res["ov_stats"], res["evs"], res["textbox"],
                           fills(ref, res["recs"], res["evs"]), res["name_ink"])
 
 
@@ -92,7 +92,7 @@ def fills(ref: GA.Ref, recs: list[dict], evs: list[list[dict]] | None) -> dict:
     那条 cue 里建轨打了 `nameplate` 标记的事件的文字就是玩家起的名字，算一票（gi1 整场带占位的台词只认上 1 句，主角台词的名牌事件 6 个候选、5 票有效）。"""
     lines = {ln["key"]: ln for u in ref.doc["units"] for ln in u["lines"]}
     got = [r for r in recs if r.get("ref") and r["ref"].get("key") in lines]
-    if not any(PH.PLAYER in (lines[r["ref"]["key"]].get(k) or "") for r in got for k in ("cn", "jp_tpl")):
+    if not any(PH.PLAYER in (lines[r["ref"]["key"]].get(k) or "") for r in got for k in ("cn", "en", "jp_tpl")):
         return textjoin_fills(ref, got, lines)
     pairs = [(r["ocr"], lines[r["ref"]["key"]]["jp_tpl"]) for r in got
              if PH.PLAYER in (lines[r["ref"]["key"]].get("jp_tpl") or "") and r.get("ocr")]
@@ -114,7 +114,7 @@ def textjoin_fills(ref: GA.Ref, got: list[dict], lines: dict, nickname: str | No
     否则用默认项。候选各语种不同，记 `by_lang`；自定义的名字只有玩家打的那一串，记 `value`（中文输出也用它）。没有候选（旧包）的不猜。
     候选里嵌着玩家名（`{NICKNAME}`，n=22 的默认项）时换成 `nickname`，读不出就删掉；别的占位删掉。"""
     tjs = ref.doc.get("textjoins") or {}
-    used = sorted({n for r in got for k in ("cn", "jp_tpl", "cn_rich", "jp_rich")      # 带样式的那份：只出现在 Ruby 读音里的
+    used = sorted({n for r in got for k in ("cn", "jp_tpl", "cn_rich", "jp_rich", "en", "en_rich")      # 带样式的那份：只出现在 Ruby 读音里的
                    for n in GS.TEXTJOIN_RE.findall(lines[r["ref"]["key"]].get(k) or "")}, key=int)
     out = {}
     for n in used:
@@ -133,7 +133,7 @@ def textjoin_fills(ref: GA.Ref, got: list[dict], lines: dict, nickname: str | No
         win = top[0] if top and top[0][1] > SHARE * of and (top[0][0][0] == "item" or top[0][1] >= MIN_VOTES) else None
         stat = {"votes": win[1] if win else 0, "of": of, "top": [[list(k), c] for k, c in top]}
         def item(i):
-            return {k: _filled(e[k][i], nickname) for k in ("jp", "cn")}
+            return {k: _filled(e[k][i], nickname) for k in ("jp", "cn", "en") if k in e}
         if win and win[0][0] == "item":
             i = win[0][1]
             out[tag] = {"value": None, "by_lang": item(i),

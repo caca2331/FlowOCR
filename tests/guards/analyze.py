@@ -2141,24 +2141,24 @@ def t_cluster_lines() -> None:
                     (3, [ev(3, [148, 786, 658, 814], 2_267_000, 2_633_000)])]
     segs = SM.position_segments(moved, pcues, 983_000, 2_633_000)
     check("叠加·同一认领的正文换了位置就另起一段、段间空档不画；回到原处也另起；首尾段贴记录的起止",
-          [(a, b, [e["id"] for e in evs]) for evs, _, a, b in segs]
+          [(sg.start, sg.end, [e["id"] for e in sg.evs]) for sg in segs]
           == [(983_000, 1_400_000, [0, 1]), (1_483_000, 1_533_000, [2]), (2_267_000, 2_633_000, [3])],
-          [(a, b) for _, _, a, b in segs])
+          [(sg.start, sg.end) for sg in segs])
     # Codex 复审的反例：每一步和上一步重叠过半，五步之后完全离开首框
     dcues = [srtio.Cue(k * 0.5, k * 0.5 + 0.5, ("x",)) for k in range(5)]
     drift = [(k, [ev(k, [100, 100 + 10 * k, 600, 128 + 10 * k], k * 500_000, k * 500_000 + 500_000)]) for k in range(5)]
     dsegs = SM.position_segments(drift, dcues, 0, 2_500_000)
     check("叠加·慢慢漂的字：段里每条都要和画的那个框同处（只比上一条没有传递性），不许整段钉在首框",
           len(dsegs) > 1 and all(max(SM.box_inside(e["box"], r), SM.box_inside(r, e["box"])) >= SM.SAME_PLACE
-                                 for evs, rows, _, _ in dsegs for e in evs
+                                 for evs, rows, *_ in dsegs for e in evs
                                  for r in [[min(x[0] for x in rows), min(x[1] for x in rows),
                                             max(x[2] for x in rows), max(x[3] for x in rows)]]),
-          [(a_, b_, rows) for _, rows, a_, b_ in dsegs])
+          [(sg.start, sg.end, sg.rows) for sg in dsegs])
     # 画的框因行数变多换掉时，已在段里的也要重核：第三条两行、框下移，首条已不在新框里 -> 第三条另起
     swap = [(0, [ev(0, [100, 100, 600, 128], 0, 500_000)]), (1, [ev(1, [100, 110, 600, 138], 500_000, 1_000_000)]),
             (2, [ev(2, [100, 120, 600, 148], 1_000_000, 1_500_000), ev(3, [100, 150, 600, 178], 1_000_000, 1_500_000)])]
     check("叠加·画的框换成行数更多的那条时，段里已有的也要和新框同处，不同处就另起一段",
-          [[e["id"] for e in evs] for evs, _, _, _ in SM.position_segments(swap, dcues, 0, 1_500_000)] == [[0, 1], [2, 3]])
+          [[e["id"] for e in sg.evs] for sg in SM.position_segments(swap, dcues, 0, 1_500_000)] == [[0, 1], [2, 3]])
     still = {"id": 9, "box": [586, 735, 692, 770], "t_start": 0, "t_end": 9_000_000}
     scroll = {**still, "boxes": [[0, [586, 963, 692, 999]], [500_000, [588, 739, 690, 768]], [1_000_000, [586, 735, 692, 770]],
                                  [1_500_000, [586, 677, 692, 713]], [2_000_000, [586, 663, 692, 713]], [5_000_000, [584, 735, 694, 780]]]}
@@ -2168,5 +2168,5 @@ def t_cluster_lines() -> None:
           == [(0, 500_000), (500_000, 1_500_000), (1_500_000, 5_000_000), (5_000_000, 9_000_000)],
           SM.event_segments(scroll))
     check("叠加·打字机长字（小框落进大框）不切，只有一段时起止就是记录的起止",
-          [(a, b) for _, _, a, b in SM.position_segments(grow + [(2, [])], pcues, 983_000, 1_533_000)]
+          [(sg.start, sg.end) for sg in SM.position_segments(grow + [(2, [])], pcues, 983_000, 1_533_000)]
           == [(983_000, 1_533_000)])

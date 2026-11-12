@@ -1,7 +1,7 @@
 """内置预设：阶段 3 的 SRT——一份轻量、符合直觉、默认对应主轨的 sidecar（owner 2026-10-05：阶段 3、4 的产物以 ASS 为主，
 要 SRT 时用这个预设，不给叠加预设另加开关）。
 
-条目和 `default` 的字幕稿是同一批（`script.build_items`）：一句一条、可见的几行按 SRT 的标准换行分行；名牌、常驻 UI、阅读面板不进
+条目和 `default` 的字幕稿是同一批（`script.build_items`）：一句一条、可见的几行按 SRT 的标准换行分行；名牌、常驻 UI、阅读面板、特殊上屏形式的台词与提示（`Special`）不进
 （`script.srt_blocks`）。matched 的译文出剧本原句。阶段 2 写在 tracks.json 旁边的逐轨 SRT 是分析用的投影，和它不是一回事、也不同名。
 
 options：

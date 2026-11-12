@@ -25,7 +25,7 @@
 7. **时间**：不从剧本合成（原版按 0.02 s/字往前挪起点、把 1 s 内的空档填平，这里都不做）；起点取 cue 里字最早出现的时刻
    （`main_cues`），连续认上同一行、间隔不超过 `MERGE_GAP` 的 cue 并成一条记录（`records`）。
 
-产物（`flowocr-matched/7`）里每条记录：`start` / `end`（秒）、`ocr`（并进来的 cue 里最长的 OCR 原文）、`ref`（认上的剧本行：
+产物（`flowocr-matched/8`）里每条记录：`start` / `end`（秒）、`ocr`（并进来的 cue 里最长的 OCR 原文）、`ref`（认上的剧本行：
 `key` / `kind`（key 的后缀）/ `unit`（脚本文件）/ `jp` / `cn` / `score`（本句相似度）/ `speaker` / `speaker_cn`；没认上是 None）、
 `how`（`exact` / `fuzzy` / `context`：本句不到门、靠后文认上的 / `none`）、`conf`、`via`（`lock` / `local` / `jump`）、
 `cues`（由第几条 cue 组成，下标按 `main_cues` 的顺序）、`n_cues`、`extra`（恒为空：这一作一条 cue 只装一行）、
@@ -35,7 +35,7 @@
 * `cluster_patch(context, options)`：按游戏给建轨的参数覆盖（表是 `PATCHES`，《魔裁》= `game=mocai` 打开按窗并带）。
 * `match(document, context, options)`：`document` 是 `*-tracks.json` 的 dict，喂它的**主轨**；
   `context["script"]` 是剧本目录（含 `*.bytes` 的 `Scripts`），`context["names"]` 是 `CharacterNames.bytes`
-  （不给就找剧本目录的上一级）。返回 `flowocr-matched/7`（`matchedio`）。
+  （不给就找剧本目录的上一级）。返回 `flowocr-matched/8`（`matchedio`）。
   `options`：`start` / `end`（秒，只匹配起点落在这段里的 cue）、`merge_gap`（秒，默认 `MERGE_GAP`）、
   `overlay`（默认开，判叠加层，同 `scriptmatch`）。
 
@@ -549,6 +549,7 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
     from flowocr import provenance as pv
     from flowocr.analyze import echo as EC
     from flowocr.analyze import scriptmatch as SM
+    from flowocr.analyze import textbox as TB
     o = dict(options or {})
     script = context.get("script")
     if not script:
@@ -570,11 +571,13 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
     # 回显判定（`flowocr.analyze.echo`，和 gametext 共用）：只喂主轨，全在主轨上、同一个来源；顺序剧本没有锚点时刻，每行取最早那次出现当主
     EC.mark(recs, [c.source for c in cues], [True] * len(cues), panel_of, None, grid=EC.grid_of(document))
     SM.mark_display(recs, cues, lambda c: "dialogue")
-    items = ov_stats = None
+    items = ov_stats = textbox = None
     if _flag(o.get("overlay", True)):
         # 没有 `GA.Ref`：名牌的译名（名字表）和开头行要排掉的剧本台词（`head_script_lines`）由这里交进去
-        items, ov_stats = SM.overlay_items(recs, document, evs_of, cues, speakers=name_table(names),
-                                           script_lines=head_script_lines(lines, names))
+        items, ov_stats, textbox = SM.overlay_items(recs, document, evs_of, cues, speakers=name_table(names),
+                                           script_lines=head_script_lines(lines, names),
+                                           layout=TB.layout_for(context.get("layout"), context.get("game"),
+                                                                         context.get("viewport") or tracksio.recorded_viewport(document)))
     tracks_path = str(context.get("tracks_path") or "")
     prov = document.get("provenance") or {}
     return {"schema": matchedio.SCHEMA,
@@ -587,4 +590,4 @@ def match(document: dict, context: dict, options: dict | None = None) -> dict:
                       "speaker_names": len(names)},
             "cues": recs,
             "display": DISPLAY,
-            **({"overlay": SM.overlay_doc(items, ov_stats, evs_of)} if items is not None else {})}
+            **({"overlay": SM.overlay_doc(items, ov_stats, evs_of, textbox)} if items is not None else {})}

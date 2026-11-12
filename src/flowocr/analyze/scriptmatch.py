@@ -30,6 +30,7 @@ import unicodedata
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import NamedTuple
 
 from flowocr import paths  # noqa: E402
 from flowocr import placeholders as PH  # noqa: E402
@@ -41,6 +42,7 @@ from flowocr.analyze import echo as EC  # noqa: E402
 from flowocr.analyze import game_align as GA  # noqa: E402
 from flowocr.analyze import nameink as NI  # noqa: E402
 from flowocr.analyze import script_align as SA  # noqa: E402
+from flowocr.analyze import textbox as TB  # noqa: E402
 from flowocr.artifacts import srtio  # noqa: E402
 from flowocr.artifacts import tracksio  # noqa: E402
 
@@ -49,10 +51,13 @@ CODE_FP_FILES = ("src/flowocr/analyze/scriptmatch.py", "src/flowocr/artifacts/ev
                  "src/flowocr/artifacts/matchedio.py", "src/flowocr/placeholders.py",
                  "src/flowocr/analyze/matchers/gametext.py", "src/flowocr/analyze/gamescript.py", "src/flowocr/textfold.py", "src/flowocr/richtext.py",
                  "src/flowocr/analyze/gtdbundle.py", "src/flowocr/paths.py", "src/flowocr/analyze/echo.py",
-                 "src/flowocr/extract/framegrid.py", "src/flowocr/analyze/nameink.py", "src/flowocr/provenance.py")
+                 "src/flowocr/extract/framegrid.py", "src/flowocr/analyze/nameink.py", "src/flowocr/provenance.py",
+                 "src/flowocr/analyze/textbox.py")
 """本文件 + 它 import 的本地模块（同 `build_tracks.CODE_FP_FILES` 的口径，仓库相对路径）。
 再往上的两层各自有指纹、写在 provenance 里：剧本是 `ref_code_fp`（gamescript），轨是 `tracks_code_fp`。
 `gamescript`（连同它 import 的本地模块）也列在这里：匹配时还调 `gamescript.cnorm`（检索归一，依赖 `textfold`），`ref_code_fp` 记的是产剧本那次的代码。"""
+TR_EXTRA = tuple(k for k in matchedio.TEXT_KEYS if k not in ("jp", "cn"))
+"""剧本行除 `jp` / `cn` 外带进认领、选项条目的文本字段（有才带）。"""
 CLI_DESCRIPTION = """把轨的每条 cue 对上剧本原文（带评测口径的报表；通用入口是 flowocr-match）。
 
 对不上的原样留 OCR 文本、标 how: "none"；时间一律取 cue 的。一条 cue 可以带第二条剧本行（extra），
@@ -145,7 +150,7 @@ def match(ref: GA.Ref, cues: list[srtio.Cue], fuzzy: float,
     script = GA.fresh_script(ref)
     subs = [(c.start, "\n".join(c.lines), "") for c in cues]
     st = GA.score(ref, script, subs, fuzzy, [c.end for c in cues], main_of, step)
-    cn = {ln["key"]: {"cn": ln.get("cn"), **{k: ln[k] for k in ("jp_tpl", "jp_rich", "cn_rich") if ln.get(k)}}
+    cn = {ln["key"]: {"cn": ln.get("cn"), **{k: ln[k] for k in TR_EXTRA if ln.get(k)}}
           for u in ref.doc["units"] for ln in u["lines"]}
     unit = {ln["key"]: u["uid"] for u in ref.doc["units"] for ln in u["lines"]}
     sn = [SA.norm(e.text) for e in script]
@@ -458,16 +463,8 @@ def fits_template(q: str, rt: str, tpl: str) -> bool:
 
 
 def rows_of(body: list[dict]) -> list[list[float]]:
-    """正文事件按 cy 分行，每行一个框（行内事件框的并集），从上到下。"""
-    rows: list[list[float]] = []
-    for e in sorted(body, key=lambda e: (e["box"][1] + e["box"][3]) / 2):
-        x0, y0, x1, y1 = e["box"]
-        if rows and (y0 + y1) / 2 - (rows[-1][1] + rows[-1][3]) / 2 <= 0.5 * (y1 - y0):
-            r = rows[-1]
-            rows[-1] = [min(r[0], x0), min(r[1], y0), max(r[2], x1), max(r[3], y1)]
-        else:
-            rows.append([x0, y0, x1, y1])
-    return rows
+    """正文事件按 cy 分行，每行一个框（行内事件框的并集），从上到下（分行的判据在 `textbox.row_groups`，原文整块按同一份分）。"""
+    return [box for box, _ in TB.row_groups(body)]
 
 
 DISPLAY = {
@@ -478,20 +475,26 @@ DISPLAY = {
         "offband": {"tier": "on", "label": "字幕带外的台词（含绝区零的选项按钮、居中旁白）"},
         "cutscene": {"tier": "on", "label": "过场字幕"},
         "narration": {"tier": "on", "label": "黑屏旁白"},
-        "ui": {"tier": "off", "label": "界面文字"},
+        matchedio.SPECIAL: {"tier": "on", "label": "特殊上屏形式的台词与提示（横幅、战斗喊话、白字提示…）"},
+        "ui": {"tier": "off", "label": "界面文字（技能说明、帖子、成就…）"},
         "elsewhere": {"tier": "off", "label": "主轨外别处重现的台词（对话记录面板等）"},
         "panel": {"tier": "off", "label": "阅读面板长文本"},
         "unmatched": {"tier": "off", "label": "喂给了匹配器、没画成译文的文字"},
         "unfed": {"tier": "off", "label": "没交给匹配器的文字"}},
     "fill": {"tier": "on"}}
 """游戏文本包匹配器的显示声明（显示协议，`matchedio._check_display`；owner 2026-10-06 D1 / D4、10-07 确认）：
-台词直接进 default；选项、带外的台词、过场字幕、黑屏旁白、名牌默认进、可关；界面文字、别处重现的台词、没挂在台词上的名牌样文字（`name_roles`，owner 2026-11-05）、
+台词直接进 default；选项、带外的台词、过场字幕、黑屏旁白、特殊上屏形式的台词与提示（`LOOSE_SPECIAL` 那条的说明，owner 2026-11-07）、名牌默认进、可关；界面文字、别处重现的台词、没挂在台词上的名牌样文字（`name_roles`，owner 2026-11-05）、
 阅读面板、没画成译文的文字默认不进、可开。
 `elsewhere` 是选项层那条路（`choice_items`：主轨外、逐字等于剧本行、没被认领）找到的台词——2026-10-07 摆帧多是对话记录面板里的旧行，
 也有短台词撞上界面里的同名字样（`カチーナ！` 对队伍列表的名字）；协议之前它们在 default 里也不画。
 填位（认领了、但 OCR 没读到这句）默认照画。"""
 LOOSE_CUTSCENE = ("Comic", "Cinema")
-"""绝区零散条目里的过场字幕（`role` 是 `head`）：漫画过场、片中字幕。其余散条目是技能说明、帖子、提示这类界面文字。"""
+"""绝区零散条目里的过场字幕（`role` 是 `head`）：漫画过场、片中字幕。"""
+LOOSE_SPECIAL = ("Tips", "MiddleTips")
+"""绝区零散条目里游戏的提示 / 喊话系统出的字（`role` 是 `head`），归 `special`（owner 2026-11-07，special-lines 计划）：
+`Tips` 是野外 / 战斗中的喊话、系统通知、操作教程，`MiddleTips` 是战斗提示横幅，都在画面上方——对应原神语音字幕里 style 不是 `Normal` 的那些
+（`ReminderUI`：横幅、战斗喊话、白字提示、教程式提示，同样归 `special`）。上屏形式特殊，所以用单独的组、字幕稿里单独的样式，默认画、不进 SRT。
+其余散条目（技能说明、帖子、成就、装载提示…）是界面文字。"""
 
 
 def group_of(kind: str, status: str | None, role: str | None) -> str:
@@ -501,8 +504,8 @@ def group_of(kind: str, status: str | None, role: str | None) -> str:
         return "choice"
     if kind == "BlackScreen":
         return "narration"
-    if kind == "ReminderUI":
-        return "ui"
+    if kind == "ReminderUI" or (kind == "Loose" and role in LOOSE_SPECIAL):
+        return matchedio.SPECIAL
     if kind == "Loose":
         return "cutscene" if role in LOOSE_CUTSCENE else "ui"
     if status == "OffBand":
@@ -520,11 +523,11 @@ def mark_display(recs: list[dict], cues: list, group_fn) -> None:
             c["fill"] = not any(SA.supports(t, c["jp"] or "") for t in texts)
 
 
-def overlay_doc(items: list[dict], ov_stats: dict, evs_of: list[list[dict]], name_ink: dict | None = None) -> dict:
-    """产物的 `overlay`：条目、计数、喂给匹配器的事件（`fed`，显示协议的两个保留组由它推出）、判过名牌字色时各层的名牌色
-    （`name_ink`，`nameink.check`）。两个内置匹配器共用。"""
+def overlay_doc(items: list[dict], ov_stats: dict, evs_of: list[list[dict]], textbox: dict, name_ink: dict | None = None) -> dict:
+    """产物的 `overlay`：条目、计数、喂给匹配器的事件（`fed`，显示协议的两个保留组由它推出）、文本框画像（`textbox`，`overlay_items` 给的）、
+    判过名牌字色时各层的名牌色（`name_ink`，`nameink.check`）。两个内置匹配器共用。"""
     ov_stats["groups"] = dict(Counter(it["group"] for it in items))
-    return {"stats": ov_stats, "items": items,
+    return {"stats": ov_stats, "items": items, "textbox": textbox,
             "fed": sorted({e["id"] for evs in evs_of for e in evs}), **({"name_ink": name_ink} if name_ink else {})}
 
 
@@ -580,7 +583,7 @@ def choice_items(doc: dict, main_regions: set[int], ref: GA.Ref, taken: set[int]
     unit_span = unit_spans(ref)
     prefix = ChoicePrefix(ref, unit_span)
     by_text: dict[str, list[tuple]] = {}
-    tpl = {ln["key"]: {k: ln[k] for k in ("jp_tpl", "jp_rich", "cn_rich") if ln.get(k)} for u in ref.doc["units"] for ln in u["lines"]}
+    tpl = {ln["key"]: {k: ln[k] for k in TR_EXTRA if ln.get(k)} for u in ref.doc["units"] for ln in u["lines"]}
     for u in ref.doc["units"]:
         span = unit_span.get(u["uid"])
         for ln in u["lines"]:
@@ -658,7 +661,8 @@ def choice_items(doc: dict, main_regions: set[int], ref: GA.Ref, taken: set[int]
                 prev[8] += g[8]          # 接上以后重叠的两段并掉，免得半透明底板叠两层
             else:
                 out.append(g)
-    # 这条路找到的台词不是认领，是别处重现的同一句（多是对话记录面板），归 `elsewhere`；选项、界面文字、过场字幕等照行的组
+    # 这条路找到的台词不是认领，是别处重现的同一句（多是对话记录面板），归 `elsewhere`；选项、界面文字、过场字幕等照行的组。
+    # 特殊上屏形式的提示 / 喊话（`special`）也照行的组、默认画：它们不进对话记录，在这条路上读到就是它本身上屏
     return [{"layer": choice_layer(x[7]), "group": "elsewhere" if x[9] == "dialogue" else x[9], "fill": False,
              "start_us": x[0], "end_us": x[1], "rows": [x[2]], "events": list(dict.fromkeys(x[8])),
              "key": x[6], "jp": x[5], "cn": x[3], **tpl.get(x[6], {})}
@@ -766,10 +770,10 @@ READABLES_TABLE, READABLES_CONTRACT = "readables", 1
 """文本包里的阅读面板长文本表（game-text-data 的 `<游戏>.readables/1`：一行 `id` / `source` / `text`，各语种逐行 id 相同）。"""
 
 
-def readable_paras(game: str) -> dict[str, tuple[str, str]] | None:
-    """文本包的 `readables` 表 -> 段索引（归一键 -> (日文段, 中文段)），`readable_items` 用。包里没有这张表返回 None。
+def readable_paras(game: str) -> dict[str, tuple[str, str, str | None]] | None:
+    """文本包的 `readables` 表 -> 段索引（归一键 -> (日文段, 中文段, 英文段或 None)），`readable_items` 用。包里没有这张表返回 None。
 
-    一条长文本按 `paragraphs` 切段，日中段数不等的整条跳过；段的内容字少于 `READABLE_MIN_CHARS` 的不进（短段撞车太多）。
+    一条长文本按 `paragraphs` 切段，日中段数不等的整条跳过（英文段数和日文不等的，这条的英文段记 None）；段的内容字少于 `READABLE_MIN_CHARS` 的不进（短段撞车太多）。
     表是阅读界面（书籍、信件、说明…）引用的长文本，已经在对话类表里的 game-text-data 那边去掉了，不和台词叠加抢字。
     建一次要读完整张表，结果按 包的内容指纹 + 本模块的代码指纹 缓存到 `out/_cache/readables/`（同 `gamescript.library`）。"""
     import hashlib
@@ -784,18 +788,21 @@ def readable_paras(game: str) -> dict[str, tuple[str, str]] | None:
                          .encode()).hexdigest()[:16]
     cp = paths.data_root() / "out" / "_cache" / "readables" / f"{game}-{key}.pkl"
     if cp.exists():
-        bd.verify_stored([READABLES_TABLE])
+        bd.verify_stored([READABLES_TABLE], ("ja", "zh-Hans", *((GS.EN,) if GS.has_en(game, READABLES_TABLE) else ())))
         with open(cp, "rb") as f:
             return pickle.load(f)
-    paras: dict[str, tuple[str, str]] = {}
-    for a, b in GS.paired(game, READABLES_TABLE):
+    paras: dict[str, tuple[str, str, str | None]] = {}
+    for a, b, e in GS.paired(game, READABLES_TABLE):
         pj, pc = paragraphs(a["text"] or ""), paragraphs(b["text"] or "")
         if len(pj) != len(pc):
             continue
-        for x, y in zip(pj, pc):
+        pe = paragraphs(e["text"] or "") if e else []
+        if len(pe) != len(pj):
+            pe = [None] * len(pj)
+        for x, y, z in zip(pj, pc, pe):
             k = GS.cnorm(x)
             if len(k) >= READABLE_MIN_CHARS:
-                paras.setdefault(k, (x, y))
+                paras.setdefault(k, (x, y, z))
     # 不清理别的键：不同代码 / 不同包的进程共用这个目录，删"旧键"会删掉别的进程正在读的那份（二次验收 2026-10-06）。
     # 旧键只占盘，整目录删掉就等于没有缓存
     cp.parent.mkdir(parents=True, exist_ok=True)
@@ -806,7 +813,7 @@ def readable_paras(game: str) -> dict[str, tuple[str, str]] | None:
     return paras
 
 
-def readables_of(ref: GA.Ref) -> tuple[dict[str, tuple[str, str]], dict]:
+def readables_of(ref: GA.Ref) -> tuple[dict[str, tuple[str, str, str | None]], dict]:
     """剧本是哪款游戏的，就读那款文本包的 `readables` 表；包里没有这张表就当场报错（选开了却什么都盖不上，别静默）。
     返回 (段索引, 来源)：来源是这次读的那份包（`Bundle.provenance`）——面板读的是**现在找得到的**包，
     不一定是产剧本那份（`provenance.gametext` 抄的是剧本的），所以单独记进 `overlay.stats.panel_gametext`。"""
@@ -817,10 +824,10 @@ def readables_of(ref: GA.Ref) -> tuple[dict[str, tuple[str, str]], dict]:
     return paras, GA.GS.bundle_of(game).provenance()
 
 
-def readable_items(obs_path: Path, paras: dict[str, tuple[str, str]], frame_us: int,
+def readable_items(obs_path: Path, paras: dict[str, tuple[str, str, str | None]], frame_us: int,
                    taken: list[dict]) -> tuple[list[dict], int]:
     """阅读面板长文本（选开，2026-09-12 owner 要"试试看能不能盖"）：**逐帧**拿 obs 里的长文本行去找它属于哪一**段**
-    （`paras`：归一键 -> (日文段, 中文段)，`readable_paras` 从文本包的 `readables` 表建），同一帧里认出来的段并成一块，
+    （`paras`：归一键 -> (日文段, 中文段, 英文段或 None)，`readable_paras` 从文本包的 `readables` 表建），同一帧里认出来的段并成一块，
     盖上这几段的译文；相邻帧段集合相同、位置几乎不动就接着延长。返回 (items, 用掉的观测条数)。
 
     **不用 run / 事件**：阅读面板在滚，run 按静止框跟踪，同一个框位置上的文字一路在换，
@@ -922,15 +929,17 @@ def readable_items(obs_path: Path, paras: dict[str, tuple[str, str]], frame_us: 
         if cur and cur[5] == sig and cur[1] + frame_us // 2 >= t and box_iou(cur[2][0], box) >= 0.8:
             cur[1] = t + frame_us
         else:
+            en = [paras[keys[p]][2] for p in paras_here]
             cur = [t, t + frame_us, [box], {"jp": [paras[keys[p]][0] for p in paras_here],
-                                            "cn": [paras[keys[p]][1] for p in paras_here]}, row_h, sig]
+                                            "cn": [paras[keys[p]][1] for p in paras_here],
+                                            **({"en": en} if None not in en else {})}, row_h, sig]    # 有一段没有英文就整块不出英文
             items.append(cur)
     return [{"layer": "panel", "group": "panel", "fill": False, "start_us": s, "end_us": e, "rows": rows, "paras": ps, "row_h": row_h}
             for s, e, rows, ps, row_h, _ in items], n_used
 
 
-def speaker_names(ref: GA.Ref) -> dict[str, str]:
-    """说话人：日文（`SA.norm` 归一）-> 中文。名牌层的译文从这里取。
+def speaker_names(ref: GA.Ref, lang: str = "cn") -> dict[str, str]:
+    """说话人：日文（`SA.norm` 归一）-> 中文（`lang="en"`：英文，剧本行的 `speaker_en` 和顶层 `speakers_en`）。名牌层的译文从这里取。
 
     先用剧本里 gamescript 写的**整库** `speakers` 表（这段视频圈中的剧本行常没有说话人，原神任务对话尤甚），
     表里没有的再从剧本行补（同一个名字取出现最多的写法）。库里没有说话人的（绝区零的 scene）就没有名字译文，
@@ -941,27 +950,28 @@ def speaker_names(ref: GA.Ref) -> dict[str, str]:
     一行报错都没有——照文档的命令跑 gi-s2 得到 `名牌有中文名的 0/39`，而 matcher 计划 记的是 28。
     和"旧默认产的 obs 被静默复用"是同一个形状，所以这里明着喊，并把这件事写进产物
     （`overlay.stats.ref_has_speakers`），不让它只在终端上闪过。"""
-    if "speakers" not in ref.doc:
+    if "speakers" not in ref.doc and lang == "cn":
         print("⚠ 剧本里没有 `speakers` 表（早于 2026-09-14 的 gamescript）：名牌层将没有任何译文。"
               "重跑 `flowocr.analyze.gamescript` 生成剧本再来。")
     cnt: dict[str, Counter] = defaultdict(Counter)
     for u in ref.doc["units"]:
         for ln in u["lines"]:
-            if ln.get("speaker") and ln.get("speaker_cn"):
-                cnt[SA.norm(ln["speaker"])][ln["speaker_cn"]] += 1
+            if ln.get("speaker") and ln.get(f"speaker_{lang}"):
+                cnt[SA.norm(ln["speaker"])][ln[f"speaker_{lang}"]] += 1
     names = {k: c.most_common(1)[0][0] for k, c in cnt.items() if k}
-    table = {SA.norm(k): v for k, v in (ref.doc.get("speakers") or {}).items() if SA.norm(k) and v}
+    table = {SA.norm(k): v for k, v in (ref.doc.get("speakers" if lang == "cn" else f"speakers_{lang}") or {}).items()
+             if SA.norm(k) and v}
     return {**names, **table}
 
 
-def term_names(ref: GA.Ref) -> dict[str, str]:
-    """短名词表：日文（`SA.norm` 归一）-> 中文。说话人表（`speaker_names`）查不到的名牌再查它。
+def term_names(ref: GA.Ref, lang: str = "cn") -> dict[str, str]:
+    """短名词表：日文（`SA.norm` 归一）-> 中文（`lang="en"`：英文）。说话人表（`speaker_names`）查不到的名牌再查它。
 
     表是 gamescript 从文本包的 `terms` 里挑的——只收这段 obs 里逐字出现过的键、消歧也在那边做完
     （`gamescript.term_table`）；旧包 / 旧剧本没有这一项，返回空表，名牌层照旧只查说话人。
     它按**字形**查到的是游戏自己的译文，但不保证那块字是人名（任务目标、称号也会查到），
     所以名牌条目上记 `name_src`，下游分得清"剧本说话人"和"按字形查到的"。"""
-    return {SA.norm(k): v["cn"] for k, v in (ref.doc.get("terms") or {}).items() if SA.norm(k) and v.get("cn")}
+    return {SA.norm(k): v[lang] for k, v in (ref.doc.get("terms") or {}).items() if SA.norm(k) and v.get(lang)}
 
 
 TERM_ON_DIALOGUE = 0.3
@@ -1139,9 +1149,18 @@ def _same_place(a: list[float], b: list[float]) -> bool:
     return max(box_inside(a, b), box_inside(b, a)) >= SAME_PLACE
 
 
-def position_segments(parts: list[tuple[int, list[dict]]], cues: list, s_us: int, e_us: int
-                      ) -> list[tuple[list[dict], list[list[float]], int, int]]:
-    """一条认领（`merge_runs` 可能并了好几条 cue）的正文按**位置**切成几段叠加块：(事件, 行框, 起, 止)。
+class Segment(NamedTuple):
+    """`position_segments` 切出的一段叠加块。"""
+    evs: list[dict]            # 段里全部 cue 的正文事件
+    rows: list[list[float]]    # 画的那条 cue 的行框（条目的 `rows`）
+    start: int
+    end: int
+    cue: int                   # 画的那条 cue 的下标
+    shown: list[dict]          # 画的那条 cue 的正文事件（`rows` 就是它们的行框；原文整块按它们的字对剧本行，`textbox`）
+
+
+def position_segments(parts: list[tuple[int, list[dict]]], cues: list, s_us: int, e_us: int) -> list[Segment]:
+    """一条认领（`merge_runs` 可能并了好几条 cue）的正文按**位置**切成几段叠加块（`Segment`）。
 
     认领是"这几条 cue 是同一句剧本行"，渲染块是"译文画在哪、画多久"——两件事。区域可以包含跟着画面走的字，
     按区域并起来的几条 cue 不一定在同一处（2026-09-26 审计：hsr-s1 一句对白 2 s 里换了四个位置，
@@ -1173,10 +1192,10 @@ def position_segments(parts: list[tuple[int, list[dict]]], cues: list, s_us: int
     out = []
     for k, g in enumerate(groups):
         evs = [e for m in g for e in m[1]]
-        rows = rows_of(render_of(g)[1])
+        shown = render_of(g)
         a = s_us if k == 0 else int(round(round(cues[g[0][0]].start, 3) * 1e6))
         b = e_us if k == len(groups) - 1 else int(round(round(cues[g[-1][0]].end, 3) * 1e6))
-        out.append((evs, rows, a, b))
+        out.append(Segment(evs, rows_of(shown[1]), a, b, shown[0], shown[1]))
     return out
 
 
@@ -1289,12 +1308,63 @@ def yield_to_body(name_items: list[dict], body_items: list[dict]) -> tuple[list[
     return kept, len(name_items) - len(kept)
 
 
+NAME_ROW_TOL = 0.5
+"""`yield_to_block`：名牌块的下沿离同一区域前后名牌下沿的中位超过这么多个正文行距，才当成台词的首行（暂定）。"""
+
+
+def yield_to_block(items: list[dict], doc: dict, textbox: dict) -> tuple[list[dict], int]:
+    """`name` 层的块（含归 stray_name 组的）被正文原文整块借成了一行（`block_drawn_by` 指着它）、位置又不在名牌该在的地方的，
+    是台词的首行被认成了名牌：去掉这块，整块那一行改记没人画（阶段 3 当借来的事件、不另画）——返回 (留下的条目, 去掉的块数)。
+
+    "名牌该在的地方"按前后文定：同一区域时间上前后各 `TB.INERTIA_K` 块名牌（没被整块借走的）的下沿中位，和惯性同一个思路——
+    名牌跟着文本框，一款游戏里它的位置是定的。参照不到 `TB.INERTIA_MIN_REF` 块的不动。整块借这个事件时已经核过字（对上剧本那一行日文）
+    和位置（落在按行距推出的那一行上，`TB.fill`），这里再要它离名牌的位置差 `NAME_ROW_TOL` 个行距以上，喊名字的台词（`カチーナ！`）
+    恰好贴着名牌时不误去。实例是《魔裁》两行台词的短首行（`はい。`、`そう。`、`あら？`）：剧本里不是一整条台词、`head_lines` 排不掉，
+    下沿约 909 px、名牌约 835 px，原来名牌层在台词首行上另画一块 OCR 原文、和正文译文叠两层。
+
+    称号层（`title`）不参照也不去：它和名字叠着画、位置不同，混进中位会把名牌的位置拉偏；九场里也没有称号块被整块借走过。
+    在 `name_roles` 之后跑：去掉的块原来若当过别的名牌的称号搭档、或帮一串名牌判成挂上，剩下的块不重算（九场里没出现）。"""
+    events = doc["events"]
+    uses: dict[int, int] = {}                                   # 名牌块下标 -> 借它的正文条目下标
+    for k, it in enumerate(items):
+        for by in it.get("block_drawn_by") or ():
+            if by is not None and items[by]["layer"] == "name":
+                uses.setdefault(by, k)
+    if not uses:
+        return items, 0
+    by_reg: dict[int, list[int]] = defaultdict(list)
+    for k, it in enumerate(items):
+        if it["layer"] == "name":
+            by_reg[events[it["events"][0]]["region"]].append(k)
+    drop = set()
+    for by, k in uses.items():
+        order = sorted(by_reg[events[items[by]["events"][0]]["region"]], key=lambda i: items[i]["start_us"])
+        n = order.index(by)
+        refs = sorted(items[i]["rows"][0][3] for i in order[max(0, n - TB.INERTIA_K):n] + order[n + 1:n + 1 + TB.INERTIA_K] if i not in uses)
+        pitch = (textbox.get(str(events[items[k]["events"][0]]["region"])) or {}).get("pitch")
+        if len(refs) >= TB.INERTIA_MIN_REF and pitch and abs(items[by]["rows"][0][3] - refs[(len(refs) - 1) // 2]) > NAME_ROW_TOL * pitch:
+            drop.add(by)
+    if not drop:
+        return items, 0
+    at = {}
+    out = []
+    for k, it in enumerate(items):
+        if k not in drop:
+            at[k] = len(out)
+            out.append(it)
+    for it in out:
+        if it.get("block_drawn_by"):
+            it["block_drawn_by"] = [None if by is None or by in drop else at[by] for by in it["block_drawn_by"]]
+    return out, len(drop)
+
+
 def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: list,
                   ref: GA.Ref | None = None, readables: dict[str, tuple[str, str]] | None = None,
                   obs_path: Path | None = None, speakers: dict[str, str] | None = None,
-                  script_lines: frozenset[str] | None = None) -> tuple[list[dict], dict]:
+                  script_lines: frozenset[str] | None = None, layout: dict | None = None) -> tuple[list[dict], dict, dict]:
     """**判定**：各层该盖哪些块，产出写进 `matched.json` 的 `overlay.items`（语言无关，jp / cn 都带）。
-    导出器（`export_overlay`）只按层和语言投影，不再现场判断（artifacts.md 第 1 条）。返回 (条目, 各层计数)。
+    导出器（`export_overlay`）只按层和语言投影，不再现场判断（artifacts.md 第 1 条）。
+    返回 (条目, 各层计数, 文本框画像 `overlay.textbox`)；正文 / extra 条目带原文整块（`textbox.annotate`，计数里的 `textbox` 是它的统计）。
 
     `speakers`：名牌层的说话人表（日文名按 `SA.norm` 归一 -> 中文名）。不给就从 `ref` 取（`speaker_names`）；
     没有 `GA.Ref` 的匹配器（`naninovel`）用它交进自己的名字表——不交的话名牌层整层没有译文（2026-10-24，宣传片素材上的 `セナ` / `リオ`）。
@@ -1310,6 +1380,9 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
         script_lines = GA.band_lines(ref.script) if ref is not None else frozenset()
     heads = GA.head_lines([(c.start, "\n".join(c.lines), "") for c in cues], script_lines)
     body_items, extra_items = [], []
+    # 和 body_items / extra_items 逐条对应：(画的那条 cue 的正文事件, 那条 cue 的全部事件)，建原文整块用
+    shown_body: list[tuple[list[dict], list[dict]]] = []
+    shown_extra: list[tuple[list[dict], list[dict]]] = []
     index = tracksio.EventIndex(doc["events"], BODY_LOOKBACK_US)
     parts_of = {ri: [(i, body_of(evs_of[i], heads, r["ref"].get("jp") or "", r["ref"].get("jp_tpl") or "")) for i in r["cues"]]
                 for ri, r in enumerate(recs) if r["ref"]}
@@ -1322,7 +1395,8 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
         body = [e for _, b in parts for e in b]
         mates = [e for i in r["cues"] for e in evs_of[i]]
         taken = {e["id"] for e in body}
-        for evs, rows, a, b in position_segments(parts, cues, s_us, e_us):
+        for seg in position_segments(parts, cues, s_us, e_us):
+            evs, rows, a, b = seg.evs, seg.rows, seg.start, seg.end
             jp = r["ref"].get("jp") or ""
             a, lead = body_start(a, evs, jp, index, int(BODY_SHIFT_TOL * doc["frame_us"]))
             refined = "text_effect" in doc and any("t_full_how" in e for e in evs)      # 同 `script.refined_of`
@@ -1337,11 +1411,13 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                "events": list(dict.fromkeys(e["id"] for e in evs + lent)), "key": r["ref"]["key"],
                                **{k: r["ref"][k] for k in matchedio.TEXT_KEYS if k in r["ref"]},
                                "claim": [ri, -1], "echo": r.get("echo"), "echo_of": r.get("echo_of")})
+            shown_body.append((seg.shown, evs_of[seg.cue]))
         # extra 盖它自己的那几行：字落在这条剧本行里、而且不是主认领已经用掉的事件（含正文块定起点借来的读数）
         for xi, x in enumerate(r["extra"]):
             parts = [(i, [e for e in body_of(evs_of[i], heads, x.get("jp") or "", x.get("jp_tpl") or "") if e["id"] not in taken])
                      for i in r["cues"]]
-            for evs, xrows, a, b in position_segments(parts, cues, s_us, e_us):
+            for seg in position_segments(parts, cues, s_us, e_us):
+                evs, xrows, a, b = seg.evs, seg.rows, seg.start, seg.end
                 taken |= {e["id"] for e in evs}
                 # 时间取**它自己那几个事件**的（裁进这一段的范围）：选项按钮往往比正文晚出现好几秒，
                 # 用记录的起止会让译文先浮在空处（2026-09-14 摆帧：zzz 18 条里 17 条事件时段不到记录的 80%）
@@ -1352,6 +1428,7 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                     "events": list(dict.fromkeys(e["id"] for e in evs)), "key": x["key"],
                                     **{k: x[k] for k in matchedio.TEXT_KEYS if k in x},
                                     "claim": [ri, xi], "echo": x.get("echo"), "echo_of": x.get("echo_of")})
+                shown_extra.append((seg.shown, evs_of[seg.cue]))
     # 名牌：主轨里被认成开头行的**事件**（一个事件一块，时间取事件自己的——名牌跨好几条 cue 挂着）。
     # `名前：台词` 那种同一行格式框不出名字那半，不进这一层
     if speakers is not None:
@@ -1400,6 +1477,11 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
                                    "ocr": e["text"]})
     name_items, n_lent = yield_to_body(name_items, body_items)
     n_fz = fuzzy_names(name_items, share, votes)
+    # 英文名只是跟着中文名带：认名（逐字查、投票、借）照旧只看中文，认出是谁以后按那个日文名查英文（说话人表优先，同中文）
+    en_names = {**term_names(ref, "en"), **speaker_names(ref, "en")} if ref is not None else {}
+    for it in name_items:
+        if it["cn"] and (en := en_names.get(SA.norm(it["jp"]))):
+            it["en"] = en
     name_items.sort(key=lambda it: it["start_us"])
     if n_lent:
         print(f"[名牌] 事件已记进正文块（定起点借来的读数）、名牌层让出的 {n_lent} 块")
@@ -1433,6 +1515,19 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
     print(f"[名牌] 挂在认上的台词上的名字 {n_roles.get('name', 0)} 块、称号 {n_roles.get('title', 0)} 块；"
           f"没挂上、归 {matchedio.STRAY_NAME}（默认不画）的 {n_roles.get(matchedio.STRAY_NAME, 0)} 块")
     items = body_items + choices + panels + extra_items + name_items
+    # 原文整块与文本框画像（line-breaks 计划）：名牌分组、选项去重都做完之后才算，只写条目的新字段，不动 `rows`
+    x_at = len(body_items) + len(choices) + len(panels)              # extra 条目在 items 里从这里起
+    textbox, tb_stats = TB.annotate(items, doc, {**dict(enumerate(shown_body)), **{x_at + k: v for k, v in enumerate(shown_extra)}}, layout)
+    # 名牌层在 items 末尾，去掉其中几块不挪正文 / extra 的下标
+    items, n_head = yield_to_block(items, doc, textbox)
+    kept = {id(it) for it in items}
+    name_items = [it for it in name_items if id(it) in kept]
+    tb_stats["names_yielded"] = n_head
+    tb_stats["drawn_by"] = sum(1 for it in items for x in it.get("block_drawn_by") or () if x is not None)
+    if n_head:
+        print(f"[名牌] 被正文原文整块借成首行、位置不在名牌处的 {n_head} 块：是台词首行，名牌层去掉")
+    for ln in TB.summary(textbox, tb_stats):
+        print(ln)
     stats = {k: sum(1 for it in items if it["layer"] == k) for k in LAYERS}
     # 名牌层的 `name` / `title` 照层的惯例数块（在动的名牌切成几块，`event_segments`）；下面几个按**事件**数（去重、两层合起来），
     # 和 2026-10-05 之前的读数同口径（那时一个事件一块）
@@ -1446,19 +1541,22 @@ def overlay_items(recs: list[dict], doc: dict, evs_of: list[list[dict]], cues: l
     # 剧本有没有说话人表（gametext 是剧本的 `speakers` 表，交了 `speakers` 的是那张表非空）：没有的话名牌层结构上一条译文都不会有
     # （`speaker_names` 的 ⚠），记进产物，免得下次看见 `name_translated 0` 去查判据
     stats["ref_has_speakers"] = has_speakers
-    return items, stats
+    stats["textbox"] = tb_stats
+    return items, stats, textbox
 
 
 def run_match(ref: GA.Ref, subs: str, feed: str, feed_panel: str, fuzzy: float, merge_gap: float,
               overlay: bool = True, readables: bool = False, obs: str | None = None,
-              doc: dict | None = None, events: bool = False) -> dict:
+              doc: dict | None = None, events: bool = False, layout: str | None = None, viewport: str | None = None) -> dict:
     """匹配的**主体**：喂入 → 匹配 → 并相邻 → （有框时）判叠加层。**不打印统计、不写文件。**
 
     CLI（`main`）和内置匹配器（`flowocr.analyze.matchers.gametext.match`）都走这里，判据只有这一份
     （2026-09-22 从 main 里拆出来，正规化 project-structure）。`subs` 是 SRT 或 `*-tracks.json` 的路径；
     `doc` 给了就不再从 `subs` 读（匹配器 API 手上已经有 doc），`feed == "main"` 仍要 `subs` 指到文件。
     `events`：不判叠加层也要每条 cue 的事件（匹配器猜占位的值要用，比如原神读名牌）。
-    返回 `recs` / `n_raw` / `suspect_raw` / `cues` / `items` / `ov_stats` / `doc_t` / `evs`（每条 cue 的事件，没读 tracks 是 None）/
+    `layout`：版式文件的路径（`--ctx layout=`，`none` 是不用）；没给按剧本的游戏找随代码走的那份（`textbox.layout_for`）。
+    `viewport`：游戏画面在录像里的位置（`--ctx viewport=x,y,w,h`）；没给用建轨时记下的（`tracksio.recorded_viewport`），都没有按版式文件推算（`textbox.locate`）。
+    返回 `recs` / `n_raw` / `suspect_raw` / `cues` / `items` / `ov_stats` / `textbox` / `doc_t` / `evs`（每条 cue 的事件，没读 tracks 是 None）/
     `subs_path` / `tp`。"""
     panel_of = None
     if feed == "main":
@@ -1492,23 +1590,25 @@ def run_match(ref: GA.Ref, subs: str, feed: str, feed_panel: str, fuzzy: float, 
     mark_echoes(ref, recs, cues, main_of, panel_of, log_panel_of, grid)
     mark_display(recs, cues, lambda c: group_of(c["kind"], c.get("status"), ref.role.get(c["key"])))
     # 叠加层的判定（有框才判得了）：写进 JSON，--ass 只投影
-    items = ov_stats = doc_t = evs = name_ink = None
+    items = ov_stats = doc_t = evs = name_ink = textbox = None
     # tracks 只在要用时读：叠加层要框，匹配器猜占位的值可能要事件（`--no-overlay` 又不要事件时照旧不碰 tracks、不对账）
     if (doc is not None or subs.endswith("-tracks.json")) and (overlay or events):
         doc_t = doc if doc is not None else tracksio.load(Path(subs))
         evs = cue_events(doc_t, cues) if evs_of is None else evs_of
     if doc_t is not None and overlay:
         paras, panel_src = readables_of(ref) if readables else (None, None)
-        items, ov_stats = overlay_items(recs, doc_t, evs,
+        items, ov_stats, textbox = overlay_items(recs, doc_t, evs,
                                         cues, ref=ref, readables=paras,
-                                        obs_path=Path(obs) if obs else None)
+                                        obs_path=Path(obs) if obs else None,
+                                        layout=TB.layout_for(layout, (ref.doc.get("provenance") or {}).get("game"),
+                                                             viewport or tracksio.recorded_viewport(doc_t)))
         if panel_src:
             ov_stats["panel_gametext"] = panel_src
         # 名牌字色（owner 2026-11-05）：和匹配器同一阶段，只判认上的名牌；阶段 3 照判定写样式，不读视频
         name_ink = NI.check(items, doc_t, (ref.doc.get("provenance") or {}).get("game"))
         ov_stats["name_plain"] = sum(1 for it in items if it.get("ink") is False)
     return {"recs": recs, "n_raw": n_raw, "suspect_raw": suspect_raw, "cues": cues, "items": items, "ov_stats": ov_stats,
-            "name_ink": name_ink, "doc_t": doc_t, "evs": evs, "subs_path": subs_path, "tp": tp}
+            "textbox": textbox, "name_ink": name_ink, "doc_t": doc_t, "evs": evs, "subs_path": subs_path, "tp": tp}
 
 
 def cue_main(cues: list, evs_of: list[list[dict]] | None, doc: dict | None) -> list[bool]:
@@ -1612,11 +1712,11 @@ def report(st: dict, recs: list[dict], n_raw: int, merge_gap: float, fuzzy: floa
 
 
 def matched_doc(ref: GA.Ref, recs: list[dict], n_raw: int, st: dict, ref_path: str, subs_path: Path, tp: dict,
-                argv: list[str], params: dict, items, ov_stats, evs, fills: dict | None = None,
+                argv: list[str], params: dict, items, ov_stats, evs, textbox: dict | None, fills: dict | None = None,
                 name_ink: dict | None = None) -> dict:
     """`*-matched.json`（`SCHEMA`）。provenance 记这次是谁、用哪版代码、什么参数产的。
-    `evs`：喂给匹配器的每条 cue 的事件（`run_match` 的 `evs`），叠加层的 `fed` 由它来（显示协议）。
-    `fills`：匹配器猜的占位的值（`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …}, "how": 从哪来, …}}`，`flowocr.placeholders`）。
+    `evs`：喂给匹配器的每条 cue 的事件（`run_match` 的 `evs`），叠加层的 `fed` 由它来（显示协议）。`textbox`：文本框画像（`run_match` 的 `textbox`）。
+    `fills`：匹配器猜的占位的值（`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …, "en"?: …}, "how": 从哪来, …}}`，`flowocr.placeholders`）。
     `name_ink`：名牌字色判过时这款游戏各层的名牌色（`nameink.check`），记进 `overlay.name_ink`。"""
     from flowocr.analyze import build_tracks as bt
     pv = ref.doc["provenance"]
@@ -1644,7 +1744,7 @@ def matched_doc(ref: GA.Ref, recs: list[dict], n_raw: int, st: dict, ref_path: s
             "cues": recs,
             **({"fills": fills} if fills else {}),
             "display": DISPLAY,
-            **({"overlay": overlay_doc(items, ov_stats, evs, name_ink)} if items is not None else {})}
+            **({"overlay": overlay_doc(items, ov_stats, evs, textbox, name_ink)} if items is not None else {})}
 
 
 
@@ -1670,7 +1770,7 @@ def main() -> int:
     ap.add_argument("--srt", default=None,
                     help="顺便导出一份 SRT（同 matched_srt 的默认：同一句的同时回显 / 记录面板回显不出；"
                          "要放回，拿 --out 的产物跑 flowocr-render --preset matched_srt --opt echo=keep）")
-    ap.add_argument("--lang", choices=("jp", "cn"), default="jp", help="导出的正文取哪种语言")
+    ap.add_argument("--lang", choices=matchedio.LANGS, default="jp", help="导出的正文取哪种语言")
     ap.add_argument("--fuzzy", type=float, default=0.75, help="同 game_align")
     ap.add_argument("--merge-gap", type=float, default=MERGE_GAP,
                     help="相邻 cue 认的是同一条剧本行、间隔 ≤ 这么多秒就并成一条（0 = 不并，见 merge_runs）")
@@ -1686,6 +1786,10 @@ def main() -> int:
     ap.add_argument("--readables", action="store_true",
                     help="把阅读面板（书籍、信件、说明）的长文本也盖上：文本包里要有 readables 表，要 --obs（见 readable_items）")
     ap.add_argument("--obs", default=None, help="--readables 要逐帧的观测（run_ocr2 的 jsonl）")
+    ap.add_argument("--layout", default=None,
+                    help="叠加的版式文件（同匹配器的 --ctx layout=；none 是不用，A/B 的对照臂）；不给按剧本的游戏找随代码走的那份")
+    ap.add_argument("--viewport", default=None, metavar="X,Y,W,H",
+                    help="游戏画面在录像里的位置（像素，同匹配器的 --ctx viewport=）；不给用建轨 --viewport 记下的，都没有按版式文件推算")
     ap.add_argument("--no-overlay", action="store_true",
                     help="不判叠加层、`--out` 里不写 `overlay`（只要 SRT / 只要认领统计时用）。"
                          "默认判——给了 `-tracks.json` 就判，`--ass` 只是投影。原神的剧本仍会读 tracks（从名牌读玩家名填 `{NICKNAME}`）")
@@ -1717,13 +1821,13 @@ def main() -> int:
     ref = GA.load_ref(Path(a.ref))
     res = run_match(ref, a.subs, a.feed, a.feed_panel, a.fuzzy, a.merge_gap,
                     overlay=not a.no_overlay, readables=a.readables, obs=a.obs,
-                    events=gametext.needs_events(ref))
+                    events=gametext.needs_events(ref), layout=a.layout, viewport=a.viewport)
     recs, items, ov_stats = res["recs"], res["items"], res["ov_stats"]
     st = match_stats(ref, recs, res["suspect_raw"])
     report(st, recs, res["n_raw"], a.merge_gap, a.fuzzy, ov_stats, a.readables)
     doc = matched_doc(ref, recs, res["n_raw"], st, a.ref, res["subs_path"], res["tp"], sys.argv[1:],
                       {"fuzzy": a.fuzzy, "merge_gap": a.merge_gap, "feed": a.feed, "feed_panel": a.feed_panel, "readables": a.readables},
-                      items, ov_stats, res["evs"], gametext.fills(ref, recs, res["evs"]), res["name_ink"])
+                      items, ov_stats, res["evs"], res["textbox"], gametext.fills(ref, recs, res["evs"]), res["name_ink"])
     p = Path(a.out)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")

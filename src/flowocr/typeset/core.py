@@ -59,7 +59,8 @@ FX_STYLE = {"OutlineColour": "&H00101010", "BackColour": "&H00000000", "BorderSt
 生成行要的是现在叠加的样子（近黑描边 2、没有框、没有阴影）。字体、颜色、字号这些跟着源样式走。"""
 
 TYPEWRITER_MODES = ("off", "on", "dim")
-FO_PARAMS = {"ev", "key", "box", "fit", "rows", "cap", "plate", "path", "tw", "grow", "rowt", "wrap", "off", "why", "was", "spk"}
+FO_PARAMS = {"ev", "key", "box", "va", "pitch", "em", "bw", "le", "syn", "fit", "rows", "cap", "plate", "path", "tw", "grow", "rowt", "wrap",
+             "off", "why", "was", "spk"}
 """内置认得的 `fo` 参数；扩展效果的名字另加。不认识的当场报错（`unknown=ignore` 才跳过）。"""
 KIND_OF_STYLE = {"Panel": "block", "Choice": "choice", "Offmain": "offmain", **dict.fromkeys(draft.NAME_STYLES, "name")}
 GROW_LEAD = 1.0
@@ -217,6 +218,18 @@ def grow_of(v) -> list[tuple[int, int]]:
     return out
 
 
+def body_params(p: dict) -> dict:
+    """正文译文的摆行参数（阶段 3 的 `script.body_fo` 写的）→ {va, pitch, em, bw, le, synth}。没写的（旧字幕稿、人手加的行）按缺省：
+    `va` 取 `top`，`pitch` 是 None（`layout.place_rows` 按 `box` 现算），没有 `em` 字号用 `fit_line`，没有 `bw` 以画面宽为上限，没有 `le` 按全角字换算（不是英文），没有 `syn` 就是整块都是真实的框。"""
+    def num(k: str) -> float | None:
+        return float(p[k]) if p.get(k) not in (None, True) else None
+    va = p["va"] if p.get("va") not in (None, True) else "top"
+    if va not in layout.VALIGNS:
+        raise ValueError(f"va 只能是 {' / '.join(layout.VALIGNS)}：{va!r}")
+    syn = {int(v) for v in str(p["syn"]).split()} if p.get("syn") not in (None, True) else set()
+    return {"va": va, "pitch": num("pitch"), "em": num("em"), "bw": num("bw"), "le": num("le"), "synth": syn}
+
+
 def text_rows(text: str) -> tuple[list[list[tuple]], list[str], str, int | None]:
     """去掉 `fo` 之后的正文 → (逐行的记号, 逐行的纯文字, 行首块里不归阶段 4 管的 tag, 全字出现的时刻毫秒)。
     记号是 ("tags", 块内容) / ("ch", 字, 出现时刻毫秒或 None) / ("nl",)（行里的软换行 `\\n` 不算分行）。
@@ -241,7 +254,7 @@ def text_rows(text: str) -> tuple[list[list[tuple]], list[str], str, int | None]
                     t_cs += int(got[1])
                     has_k = True
                     continue
-                if got and i == 0:                             # 行首块里归阶段 4 管的（\an \pos \move \fs \fad）由阶段 4 重写
+                if got and i == 0:                             # 行首块里归阶段 4 管的（\an \pos \move \fs \fad \bord）由阶段 4 重写
                     continue
                 kept.append(t)                                 # 其余（行内的 \fs80、\1c、\t(…)…）原样留着
             rest = "".join(kept)
@@ -748,10 +761,16 @@ class Typesetter:
         if resized:
             self.notes.append((src.no, f"字号改过（\\fs{fs}）：以人为准，不再适配"))
         mode = "free"
+        fit = p.get("fit")
         cap = max(len(box), int(p["cap"]) if p.get("cap") not in (None, True) else 0)   # 原文框本来装几行（阶段 3 记的）
         base = tuple(box[0][:2]) if box else (0, 0)     # 轨迹 path 记的是原文框的位置：扩出行只改排版，不改这个基准
         src_box = [list(r) for r in box]                 # 扩行之前的原文框：底板跟着字长时原文只在这几行
-        if kind != "block" and p.get("rows") and box and not moved:
+        reflow = None
+        if kind == "line" and fit == "tr" and p.get("rows") and box and not moved:
+            # 正文译文：`box` 是原文整块，译文按它摆行（阶段 3 的 `view_rows` 同一函数、同一组参数）；人改过行数照样走这里
+            reflow = body_params(p)
+            box, mode = layout.place_rows(src_box, len(plain), reflow["va"], reflow["pitch"], self.H), "rows"
+        elif kind != "block" and p.get("rows") and box and not moved:
             n = len(plain)
             if n == len(box):
                 mode = "rows"
@@ -767,7 +786,6 @@ class Typesetter:
                 self.notes.append((src.no, f"正文 {n} 行、原文框装 {cap} 行：按原来一行的高度扩出 {n - cap} 行（压到别的字不管）"))
         m = re.fullmatch(r"r(\d+)", src.actor.strip())
         s0, e0 = cs_of(src.row.get("Start")) * 10_000, cs_of(src.row.get("End")) * 10_000
-        fit = p.get("fit")
         tw = int(p["tw"]) if p.get("tw") not in (None, True) and full_ms is None else None
         # 逐行显字（阶段 3 的句条目）：人写了 \k 节奏以人为准；行数和段数对不上（人改了行）退回整条匀速
         rowt = grow_of(p["rowt"]) if p.get("rowt") not in (None, True) and full_ms is None else None
@@ -779,13 +797,13 @@ class Typesetter:
              "full_ms": full_ms if full_ms is not None else max(b for _, b in rowt) if rowt else tw,
              "an": int(an) if an else 5, "pos": pos, "move": move, "fs": float(fs) if fs else None, "fad": fad,
              "box": box, "src_box": src_box, "grow": grow_of(p["grow"]) if p.get("grow") not in (None, True) else None,
-             "base": base, "cap": cap, "kind": kind, "mode": mode, "moved": moved, "resized": resized,
+             "base": base, "cap": cap, "kind": kind, "mode": mode, "moved": moved, "resized": resized, "reflow": reflow,
              "fit": (fit if fit in ("src", "tr") else "src") if fit and not resized else None,
              "translated": fit == "tr", "path": path_of(p["path"]) if p.get("path") and not moved else None,
              "region": int(m[1]) if m else -1, "start_us": s0, "end_us": e0}
         if kind == "block":
             paras = [re.sub(r"\\N", "", q) for q in re.split(r"\\N\\N", "\\N".join(plain))] if plain else []
-            x["paras"], x["wrap"] = paras, int(p["wrap"])
+            x["paras"], x["wrap"], x["latin"] = paras, int(p["wrap"]), p.get("le") not in (None, True)
             x["measure"] = (font, layout.width_keys(paras, True))
         else:
             lines = plain if mode != "single" else ["\n".join(plain)]
@@ -794,21 +812,24 @@ class Typesetter:
             tok_rows = carry_rows(rows_tok) if mode == "rows" else [rows_joined(rows_tok)]
             runs = [s for r in tok_rows for ln in runs_of(r) for s, _ in ln]
             marks = [k for r in tok_rows for k in ruby.keys(ruby.rubies_of(r))]       # Ruby 的位置和读音的宽
-            x["measure"] = (font, runs + layout.width_keys(lines, False) + marks)
+            x["measure"] = (font, runs + layout.width_keys(lines, False) + marks + (list(layout.EM_KEYS) if reflow else []))
         return x
 
     def fit(self, x: dict, widths: dict, W: int) -> None:
         if x["kind"] == "block":
             box = x["box"][0] if x["box"] else [0, 0, W, 0]
             keep = int(x["fs"]) if x["resized"] and x["fs"] is not None else None
-            x["size"], x["wrapped"] = layout.block_layout(box, x["paras"], x["wrap"], x["font"], widths, size=keep)
+            x["size"], x["wrapped"] = layout.block_layout(box, x["paras"], x["wrap"], x["font"], widths, size=keep, latin=x["latin"])
             return
         x["sizes"] = None
         if x["fit"] == "src" and x["mode"] == "rows" and len(x["box"]) > 1 and len(x["lines"]) == len(x["box"]):
             # 原文按原框逐行摆：每行按自己的框适配字号（一句一条之后，名牌下的称号、并排的小标签和正文高度不同，
-            # 统一一个字号会把小字撑出框——魔裁存档界面的 `[142] Empty`）；译文行是重分过的，照旧整条一个字号
+            # 统一一个字号会把小字撑出框——魔裁存档界面的 `[142] Empty`）；译文整条一个字号
             x["sizes"] = [layout.fit_line([b], [ln], x["font"], widths, False, W) for b, ln in zip(x["box"], x["lines"])]
             x["size"] = max(x["sizes"])
+        elif x["fit"] and x["reflow"]:
+            # 正文译文（D1）：一字宽跟原文的 `em`，宽过文本框（`bw`，没有就画面）才缩，整条一个字号；没有 `em` 退回 `fit_line`
+            x["size"] = layout.body_size(x["box"], x["lines"], x["font"], widths, x["reflow"]["em"], x["reflow"]["bw"], W, x["reflow"]["le"])
         elif x["fit"] and x["box"] and x["mode"] != "free":
             x["size"] = layout.fit_line(x["box"], x["lines"], x["font"], widths, x["fit"] == "tr", W)
         elif x["fit"] and x["box"]:
@@ -867,12 +888,13 @@ class Typesetter:
             self.count("fade")
         actor, style = src.actor, src.style
         s_us, e_us, size = x["start_us"], x["end_us"], x["size"]
+        x["pad"] = pad = layout.plate_pad(size)
         user_where = "\\move(%s)" % x["move"] if x["move"] else "\\pos(%s)" % x["pos"] if x["pos"] else ""
         segs, base = [(s_us, e_us, None, None)], (0, 0)
         els: list[Element] = []
         if x["kind"] == "block":
             box = [x["box"][0]] if x["box"] else []
-            plates = layout.plate_rects(box, [], None, "box") if p.get("plate") and box else []
+            plates = layout.plate_rects(box, [], None, "box", pad) if p.get("plate") and box else []
             els += [plate_el(pl, back) for pl in plates]
             body = "\\N".join(x["wrapped"])
             if box and not x["moved"]:
@@ -898,19 +920,34 @@ class Typesetter:
             line_ws = [[sum(widths.get((x["font"], s), 0.0) * (z or sz) for s, z in ln) for ln in runs_of(t)]
                        for t, sz in zip(tok, sizes)]                  # 每个可见行画出来的宽（读音按它定中心、缩字号）
             plate_mode = p.get("plate") if isinstance(p.get("plate"), str) else look.plate
+            x["bands"] = None
             if x["mode"] in ("rows", "single"):
-                axes = layout.axes_in_screen(box, tw, align, x["translated"], W, x.get("axis"))
+                if x["reflow"]:                   # 正文译文：共用锚轴只按原文整块里真实的框（合成的不算）
+                    axes = layout.block_axes(box, x["src_box"], x["reflow"]["synth"], tw, align, W)
+                else:
+                    axes = layout.axes_in_screen(box, tw, align, x["translated"], W, x.get("axis"))
                 ink = [a + ink_shift(t, sz, x["font"], widths, align) for a, t, sz in zip(axes, tok, sizes)]   # 墨迹实际的锚轴
-                x["rubies"] = [ruby.place(m, a, (r[1] + r[3]) / 2, "middle", align, sz, lw, x["font"], widths, W)
-                               for m, a, r, sz, lw in zip(marks, ink, box, sizes, line_ws)]
-                bare = (layout.plate_rects(x["src_box"] if plate_mode == "src" else box, tw, ink, plate_mode, align,
-                                           text_hs(x, size, tok)) if p.get("plate") else [])
-                plates = (bare if plate_mode == "src"            # 只盖原文：译文扩出的行、读音都不并进来
-                          else ruby.with_rubies(bare, [[q.rect for q in rs] for rs in x["rubies"]], plate_mode))
+                # 字的锚点：墨迹中心落在这一行的竖直中心上（`export.ink_dy`：libass 竖直居中时墨迹偏下），底板按行中心上下对称地盖
+                ys = [(r[1] + r[3]) / 2 - export.ink_dy(x["font"]) * sz for r, sz in zip(box, sizes)]
+                x["rubies"] = [ruby.place(m, a, y, "middle", align, sz, lw, x["font"], widths, W)
+                               for m, a, y, sz, lw in zip(marks, ink, ys, sizes, line_ws)]
+                # 译文行数和原文整块不同（n ≠ k）：底板盖住原文整块 ∪ 译文各行
+                spread = bool(x["reflow"]) and len(box) != len(x["src_box"])
+                if spread and plate_mode == "rows" and p.get("plate"):
+                    # 逐行配对盖不全原文、又会上下叠：译文各行、原文各行、读音拼成不重叠的横条，记下每条盖着谁（跟着字长时按它找这一条的几段）
+                    got = layout.row_bands(box, tw, ink, align, text_hs(x, size, tok), x["src_box"], pad,
+                                           [q.rect for rs in x["rubies"] for q in rs])
+                    bare = plates = [b for b, _ in got]
+                    x["bands"] = [c for _, c in got]
+                else:
+                    bare = (layout.plate_rects(x["src_box"] if plate_mode == "src" else box, tw, ink, plate_mode, pad, align,
+                                               text_hs(x, size, tok), src_rows=x["src_box"] if spread else None) if p.get("plate") else [])
+                    plates = (bare if plate_mode == "src"            # 只盖原文：译文扩出的行、读音都不并进来
+                              else ruby.with_rubies(bare, [[q.rect for q in rs] for rs in x["rubies"]], plate_mode, pad))
                 els += self.plate_els(x, plates, back, plate_mode, tok, tw, ink, align, widths, bare)
-                for i, (r, a, t, sz) in enumerate(zip(box, axes, tok, sizes)):
+                for i, (y, a, t, sz) in enumerate(zip(ys, axes, tok, sizes)):
                     first, full = x["rowt"][i] if x["rowt"] else (None, x["full_ms"])
-                    els.append(Element(1, a, (r[1] + r[3]) / 2, "\\an%d" % layout.ANCHOR[align], "\\fs%d%s" % (sz, ctag),
+                    els.append(Element(1, a, y, "\\an%d" % layout.ANCHOR[align], "\\fs%d%s" % (sz, ctag),
                                        body_of(t, x["mode_tw"], full, first), "text", tail2=x["lead"], fade=True, tokens=t))
                     els += [self.ruby_el(x, q, ctag, full, first) for q in x["rubies"][i]]
                 if x["path"]:
@@ -919,7 +956,7 @@ class Typesetter:
             else:
                 # 整块画在 \pos 上：字号按原来一行的高度适配，一般不冲出原文框的并集，没接 text_h（近似，计划里记过）
                 pbox = x["src_box"] if plate_mode == "src" else box      # 单框扩行时 box 已往下扩，只盖原文就用原文框
-                bare = layout.plate_rects(pbox, [], None, "box") if p.get("plate") and pbox else []
+                bare = layout.plate_rects(pbox, [], None, "box", pad) if p.get("plate") and pbox else []
                 axis = [a + ink_shift(tok[0], size, x["font"], widths, align) for a in assfile.numbers(x["pos"])[:1]] if x["pos"] else []
                 x["rubies"] = [[]]
                 if marks[0] and (x["move"] or not x["pos"]):
@@ -930,7 +967,7 @@ class Typesetter:
                     x["rubies"] = [ruby.place(marks[0], axis[0], assfile.numbers(x["pos"])[1], valign, align, size, line_ws[0],
                                               x["font"], widths, W)]
                 # 人挪过位置的，底板还在原文框上、不跟着字走：读音也不并进去
-                plates = bare if x["moved"] or plate_mode == "src" else ruby.with_rubies(bare, [[q.rect for q in x["rubies"][0]]], "box")
+                plates = bare if x["moved"] or plate_mode == "src" else ruby.with_rubies(bare, [[q.rect for q in x["rubies"][0]]], "box", pad)
                 els += self.plate_els(x, plates, back, plate_mode, tok, tw, axis, align, widths, bare)
                 els.append(Element(1, 0, 0, "\\an%d" % x["an"], "\\fs%d%s" % (size, ctag),
                                    body_of(tok[0], x["mode_tw"], x["full_ms"]), "text",
@@ -940,7 +977,8 @@ class Typesetter:
         # 扩展效果拿到的是整条一个字号（逐行字号时取最大的那行）：按字号摆位置的扩展和小字行会差一点，已知限度
         line = Line(style, actor, p, s_us, e_us, x["region"], x["kind"], box, lines, size, align, plates, look)
         if look.label and x["region"] >= 0 and plates and x["kind"] != "block":
-            px, py = max(q[2] for q in plates) - LABEL_INSET, min(q[1] for q in plates) + LABEL_INSET
+            # 按画出来的底板边（`plate_el` 四条边各自取整）：边距不是整数时，按没取整的算会差一像素
+            px, py = max(round(q[2]) for q in plates) - LABEL_INSET, min(round(q[1]) for q in plates) + LABEL_INSET
             els.append(Element(2, px, py, "\\an9", "\\fs%d\\bord1\\1c&H%s&" % (max(LABEL_MIN, int(LABEL_SCALE * size)), LABEL_COLOR),
                                f"{x['region']}" + ("ui" if style == "UI" else ""), "label"))
         for name, mod in self.fx.items():
@@ -959,7 +997,7 @@ class Typesetter:
         if not plates or x["mode_tw"] == "off" or x["path"] or x["moved"] or not axes:
             return [plate_el(pl, back) for pl in plates]
         self.count("plate_grow")
-        pad, size, font = layout.OVERLAY_PAD, x["size"], x["font"]
+        pad, size, font = x["pad"], x["size"], x["font"]
         src = [] if plate_mode == "text" else self.source_lines(x)
         rubies = x["rubies"]
         if plate_mode == "src" and x["mode"] == "rows":   # 一个原文框一块（`plates` 按 `src_box` 算的），各自跟着这一行原文长
@@ -977,6 +1015,12 @@ class Typesetter:
                 sz = x["sizes"][i] if x["sizes"] else size
                 dim_from = (x["rowt"][i][0] if x["rowt"] else 0) if x["mode_tw"] == "dim" else None
                 rows.append((r, text_front(cells, left, w, sz, pad, dim_from), left, dim_from))
+            if x["bands"] is not None:
+                # 横条拼的底板（正文译文 n ≠ k 的 rows 方案）：每条按盖着它的那几段长——译文各行、原文各行、读音，下标同 `layout.row_bands` 的顺序
+                grows = ([(left - pad, f) for _, f, left, _ in rows] + [(sr[0] - pad, sf) for sr, sf in src]
+                         + [(min(left, q.rect[0]) - pad, ruby_front(q, d)) for (_, _, left, d), rs in zip(rows, rubies) for q in rs])
+                return [plate_el(static, back, c) for static, cover in zip(plates, x["bands"])
+                        for c in grow.row_clips(static, [grows[j] for j in sorted(cover)])]
             if plate_mode == "box":
                 pieces = [(r[0] - pad, r[1] - pad, r[3] + pad, f) for r, f in src]
                 th = text_hs(x, size, tok)         # 译文的竖直范围和静态底板同一个算法（`layout.row_span`），全字后 clip 等于静态底板
@@ -1023,7 +1067,7 @@ class Typesetter:
         时刻取 `fo` 的 `grow`（一行一段）；一个框装几行原文（`single`）时这个框按 `cap` 等分、这一段按行等分
         （逐行摆的 `rows` 里一个框装几行时整格从左往右长，不等分：那里的框和正文行一一对应）。
         没有 `grow`（人手加的打字机）或段数对不上（人改过 `box`）：原文在 `[0, 全字出现]` 里按框宽比例在各行间顺次匀速长。"""
-        src, segs, pad = x["src_box"], x["grow"], layout.OVERLAY_PAD
+        src, segs, pad = x["src_box"], x["grow"], x["pad"]
         if segs is not None and len(segs) != len(src):
             self.notes.append((x["src"].no, f"grow 有 {len(segs)} 段、原文框 {len(src)} 个，对不上：底板按整条的打字机节奏估原文"))
             segs = None

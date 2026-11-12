@@ -4,6 +4,8 @@
 * `cluster_patch(context, options) -> dict`：给默认聚类器（build_tracks）的参数覆盖，键是参数名（如 `region_time_gate`）。
   不需要就返回空字典，或干脆不写这个函数。
 * `match(document, context, options) -> dict`：`document` 是 `*-tracks.json` 的 dict，返回带匹配结果的产物。
+  `context` 里的 `game` 可能来自建轨时的 `--matcher-ctx game=`（匹配时没给、用的是同一个匹配器时继承）。
+  建轨时 `--viewport` 给的游戏画面位置记在 `document["provenance"]["viewport"]`，`flowocr.artifacts.tracksio.recorded_viewport(document)` 读回 `x,y,w,h`。
   这里返回的是一份最小的记录表（`cues` 每条一个 dict，`ref` 为命中的原文或 None），格式随你；
   内置的 `gametext` 返回的是 `scriptmatch.SCHEMA` 那种完整产物。
 

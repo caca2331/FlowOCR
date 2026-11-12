@@ -7,13 +7,15 @@
 出不出一条记录（显示协议，可见集合同叠加预设，`script.matched_visible`）：
 * 有 `ref` 的：`ref` 可见（组可见，且不是填位、或填位可见）才出；在所选语种有文本就出剧本文本，没有的话只在 `unmatched` 组可见时出 OCR 原文；
 * `ref` 为空的记录归 `unmatched`，这一组可见时出 OCR 原文；
+* 特殊上屏形式的台词与提示（`ref` 的组是 `matchedio.SPECIAL`）一律不出，`show=special` / `show=all` 也不出，也不退回出 OCR 原文
+  （SRT 是对白 sidecar，owner 2026-11-07；字幕稿和叠加照画）；判在可见性这一步，回显去重把它当"主没出"；
 * 回显去重叠在可见性之后：主那次认领是某条记录的 `ref`、**而且那条记录这次出了**，才去掉这条回显（`matchedio.record_kept` 加上这一条）。
 
 起止：终点是记录的；起点是这条记录正文叠加条目最早的起点（和字幕稿、叠加同一个时刻，被名牌等别的字拉早的已挪对），没有正文条目的用记录的。
 
 options：
 * `show` / `hide`：逗号分隔的组名、`fill`（`show` 另认 `all`），同叠加预设；`keep` / `layers` 对匹配产物已去掉，传了报错；
-* `lang`：`jp`（默认）/ `cn`，正文取哪种语言；
+* `lang`：`jp`（默认）/ `cn` / `en`，正文取哪种语言；
 * `echo`：`drop`（默认）不出同一句的同时回显和记录面板回显（记录的 `echo` 是 `matchedio.SRT_DROP_ECHOES` 之一，一句一条；
   主落在别的记录的 `extra` 上时照出，见 `matchedio.record_kept`）/ `keep` 放回来（屏上出现过的每一次）；
 * `name`：文件名（默认 `<matched 的 stem 去掉 -matched>-<lang>.srt`）。
@@ -37,14 +39,15 @@ def render(document: dict, output_dir, options: dict | None = None) -> list[Path
     matchedio.validate(document)
     vis = script.matched_visible(document, o)
     lang = str(o.get("lang", "jp"))
-    if lang not in ("jp", "cn"):
-        raise ValueError(f"lang 只能是 jp / cn：{lang!r}")
+    matchedio.need_lang(document, lang)
     echo = str(o.get("echo", "drop"))
     matchedio.echo_kept({}, echo)
     raw = "unmatched" in vis.groups                  # OCR 原文（没认领的记录、认领了但没这个语种文本的）出不出
 
     def shown(r: dict) -> bool:
         ref = r.get("ref")
+        if ref and ref.get("group") == matchedio.SPECIAL:
+            return False
         return vis.shows(ref) and (raw or bool(matchedio.text_of(ref, lang))) if ref else raw
     cues = document["cues"]
     out = {ri for ri, r in enumerate(cues) if shown(r)}

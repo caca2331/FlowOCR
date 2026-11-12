@@ -57,7 +57,7 @@ have_build() {   # $1 = 产物
 # **产物照旧复用、旋钮被静默忽略**，而日志和表照常打印——和 09-06 那次
 # "照着复现命令跑打出另一张表"是同一个形状，只是从改代码搬到了改参数。
 # provenance 里的 argv 记的是当时命令行上真正打了什么；`tracksio.build_args` 按名剥掉
-# obs / --outdir / --tag，剩下的就是 BUILD_ARGS（以前写死 argv[5:]，audit-6 §2.4）。
+# obs / --outdir / --tag / --viewport，剩下的就是 BUILD_ARGS（以前写死 argv[5:]，audit-6 §2.4）；这一趟的 BUILD_ARGS 过同一个 `knob_args` 再比。
 # **旧产物没有 argv 字段**（这个字段是本次加的），所以证明不了它是用什么参数建的
 # ——一律重建。第一次跑到这里会把五部重建一遍，之后就都带 argv 了。
 # 确实不想重建（比如只想看报表）用 `ARGS_CHECK=0`，但那是**明知故犯**，别写进文档。
@@ -73,7 +73,7 @@ except Exception as exc:
 if 'argv' not in prov:
     print('  [rebuild] provenance 里没有 argv（这份产物早于该字段），参数无从核对')
     sys.exit(1)
-got, want = ' '.join(tracksio.build_args(prov)), ' '.join(sys.argv[2].split())
+got, want = ' '.join(tracksio.build_args(prov)), ' '.join(tracksio.knob_args(sys.argv[2].split()))
 if got != want:
     print(f'  [rebuild] BUILD_ARGS 变了：产物是 [{got}]，这次要 [{want}]')
     sys.exit(1)

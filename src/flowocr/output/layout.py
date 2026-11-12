@@ -5,12 +5,21 @@
 """
 from __future__ import annotations
 
+import re
+
 from flowocr.artifacts import tracksio
 from flowocr.output import export
 
-OVERLAY_PAD = 14
-"""底板比 OCR 框（和正文）外扩的像素：盖住原字笔画的边缘、字周围留点边。
-2026-10-05 owner 看对比图后从 6 加到 14：6 时字贴着底板边、显挤；要更松的边距该是底板往外扩，不是把字缩小。"""
+PLATE_PAD_PX = 2
+PLATE_PAD_EM = 0.05
+"""底板比 OCR 框（和正文）外扩 `PLATE_PAD_PX` + `PLATE_PAD_EM` × 字号（`plate_pad`）：盖住原字笔画的边缘、字周围留点边，按字号缩放。
+2026-10-05 owner 看对比图后从 6 px 加到 14 px（6 时字贴着底板边、显挤）；2026-11-10 owner 看 14 px 的预览嫌比字大一圈，改成按字号的窄边距
+（固定 14 px 在绝区零主播布局十几 px 的字上差不多是一个字宽）。"""
+
+
+def plate_pad(size: float) -> float:
+    """字号 `size` 的条目，底板四周外扩多少像素。"""
+    return PLATE_PAD_PX + PLATE_PAD_EM * size
 EDGE_PAD = 6
 """字离画面边的最小距离（锚轴往里推、扩出的行不出画面、译文字号的宽度上限）。和底板外扩分开：边距加大不该把贴满整屏的长译文字号压小一档。"""
 
@@ -66,14 +75,63 @@ def row_span(r: list[float], text_h: float) -> tuple[float, float]:
     return min(r[1], c - text_h / 2), max(r[3], c + text_h / 2)
 
 
-def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str,
-                align: str = "center", text_h: float | list[float] = 0.0) -> list[list[float]]:
+def padded(r: list[float], pad: float) -> list[float]:
+    """一个框外扩底板的边距（`plate_pad`）。"""
+    return [r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad]
+
+
+def row_plates(rows: list[list[float]], text_w: list[float], axis, pad: float, align: str = "center",
+               text_h: float | list[float] = 0.0, text_only: bool = False) -> list[list[float]]:
+    """逐行的底板（还没劈开上下交叠）：每行宽 = max(这一行的框, 译文区间)（`text_only` 只取译文区间），竖直按 `row_span`，外扩 `pad`。
+    `axis`、`text_h` 同 `plate_rects`。"""
+    axes = axis if isinstance(axis, list) else [axis] * len(rows)
+    ths = text_h if isinstance(text_h, list) else [text_h] * len(rows)
+    out = []
+    for r, w, a, h in zip(rows, text_w, axes, ths):
+        tx0, tx1 = text_span(a, w, align)
+        x0, x1 = (tx0, tx1) if text_only else (min(r[0], tx0), max(r[2], tx1))
+        y0, y1 = row_span(r, h)
+        out.append(padded([x0, y0, x1, y1], pad))
+    return out
+
+
+def bands(rects: list[list[float]]) -> list[tuple[list[float], frozenset[int]]]:
+    """几块可能互相重叠的矩形 → 不重叠的横条，盖住它们的并：按全部上下沿切成横条，每条横向取盖着它的那几块的最左到最右，
+    盖着的那几块相同的相邻横条并成一条。返回（横条, 盖着它的矩形下标）。
+    译文行数和原文整块的行数不同时（`place_rows` 的 n ≠ k），译文各行和原文各行上下错开，逐行配对的底板既盖不全原文、
+    互相之间又会叠（半透明时叠的地方更黑），所以按横条拼。"""
+    ys = sorted({v for r in rects for v in (r[1], r[3])})
+    out: list[tuple[list[float], frozenset[int]]] = []
+    for ya, yb in zip(ys, ys[1:]):
+        cover = frozenset(i for i, r in enumerate(rects) if r[1] <= ya and r[3] >= yb)
+        if not cover:
+            continue
+        if out and out[-1][1] == cover and out[-1][0][3] == ya:
+            out[-1][0][3] = yb
+            continue
+        out.append(([min(rects[i][0] for i in cover), ya, max(rects[i][2] for i in cover), yb], cover))
+    return out
+
+
+def row_bands(rows: list[list[float]], text_w: list[float], axis, align: str, text_h: float | list[float],
+              src_rows: list[list[float]], pad: float, extra: list[list[float]] = ()) -> list[tuple[list[float], frozenset[int]]]:
+    """`rows` 方案在译文行数和原文整块不同时的底板（`place_rows` 的 n ≠ k）：译文各行（`row_plates`）、原文整块各行、
+    `extra`（读音的矩形）都外扩边距，拼成不重叠的横条（`bands`），没有译文的原文行也盖上。
+    盖着横条的下标按这个顺序数：译文行 0..n−1、原文行 n..n+k−1、`extra` 接在后面（阶段 4 跟着字长时按它找每条的几段）。"""
+    return bands(row_plates(rows, text_w, axis, pad, align, text_h) + [padded(r, pad) for r in src_rows] + [padded(r, pad) for r in extra])
+
+
+def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str, pad: float,
+                align: str = "center", text_h: float | list[float] = 0.0,
+                src_rows: list[list[float]] | None = None) -> list[list[float]]:
     """每行一个底板矩形 [x0, y0, x1, y1]（`box` 模式一整块）。`axis` 是锚轴（一个数 = 各行共用，或逐行一个）；
     译文区间按锚点算（`text_span`）。上下相邻的两行外扩后会叠一条，半透明时叠的地方更黑，所以从中间劈开。
     **字不出底板**：`text_h` 是正文画出来的高（以这一行的中心为准），比原文框高时底板跟着长；`box` 也把译文的左右范围并进来
     （2026-10-05 owner 截图：两行原文框隔得远、字号按两框合起来的高定成 90 号，字形 67 px 高而底板只有 46 px）。
-    `text_h` 可以逐行给（原文逐行字号时各行字形高不同，矮行的底板不该被撑到大字那行的高）。"""
-    p = OVERLAY_PAD
+    `text_h` 可以逐行给（原文逐行字号时各行字形高不同，矮行的底板不该被撑到大字那行的高）。
+    `src_rows`：译文按 `place_rows` 摆、行数和原文整块不同时的原文整块（`rows` 是摆出来的译文行），`box` 方案的一整块并进它；
+    `text` / `src` 不看它，`rows` 方案这时用 `row_bands`。`pad`：外扩的边距（`plate_pad`）。"""
+    p = pad
     axes = axis if isinstance(axis, list) else [axis] * len(rows)
     ths = text_h if isinstance(text_h, list) else [text_h] * len(rows)
     th_of = {id(r): h for r, h in zip(rows, ths)}
@@ -81,19 +139,17 @@ def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str,
     def tall(r):
         return row_span(r, th_of.get(id(r), max(ths, default=0.0)))
     if mode == "src":
-        out = [[r[0] - p, r[1] - p, r[2] + p, r[3] + p] for r in rows]
+        out = [padded(r, p) for r in rows]
     elif mode == "box":
         spans = [text_span(a, w, align) for w, a in zip(text_w, axes)] if text_w and axis is not None else []
-        x0 = min([r[0] for r in rows] + [s[0] for s in spans])
-        x1 = max([r[2] for r in rows] + [s[1] for s in spans])
-        return [[x0 - p, tall(rows[0])[0] - p, x1 + p, tall(rows[-1])[1] + p]]
+        extra = list(src_rows or [])
+        x0 = min([r[0] for r in rows + extra] + [s[0] for s in spans])
+        x1 = max([r[2] for r in rows + extra] + [s[1] for s in spans])
+        y0 = min([tall(r)[0] for r in rows] + [r[1] for r in extra])
+        y1 = max([tall(r)[1] for r in rows] + [r[3] for r in extra])
+        return [[x0 - p, y0 - p, x1 + p, y1 + p]]
     else:
-        out = []
-        for r, w, a in zip(rows, text_w, axes):
-            tx0, tx1 = text_span(a, w, align)
-            x0, x1 = (tx0, tx1) if mode == "text" else (min(r[0], tx0), max(r[2], tx1))
-            y0, y1 = tall(r)
-            out.append([x0 - p, y0 - p, x1 + p, y1 + p])
+        out = row_plates(rows, text_w, axes, p, align, ths, text_only=mode == "text")
     for a, b in zip(out, out[1:]):
         if b[1] < a[3]:
             a[3] = b[1] = (a[3] + b[1]) / 2
@@ -136,7 +192,8 @@ def fit_line(rows: list[list[float]], lines: list[str], font: str, widths: dict,
 
 def expand_rows(rows: list[list[float]], k: int, H: int) -> list[list[float]]:
     """正文比原文框装得下的多出 `k` 行：按原来一行的高度（几个框时取行距）往下扩出 `k` 行，往下会出画面就往上扩。
-    扩出的行横向取原文几行合起来的范围；压到别的字不管（owner 2026-09-27：一个框里分成两行时扩出一行，不为重叠做保证）。"""
+    扩出的行横向取原文几行合起来的范围；压到别的字不管（owner 2026-09-27：一个框里分成两行时扩出一行，不为重叠做保证）。
+    只给不是正文译文的行（tracks 的原文、名牌、选项里人加的换行）；正文译文按原文整块摆（`place_rows`）。"""
     rows = [list(r) for r in rows]
     if k <= 0:
         return rows
@@ -154,6 +211,130 @@ def expand_box(rect: list[float], cap: int, k: int, H: int) -> list[float]:
     h = (rect[3] - rect[1]) / cap
     grown = expand_rows([[rect[0], rect[1] + i * h, rect[2], rect[1] + (i + 1) * h] for i in range(cap)], k, H)
     return [rect[0], grown[0][1], rect[2], grown[-1][3]]
+
+
+VALIGNS = ("top", "bottom", "center")
+"""文本框的竖直对齐（匹配器的文本框画像 `overlay.textbox` 的 `valign`，字幕稿 `fo` 的 `va`）：
+行数变了时整块对齐原文整块的上沿 / 下沿 / 中心。判不出、没写时是 `top`。"""
+
+EM_REF = "的一是了我不人在有这中大来上国个到说们为"
+"""量"一个全角字多宽"的参考串（常用汉字，20 个）：`em_unit` 量它和它重复两遍的墨迹宽，差 / 字数就是步进宽（首尾字的留白抵掉）。"""
+LATIN_REF = "We should head back to town and tell everyone what happened here."
+"""量"一个拉丁字平均多宽"的参考句（对白里常见的英文，带空格和标点）：`latin_unit` 量它和它隔一个空格重复两遍的墨迹宽。"""
+EM_KEYS = (EM_REF, EM_REF * 2, LATIN_REF, LATIN_REF + " " + LATIN_REF)
+"""要量墨迹宽的串（阶段 3 / 4 量字宽时带上）。"""
+LATIN_EM_DEFAULT = 0.55
+"""游戏的版式文件没给 `latin_em`（英文一个拉丁字平均占几个原文一字宽）时用的值：三款量过的游戏原神 0.56、星铁 0.53、绝区零 0.66 的中间
+（en-target 计划，英文版录像的断点尺上取的）。"""
+
+
+def em_unit(font: str, widths: dict) -> float:
+    """字号 1 时一个全角字的步进宽：`EM_REF` 重复两遍和一遍的墨迹宽之差 / 字数；没量过是 0。"""
+    one, two = (widths.get((font, k), 0.0) for k in EM_KEYS[:2])
+    return (two - one) / len(EM_REF) if one and two else 0.0
+
+
+def latin_unit(font: str, widths: dict) -> float:
+    """字号 1 时一个拉丁字（含空格、标点）的平均步进宽：`LATIN_REF` 隔一个空格重复两遍和一遍的墨迹宽之差 / 字数；没量过是 0。"""
+    one, two = (widths.get((font, k), 0.0) for k in EM_KEYS[2:])
+    return (two - one) / (len(LATIN_REF) + 1) if one and two else 0.0
+
+
+LATIN_CHARS = "".join(chr(i) for i in range(33, 127)) + "—–‘’“”…"
+"""逐字量步进宽的拉丁字（可打印 ASCII 和英文里常见的破折号、弯引号、省略号，空格另量）：英文折行按字形的真实宽度算（`latin_rel`）。
+破折号、弯引号按 `cw` 是全角（东亚宽度不定），画在英文字号下其实各有各的宽，所以一起量。"""
+
+
+def latin_keys() -> list[str]:
+    """`latin_rel` 要量墨迹宽的串：每个字重复 10 遍和 20 遍（差 / 10 是步进宽，首尾留白抵掉），空格夹在两个 x 中间量。"""
+    return [c * n for c in LATIN_CHARS for n in (10, 20)] + ["xx", "x" + " " * 10 + "x"]
+
+
+def latin_rel(font: str, widths: dict) -> dict[str, float]:
+    """每个拉丁字（含空格）的步进宽 / 平均拉丁字宽（`latin_unit`）：英文折行时一个字占 `latin_em × 这个比值` 个全角字。量不出是空表。"""
+    a = latin_unit(font, widths)
+    if a <= 0:
+        return {}
+    out = {c: (widths.get((font, c * 20), 0.0) - widths.get((font, c * 10), 0.0)) / 10 / a for c in LATIN_CHARS}
+    out[" "] = (widths.get((font, "x" + " " * 10 + "x"), 0.0) - widths.get((font, "xx"), 0.0)) / 10 / a
+    return {c: r for c, r in out.items() if r > 0}
+
+
+def block_pitch(block: list[list[float]]) -> float:
+    """原文整块的行距：几行时取首末两行**下沿**之差 / (行数 − 1)，一行时取它的高。
+    按下沿量：Ruby 只把一行的上沿撑高（《魔裁》f1 带 Ruby 的首行框上沿 853，平常 868）。"""
+    if len(block) > 1:
+        return (block[-1][3] - block[0][3]) / (len(block) - 1)
+    return block[0][3] - block[0][1]
+
+
+def place_rows(block: list[list[float]], n: int, valign: str = "top", pitch: float | None = None,
+               H: int | None = None) -> list[list[float]]:
+    """译文 `n` 行摆在原文整块（`block`，k 行，按原文行号排，含匹配器补出的行）上的位置，阶段 3 的预览位置和阶段 4 都用它：
+
+    * n = k：译文第 i 行摆在原文第 i 行的框上（原样）；
+    * n ≠ k：按行距 `pitch`（没给就 `block_pitch` 现算）排出 n 行，整块按 `valign` 对齐原文整块的上沿 / 下沿 / 中心
+      （量的是下沿：`top` 第 j 行的下沿 = 原文第一行的下沿 + j × 行距，`bottom` 从原文最后一行往上数，`center` 绕首末两行下沿的中点对称）；
+      每行高取原文整块各行高的中位（偶数行取小的那个：两行里一行带 Ruby 时不被它撑高），横向取原文几行合起来的范围；出画面（`H`，离边 `EDGE_PAD`）就整块往里推。"""
+    k = len(block)
+    if n == k:
+        return [list(r) for r in block]
+    p = pitch if pitch else block_pitch(block)
+    hs = sorted(r[3] - r[1] for r in block)
+    h = hs[(k - 1) // 2]
+    x0, x1 = min(r[0] for r in block), max(r[2] for r in block)
+    b0, b1 = block[0][3], block[-1][3]
+    if valign == "bottom":
+        bottoms = [b1 - (n - 1 - j) * p for j in range(n)]
+    elif valign == "center":
+        bottoms = [(b0 + b1) / 2 + (j - (n - 1) / 2) * p for j in range(n)]
+    else:
+        bottoms = [b0 + j * p for j in range(n)]
+    shift = 0.0
+    if H is not None:
+        top, bot = bottoms[0] - h, bottoms[-1]
+        shift = EDGE_PAD - top if top < EDGE_PAD else (H - EDGE_PAD) - bot if bot > H - EDGE_PAD else 0.0
+    return [[x0, b + shift - h, x1, b + shift] for b in bottoms]
+
+
+def block_axes(rows: list[list[float]], block: list[list[float]], synth: set[int] | list[int], text_w: list[float],
+               align: str, W: int) -> list[float]:
+    """按 `place_rows` 摆的译文行（`rows`）的锚轴：整组共用一根，按原文整块里**真实的框**算（匹配器合成的行 `synth` 不算），
+    不按译文占的那几个框——取法同 `anchor_axis` 的公共轴（防半行框）；最宽那行放不进画面就整组往里推（`axes_in_screen`）。"""
+    real = [b for i, b in enumerate(block) if i not in set(synth)] or block
+    return axes_in_screen(rows, text_w, align, True, W, anchor_axis(real, align, True)[0])
+
+
+def body_size(rows: list[list[float]], lines: list[str], font: str, widths: dict, em: float | None,
+              box_w: float | None, W: int, latin_em: float | None = None) -> int:
+    """正文译文（matched 的 body / extra）的字号，阶段 3 和阶段 4 共用（line-breaks 计划 D1，owner 2026-11-09）：
+
+    * 一个全角字宽 ≈ 原文的一字宽 `em`（`em_unit` 换算）；没有 `em` 退回 `fit_line`（按 `rows` 的框适配、有保底）；
+      英文译文（给了 `latin_em`，按输出语种给、不看内容）改成一个拉丁字的平均宽 ≈ `latin_em × em`（`latin_unit` 换算；`latin_em` 是这款游戏英文版量出的）
+      ——英文版的字体比中文版的拉丁字宽，照全角字换算会比英文版小一截（en-target 计划）；
+    * 译文行比原文宽就顺着对齐方向往外画（锚轴不动，左对齐往右长），上限是文本框宽 `box_w`，没有就是画面宽 `W − 4·EDGE_PAD`；
+      最宽那行超过上限就缩到刚好放进去，不设 `OVERLAY_MIN_SCALE` 那条下限（缩就是为了放进去）；整条一个字号。
+    选项、名牌不走这里（`fit_line` + 同栏同字号）。"""
+    if latin_em and (lu := latin_unit(font, widths)) > 0:
+        unit = lu / latin_em
+    else:
+        unit = em_unit(font, widths)
+    size = em / unit if em and unit > 0 else fit_line(rows, lines, font, widths, True, W)
+    cap = box_w if box_w else W - 4 * EDGE_PAD
+    w1 = max((line_width(font, ln, widths) for ln in lines), default=0.0)
+    if w1 > 0 and w1 * size > cap:
+        size = cap / w1
+    return max(export.FIT_MIN_SIZE, int(size))
+
+
+def words(p: str, k: int) -> list[str]:
+    """英文段按词折成每行至多 `k` 个字（单词比 `k` 长就独占一行），空格留在上一行末尾：几行无分隔地拼回去就是原段。"""
+    out = [""]
+    for w in re.findall(r"\s*\S+\s*", p) or [p]:
+        if out[-1] and len(out[-1]) + len(w.rstrip()) > k:
+            out.append("")
+        out[-1] += w
+    return out
 
 
 def same_size(boxes: list[tuple[int, int, list[float]]], sizes: list[int]) -> list[int]:
@@ -202,9 +383,10 @@ def stacked_axes(items: list[tuple[int, int, list[float]] | None], text_w: list[
 
 
 def block_layout(box: list[float], paras: list[str], row_h: int, font: str, widths: dict,
-                 size: int | None = None) -> tuple[int, list[str]]:
+                 size: int | None = None, latin: bool = False) -> tuple[int, list[str]]:
     """长文本块：译文按段折行填进块里。字号从原文行高换算起，放不下就往小缩（`size` 给了就用它，只折行）；
-    折行按每段的平均字宽手算（libass 的自动折行只在空格处断，中文整段不会折）。返回（字号, 折好的行，段间空一行）。"""
+    折行按每段的平均字宽手算（libass 的自动折行只在空格处断，中文整段不会折）；英文译文（`latin`，按输出语种给）只在空格处断，
+    断处的空格留在上一行末尾（阶段 4 把行无分隔地拼回段落，词不粘连）。返回（字号, 折好的行，段间空一行）。"""
     bw, bh = box[2] - box[0], box[3] - box[1]
     unit = [sum(widths.get((font, c), 0.0) for c in chunks(p)) / max(1, len(p)) for p in paras]
 
@@ -212,7 +394,7 @@ def block_layout(box: list[float], paras: list[str], row_h: int, font: str, widt
         out = []
         for p, u in zip(paras, unit):
             k = max(1, int(bw / max(u * size, 1e-6)))
-            out += [p[i:i + k] for i in range(0, len(p), k)] + [""]
+            out += (words(p, k) if latin else [p[i:i + k] for i in range(0, len(p), k)]) + [""]
         return out[:-1]
     if size is not None:
         return size, layout(size)

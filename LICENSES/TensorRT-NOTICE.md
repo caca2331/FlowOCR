@@ -1,6 +1,6 @@
 # NVIDIA TensorRT（可选后端）
 
-flowocr 可以用 NVIDIA TensorRT 在 GPU 上执行检测和识别（使用手册的 TensorRT 一节）。TensorRT 是 NVIDIA 的专有软件，按 NVIDIA 软件许可协议（NVIDIA Software License Agreement）提供：
+flowocr 可以用 NVIDIA TensorRT 在 GPU 上执行检测和识别（使用手册 `docs/manual/reference.md` 的 TensorRT 一节）。TensorRT 是 NVIDIA 的专有软件，按 NVIDIA 软件许可协议（NVIDIA Software License Agreement）提供：
 
 - **flowocr 不分发 TensorRT**：发行包和源码仓库里都没有它的任何文件，`pyproject.toml` 的依赖里也没有。
 - 用户运行 `flowocr-trt install` 时，程序从 NVIDIA 的包索引（`https://pypi.nvidia.com/tensorrt-cu13-libs/`）取 `tensorrt-cu13-libs` 发行包里的几个文件，

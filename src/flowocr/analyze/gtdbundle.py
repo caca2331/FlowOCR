@@ -289,7 +289,7 @@ def locate(game: str, where: str | Path | None = None) -> Bundle:
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    ap = argparse.ArgumentParser(prog="python -m flowocr.analyze.gtdbundle",
+    ap = argparse.ArgumentParser(prog=f"{paths.python_cmd()} -m flowocr.analyze.gtdbundle",   # 帮助里的写法 uv tool 装的也能照抄
                                  description="找游戏文本包、核对包里每个文件的哈希，再打印它的身份（指纹 / 位置 / 全部来源信息）")
     ap.add_argument("game")
     ap.add_argument("--gametext", default=None, help="包 / 包目录（默认 paths.gametext_root()）")

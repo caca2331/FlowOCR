@@ -2455,8 +2455,8 @@ def ruby_runs(runs: list[Run]) -> set[int]:
     return out
 
 
-RUN_SPECIFIC = ("outdir", "tag")
-"""每次都不一样、不进默认指纹的选项。"""
+RUN_SPECIFIC = ("outdir", "tag", "viewport")
+"""每次都不一样、不进默认指纹的选项（`viewport` 是这段录像的游戏画面位置）。"""
 
 
 def defaults_fingerprint(ap: argparse.ArgumentParser) -> tuple[str, str]:
@@ -2550,9 +2550,13 @@ def provenance(args, meta: dict, main_srt: str = "", main_track: str = "",
             "video": portable(meta.get("video")), "sample_fps": meta.get("sample_fps"),
             "main_srt": main_srt, "main_track": main_track, "main_cues": main_cues,
             "argv": [portable(x) for x in sys.argv[1:]],
-            **({"matcher": {"spec": portable(args.matcher), "patch": args.matcher_patch,
-                            "overridden": args.matcher_overridden}} if getattr(args, "matcher", None) else {}),
-            "args": {k: portable(v) if isinstance(v, str) else v for k, v in sorted(vars(args).items())}}
+            # 游戏画面在录像里的位置（`--viewport`）：建轨不用它，匹配时没给 `--ctx viewport=` 就用它对版式文件（`tracksio.recorded_viewport`）
+            **({"viewport": list(args.viewport_box)} if getattr(args, "viewport_box", None) else {}),
+            # `ctx`：给匹配器的 `--matcher-ctx`；其中的 `game` 在用同一个匹配器匹配、没给 `--ctx game=` 时继承（`match.context_of`，《魔裁》的 `game=mocai` 只写一次）
+            **({"matcher": {"spec": portable(args.matcher), "patch": args.matcher_patch, "overridden": args.matcher_overridden,
+                            "ctx": {k: portable(v) for k, v in getattr(args, "matcher_context", {}).items()}}}
+               if getattr(args, "matcher", None) else {}),
+            "args": {k: portable(v) if isinstance(v, str) else v for k, v in sorted(vars(args).items()) if k not in ("matcher_context", "viewport_box")}}
 
 
 OBS_NO_SIZE = "obs 缺 width / height（2026-10-06 删了按视频补探尺寸的回退）：这是很早的 obs，复用判据本来也拒，重跑 run_ocr2"
@@ -2579,7 +2583,7 @@ def apply_matcher_patch(ap: argparse.ArgumentParser, argv: list[str] | None = No
     """
     from flowocr import extensions
     args = ap.parse_args(argv)
-    args.matcher_patch, args.matcher_overridden = {}, {}
+    args.matcher_patch, args.matcher_overridden, args.matcher_context = {}, {}, {}
     if not args.matcher:
         return args
     ctx = {"tag": effective_tag(args)}   # 不写 --tag 时产物用 obs 文件名当标签，匹配器认游戏也得看同一个（复审 P2）
@@ -2603,6 +2607,7 @@ def apply_matcher_patch(ap: argparse.ArgumentParser, argv: list[str] | None = No
         kept = {k: v for k, v in patch.items() if k not in args.matcher_overridden}
         print(f"[匹配器补丁] {args.matcher}：{kept or '（无）'}"
               + (f"；命令行覆盖了 {args.matcher_overridden}" if args.matcher_overridden else ""), flush=True)
+    args.matcher_context = {k: v for k, v in ctx.items() if k != "tag"}
     return args
 
 
@@ -2619,6 +2624,9 @@ def make_parser() -> argparse.ArgumentParser:
                          "当默认聚类规则的补丁：生效顺序是内置默认 -> 匹配器补丁 -> 命令行显式给的")
     ap.add_argument("--matcher-ctx", action="append", default=[], metavar="K=V",
                     help="给匹配器 `cluster_patch` 的上下文，可多次；`tag` 自动带上（内置 gametext 按它认游戏）")
+    ap.add_argument("--viewport", default=None, metavar="X,Y,W,H",
+                    help="游戏画面在录像里的位置（像素，左上角和宽高）：主播布局、画中画、黑边这类游戏不占满录像的给它。"
+                         "建轨不用，记进产物，匹配时对版式文件用（匹配的 --ctx viewport= 给了以那边为准）；不给匹配时推算")
     ap.add_argument("--iou", type=float, default=0.35)
     ap.add_argument("--sim", type=float, default=SIM_THR)
     # 半帧余量是给 `round()` 出来的标称间隔留的抖动余地（build_runs 里那段 1 µs 的账），不是给丢帧留的。
@@ -2847,6 +2855,12 @@ def main() -> int:
     W, H = meta.get("width"), meta.get("height")
     if not W:
         raise SystemExit(OBS_NO_SIZE)
+    if args.viewport:                        # 建轨不用它，只记；格式、出没出画面现在就核，别等到匹配才报
+        try:
+            args.viewport_box = tracksio.parse_viewport(args.viewport)
+            tracksio.check_viewport(args.viewport_box, W, H)
+        except ValueError as e:
+            raise SystemExit(f"--viewport：{e}")
     frame_us = int(round(1e6 / meta["sample_fps"]))
     t0_us = min(o["t_us"] for o in obs)
     dur_us = max(o["t_us"] for o in obs) + frame_us

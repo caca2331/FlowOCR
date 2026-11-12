@@ -50,12 +50,40 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 from pathlib import Path
 
 SCHEMA = "flowocr-tracks/1"
 
 ALIGNS = ("left", "center", "right")
 """`regions[].align` 的取值。"""
+
+
+def parse_viewport(s: str | None) -> tuple[float, float, float, float] | None:
+    """游戏画面在录像里的位置 `x,y,w,h`（录像像素；建轨的 `--viewport`、匹配的 `--ctx viewport=`）→ 四个数；没给是 None。"""
+    if not s:
+        return None
+    try:
+        v = tuple(float(x) for x in s.split(","))
+    except ValueError:
+        v = ()
+    if len(v) != 4 or not all(math.isfinite(x) for x in v) or v[2] <= 0 or v[3] <= 0:
+        raise ValueError(f"viewport={s!r} 要是 x,y,w,h 四个数（录像像素，宽高为正）")
+    return v
+
+
+def check_viewport(v: tuple[float, float, float, float], W: float, H: float) -> None:
+    """游戏画面要整个在录像画面里，不然报错。"""
+    x, y, w, h = v
+    if x < 0 or y < 0 or x + w > W or y + h > H:
+        raise ValueError(f"viewport={x:g},{y:g},{w:g},{h:g} 出了录像画面（{W:g}×{H:g}）")
+
+
+def recorded_viewport(doc: dict | None) -> str | None:
+    """建轨时 `--viewport` 记在 `provenance.viewport` 里的游戏画面位置，写回 `x,y,w,h`；没记是 None。
+    匹配时没给 `--ctx viewport=` 就用它对版式文件（`analyze.textbox.locate`）：游戏画面在哪是这段录像的事，建轨时给一次，以后每次重跑匹配都带上。"""
+    v = ((doc or {}).get("provenance") or {}).get("viewport")
+    return ",".join(f"{x:g}" for x in v) if v else None
 
 ROW_OVERLAP = 0.5
 """两个框算同一行：纵向重叠至少是较矮那个字高的这么多（`same_row`）。"""
@@ -539,30 +567,38 @@ def refresh_cue_bounds(doc: dict, before: dict[int, tuple[int, int]] | None = No
             cues[k]["t_start"], cues[k]["t_end"] = a, max(a, b)
 
 
-DRIVER_OPTS = ("--outdir", "--tag")
-"""驱动（head2head.sh / gametext_eval.sh）自己填的选项，不属于"这一臂的旋钮"。"""
+NOT_KNOBS = ("--outdir", "--tag", "--viewport")
+"""不属于"这一臂的旋钮"的建轨选项（同 `build_tracks.RUN_SPECIFIC`）：驱动（head2head.sh / gametext_eval.sh）自己填的输出位置和标签，
+加上这段录像的游戏画面位置（`--viewport`，建轨不用、只记）。后者不剥的话，驱动的 BUILD_ARGS 没带它就会判成参数变了、重建，
+重建出来的轨道丢了人给的位置；剥了的代价是旧轨道没记位置时驱动加 `--viewport` 不触发重建，要 `FORCE=1`。"""
+
+
+def knob_args(argv: list[str], obs: str | None = None) -> list[str]:
+    """命令行去掉不算旋钮的那几样（`NOT_KNOBS`，空格和 `=` 两种写法；给了 `obs` 再去掉第一个等于它的位置参数）。
+    产物那一侧（`build_args`）和驱动这一趟要的 BUILD_ARGS 都过它再比：只剥一侧的话，BUILD_ARGS 带 `--viewport` 就次次判成参数变了。"""
+    out, obs_seen, i = [], obs is None, 0
+    while i < len(argv):
+        x = argv[i]
+        if x in NOT_KNOBS:
+            i += 2
+            continue
+        if not obs_seen and x == obs:
+            obs_seen = True
+        elif not any(x.startswith(o + "=") for o in NOT_KNOBS):
+            out.append(x)
+        i += 1
+    return out
 
 
 def build_args(prov: dict) -> list[str]:
-    """provenance 的 `argv` 去掉驱动自己填的那几样（obs 位置参数、`--outdir`、`--tag`），剩下的就是
-    这一臂的 BUILD_ARGS，驱动拿它和这一趟要的比，对不上就重建。
+    """provenance 的 `argv` 去掉不算旋钮的那几样（obs 位置参数、`NOT_KNOBS`，`knob_args`），剩下的就是
+    这一臂的 BUILD_ARGS，驱动拿它和这一趟要的（同样过 `knob_args`）比，对不上就重建。
 
     以前两个驱动各写 `argv[5:]`，依赖"恰好按 obs / --outdir / --tag 的顺序、用空格形式传"
     （audit-6）；这里按名剥，obs 按 provenance 里记的那个字符串认。
     ⚠ provenance 里的 `argv` 经过 `provenance.portable`（绝对路径记成相对数据根 / `~/…`）：驱动传的 BUILD_ARGS 若含绝对路径，
     要先过同一个函数再比，否则白重建一次（现有驱动都传相对路径，不受影响）。"""
-    out, argv, obs_seen, i = [], list(prov["argv"]), False, 0
-    while i < len(argv):
-        x = argv[i]
-        if x in DRIVER_OPTS:
-            i += 2
-            continue
-        if not obs_seen and x == prov.get("obs"):
-            obs_seen = True
-        elif not any(x.startswith(o + "=") for o in DRIVER_OPTS):
-            out.append(x)
-        i += 1
-    return out
+    return knob_args(list(prov["argv"]), prov.get("obs"))
 
 
 def load_regions(path: Path) -> tuple[dict, list[dict]]:

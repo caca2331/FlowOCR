@@ -43,11 +43,11 @@ python dev_tools\residue_scan.py diff --before before-<name> --after after-<name
 ```powershell
 # 阶段 1：视频 -> obs
 python dev_tools\pyrun.py -m flowocr.extract.run_ocr2 <video> --out <obs.jsonl>          # 或 flowocr-ocr；开发和基线一律 --quality high（驱动都已带上，放在 $OCR_ARGS 前面）
-python dev_tools\pyrun.py -m flowocr.extract.run_groups ...                                # 自选范围多组同时跑（见使用手册「只识别画面的一部分」）
+python dev_tools\pyrun.py -m flowocr.extract.run_groups ...                                # 自选范围多组同时跑（见使用手册参考篇「只识别画面的一部分」）
 # 阶段 2：obs -> tracks.json（一级产物）；匹配器
 python dev_tools\pyrun.py -m flowocr.analyze.build_tracks <obs.jsonl> --outdir <dir> --tag <tag>
 python dev_tools\pyrun.py -m flowocr.analyze.match <tracks.json> --matcher gametext --ctx ref=<ref.json> --out <matched.json>
-# 阶段 3：出字幕 / 字幕稿（见 docs/architecture/artifacts.md 的导出与字幕稿两节）
+# 阶段 3：出字幕 / 字幕稿（见 docs/architecture/artifacts.md 的导出与字幕稿两节）；同名字幕稿已在时不覆盖、报错，重出加 --force（库调用照写）
 python dev_tools\pyrun.py -m flowocr.output.render <matched.json> --preset matched_srt --opt lang=cn
 python dev_tools\pyrun.py -m flowocr.output.render <tracks.json> --preset script --opt keep=all --outdir <dir>   # 只写字幕稿
 python dev_tools\pyrun.py -m flowocr.output.export <tracks.json> --outdir <dir>                # 逐轨 SRT
@@ -94,6 +94,7 @@ python dev_tools/hit_delta.py 1 2 3 4 5 --b=<臂后缀>  # 跨臂的命中集合
 python dev_tools/claim_audit.py <ref.json> <tracks.json> [--feed main] [--frames <目录>]   # 逐次列出打字机半截认领和改认长台词，--frames 每次抽三帧（新素材上的观察项）
 python dev_tools/miss_detect.py <matched.json> [--vs <另一臂>] --out <x.json>   # 疑似漏字幕：该出现的行（台词、选项、过场、界面文字…）按显示协议判输出没有、按组分栏、漏的定层；B 清单（文本包外的字）
 python dev_tools/miss_detect.py <naninovel 的 matched.json> --span-ref <参照字幕 _jp.ass> --out <x.json>   # 同上，顺序剧本（《魔裁》）：参照字幕圈分母
+python dev_tools/pyrun.py dev_tools/layout_export.py <matched.json> ... --game <游戏>   # 从整场匹配产物导出叠加的版式文件（src/flowocr/analyze/layouts/<游戏>.json，短片段量不出的画像从它补；改了 textbox 的量法要重新导出；改了导出逻辑，重导一次和提交的文件比对；主播布局这类游戏画面不占满录像的，建轨给 --viewport（或匹配给 --ctx viewport=）重跑匹配）
 python dev_tools/tracks_identical.py <目录A> <目录B>  # 两份建轨产物是否相同（先剥 provenance；先做 A/A）
 python dev_tools/use2_arms.py <out> "臂名=build_tracks 参数" ... [--tags a,b] [--jobs 4]   # 用途 2 多臂对照：每臂 build_tracks -> scriptmatch -> game_align，追加进 <out>/results.jsonl
 python dev_tools/h_ratio_ruler.py data/gt/slotpairs-*.json --split dev   # 聚类的尺上多臂打分，打逐对翻转清单（在数据根里跑）
@@ -124,7 +125,7 @@ python dev_tools/preview.py <tracks.json|matched.json> --preset dev [--opt lang=
 - 文字怎么动：`dev_tools/probe_motion.py <obs.jsonl> --out <tsv>`。
 - CI（`.github/workflows/ci.yml`）分 Windows + CPU 和 Linux + CPU 两个 job（Linux 那个的 ffmpeg 用 BtbN 的 8.1 静态构建，不打包、不查文档）。除守卫与文档检查外：`dev_tools/ci_smoke.py`（生成带字幕的视频，走完提取、建轨、输出、渲染、底板烧录）；`uv build` 打 sdist 与 wheel 并 `twine check`；`dev_tools/ci_extensions.py`（在 wheel 装进的全新 venv 里，
   用装好的命令加载 `examples/` 的匹配器和预设；要非 editable 的环境，本地验证可以 `uv build --wheel` 之后 `--no-deps` 装进临时 venv）。
-- 发版（`.github/workflows/release.yml`，手动派发）：从 `main` 或 tag 构建，在全新 venv 里装 wheel 跑冒烟。离线冒烟用模型包装 OCR 模型，另预取 LaMa，禁掉下载后也跑一小段 inpainting。再按 target 传 TestPyPI，或建 GitHub Release 后传 PyPI。用法见文件头。
+- 发版（`.github/workflows/release.yml`，手动派发）：从 `main` 或 tag 构建，在全新 venv 里装 wheel 跑冒烟。离线冒烟用模型包装 OCR 模型，另预取 LaMa，禁掉下载后也跑一小段 inpainting。`target=release` 时再建 GitHub Release、传 PyPI。用法见文件头。
 
 各工具的用法在它自己的文件头。
 

@@ -86,7 +86,7 @@ def cmd_run(a) -> None:
                 subprocess.run([sys.executable, "-m", "flowocr.analyze.build_tracks", str(obs), "--outdir", str(out), "--tag", TAG, *a.build_args],
                                check=True, stdout=f, stderr=subprocess.STDOUT)
                 if not a.no_render:
-                    subprocess.run([sys.executable, "-m", "flowocr.output.render", str(out / f"{TAG}-tracks.json")],
+                    subprocess.run([sys.executable, "-m", "flowocr.output.render", str(out / f"{TAG}-tracks.json"), "--force"],
                                    check=True, stdout=f, stderr=subprocess.STDOUT)
             print(f"{cid}/{arm}/{a.variant} ok")
 

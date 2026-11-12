@@ -1,6 +1,5 @@
 # 发版：手动派发，只有一个输入 target。做法与先后在维护者的 release skill 里；这里只说 workflow 自己保证什么。
 #   dry-run   gh workflow run release.yml --repo caca2331/FlowOCR --ref main -f target=dry-run       构建 + 全部验证，什么都不发
-#   testpypi  gh workflow run release.yml --repo caca2331/FlowOCR --ref main -f target=testpypi      版本改成 <版本>.dev<run_number> 传 TestPyPI，再从那里装回来跑冒烟
 #   release   gh workflow run release.yml --repo caca2331/FlowOCR --ref v<版本> -f target=release    GitHub Release 在前、PyPI 最后，传完从 PyPI 装回来跑冒烟
 # workflow 定义和检出的代码都取自 --ref 指的那个提交。PyPI 的版本号传过一次就永久占用，所以 PyPI 永远是最后一个 job，
 # 之前的核对（版本三处一致、这个提交的 CI 是绿的、PyPI 上还没有这个版本）都过了才走到它。
@@ -13,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "dry-run（只构建与验证）/ testpypi / release"
+        description: "dry-run（只构建与验证）/ release"
         required: true
         type: choice
-        options: [dry-run, testpypi, release]
+        options: [dry-run, release]
         default: dry-run
 
 permissions:
@@ -61,7 +60,6 @@ jobs:
           REF: ${{ github.ref }}
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
-          RUN_NUMBER: ${{ github.run_number }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $ver = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -78,10 +76,6 @@ jobs:
           }
           $ok = gh api "repos/$($env:REPO)/actions/runs?head_sha=$($env:SHA)&status=success" --paginate --jq '.workflow_runs[] | select(.name == "CI") | .id'
           if (-not $ok) { throw "提交 $($env:SHA) 上没有一次成功的 CI" }
-          if ($env:TARGET -eq 'testpypi') {
-            $ver = "$ver.dev$($env:RUN_NUMBER)"
-            (Get-Content pyproject.toml) -replace '^version = ".*"', "version = `"$ver`"" | Set-Content pyproject.toml
-          }
           "version=$ver" >> $env:GITHUB_OUTPUT
           "版本 $ver，提交 $($env:SHA)，target $($env:TARGET)"
 
@@ -162,50 +156,6 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           overwrite: true
-
-  testpypi:
-    needs: build
-    if: inputs.target == 'testpypi'
-    runs-on: ubuntu-latest
-    environment: testpypi
-    permissions:
-      id-token: write    # Trusted Publishing
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-      - run: rm dist/flowocr-models-*.zip
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-          skip-existing: true    # .devN 每个 run 唯一；重跑失败 job 时跳过已传的那个
-
-  testpypi-verify:
-    needs: [build, testpypi]
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - name: ffmpeg
-        run: choco install ffmpeg -y --no-progress
-      - name: 按 TestPyPI 上 wheel 的直接链接装 [cpu]（依赖照常从 PyPI 取），跑冒烟
-        shell: pwsh
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true   # 原生命令退出非 0 就停在这一步（默认只看最后一条）
-          $url = $null
-          foreach ($i in 1..20) {
-            try { $url = ((Invoke-RestMethod "https://test.pypi.org/pypi/flowocr/$($env:VERSION)/json").urls | Where-Object packagetype -eq 'bdist_wheel').url } catch {}
-            if ($url) { break }; Start-Sleep 15
-          }
-          if (-not $url) { throw "TestPyPI 上等不到 flowocr $($env:VERSION) 的 wheel" }
-          uv venv tmp\v-test --python 3.12
-          uv pip install --python tmp\v-test\Scripts\python.exe "flowocr[cpu] @ $url"
-          tmp\v-test\Scripts\python.exe dev_tools\ci_smoke.py --device cpu --workdir tmp\smoke-test
-          if ($LASTEXITCODE) { throw "冒烟失败" }
 
   github-release:
     needs: build

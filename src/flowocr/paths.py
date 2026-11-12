@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -143,6 +144,15 @@ def resolve_model(path: str) -> str:
         return str(p)
     cand = models_root() / p.name
     return str(cand) if cand.exists() else path
+
+
+def python_cmd() -> str:
+    """当前解释器写成能直接粘进终端的形式：`uv tool install` 装的用户 PATH 上的 `python` 导不进 flowocr，打给人照抄的
+    `-m flowocr.…` 命令要用这一个。Windows 上带空格时按 PowerShell 写（`& "…"`），别处按 POSIX shell 引（安全的路径原样）。"""
+    exe = sys.executable
+    if sys.platform == "win32":
+        return f'& "{exe}"' if " " in exe else exe
+    return shlex.quote(exe)
 
 
 def child_env(env: dict | None = None) -> dict:

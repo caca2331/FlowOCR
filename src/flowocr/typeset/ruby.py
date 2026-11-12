@@ -142,23 +142,21 @@ def tokens_of(p: Placed) -> list[tuple]:
     return tags + [("ch", p.ruby.reading, p.ruby.t)]
 
 
-def union(plate: list[float], rects: list[list[float]]) -> list[float]:
-    """底板矩形并进几处读音（各外扩底板的边距）。"""
-    pad = layout.OVERLAY_PAD
+def union(plate: list[float], rects: list[list[float]], pad: float) -> list[float]:
+    """底板矩形并进几处读音（各外扩底板的边距 `pad`）。"""
     return [min([plate[0]] + [r[0] - pad for r in rects]), min([plate[1]] + [r[1] - pad for r in rects]),
             max([plate[2]] + [r[2] + pad for r in rects]), max([plate[3]] + [r[3] + pad for r in rects])]
 
 
-def with_rubies(plates: list[list[float]], rects: list[list[list[float]]], mode: str) -> list[list[float]]:
+def with_rubies(plates: list[list[float]], rects: list[list[list[float]]], mode: str, pad: float) -> list[list[float]]:
     """底板并进读音：`box` 一整块并进全部，`rows` / `text` 每行那块并进这一行的（`rects[i]` 是第 i 行的读音矩形）。
     逐行的底板往上长进了上一行那块、而读音（外扩边距后）横向都在上一行那块以内时，上沿停在上一行的下沿：
     那一截已经被上一行盖着，再叠一层半透明会更黑；横向伸出去的照并（叠一条，R6 的已知限度）。"""
     if not plates or not any(rects):
         return plates
     if mode == "box":
-        return [union(plates[0], [r for rs in rects for r in rs])]
-    out = [union(pl, rs) for pl, rs in zip(plates, rects)]
-    pad = layout.OVERLAY_PAD
+        return [union(plates[0], [r for rs in rects for r in rs], pad)]
+    out = [union(pl, rs, pad) for pl, rs in zip(plates, rects)]
     for k in range(1, len(out)):
         a, b = out[k - 1], out[k]
         if b[1] < a[3] and all(a[0] <= r[0] - pad and r[2] + pad <= a[2] for r in rects[k]):

@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowocr"
-version = "0.3.0"
+version = "1.0.0"
 description = "从视频里抽全部屏幕文字、带起止时间、按区域聚类，导出 SRT / ASS"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -27,7 +27,8 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: End Users/Desktop",
     "Natural Language :: Chinese (Simplified)",
-    "Operating System :: Microsoft :: Windows",   # 只在 Windows 上验证过；别的平台起跑时打警告（owner 2026-10-02）
+    "Operating System :: Microsoft :: Windows",   # 验证过 Windows 与 Linux（只在 WSL2 的 Ubuntu 24.04 上）；Linux 与别的平台起跑时打一行说明照跑（ffcheck，owner 2026-10-02）
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.12",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Image Recognition",
@@ -95,7 +96,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # 实验性聚类 `--cluster learned` 的模型随代码走（slot_learned.MODEL_PATH）
-"flowocr.analyze" = ["models/*.json"]
+# 叠加的版式文件（textbox.LAYOUT_DIR，一款游戏一份，短片段量不出的画像从它补）
+"flowocr.analyze" = ["models/*.json", "layouts/*.json"]
 # TensorRT 后端启动自检的输入图（trt_engine.CHECK）
 "flowocr.extract" = ["trt_check.npz"]
 

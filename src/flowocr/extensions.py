@@ -17,7 +17,8 @@ project-structure 计划："少量入口，直接可改"——普通 Python 模�
 
 * 匹配器：`cluster_patch(context: dict, options: dict | None) -> dict`（可选；返回 build_tracks 的参数覆盖，
   键是参数名如 `region_time_gate`，由默认聚类器应用）、`match(document: dict, context: dict, options: dict | None) -> dict`
-  （输入阶段 2 的分析产物 `*-tracks.json` 的 dict，返回带匹配结果的产物 `*-matched.json` 的 dict）；
+  （输入阶段 2 的分析产物 `*-tracks.json` 的 dict，返回带匹配结果的产物 `*-matched.json` 的 dict；`context` 里的 `game`
+  没在匹配时给的话，可能来自建轨时给同一个匹配器的 `--matcher-ctx game=`，`flowocr.analyze.match.context_of`）；
   可选的 `PRESET = "<预设名>"` / `PRESET_OPTS = {…}`：这个匹配器的产物最适合哪个输出预设（`recommendation`）；
 * 输出预设：`render(document: dict, output_dir: Path | str, options: dict | None) -> list[Path]`
   （输入分析产物，写文件，返回写了哪些）；

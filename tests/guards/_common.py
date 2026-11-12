@@ -37,6 +37,26 @@ def high_quality_default(fn):
     return run
 
 
+FIXED_PAD = 14
+
+
+def fixed_pad(fn):
+    """装饰守卫：执行期间底板边距钉成 `FIXED_PAD` 像素、不随字号变（`layout.plate_pad`）。这些守卫测的是底板的几何
+    （按哪些框、怎么劈开、跟着字长），期望值按一个常数边距写；边距随字号变的口径在 `t_plate_pad`。"""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        from flowocr.output import layout
+        old = layout.PLATE_PAD_PX, layout.PLATE_PAD_EM
+        layout.PLATE_PAD_PX, layout.PLATE_PAD_EM = FIXED_PAD, 0.0
+        try:
+            return fn(*a, **k)
+        finally:
+            layout.PLATE_PAD_PX, layout.PLATE_PAD_EM = old
+    return run
+
+
 def raises(fn, exc: type[BaseException] = Exception) -> bool:
     """`fn()` 抛不抛。**"守卫真的会响"和"正常路径没坏"是两件事**，两边都要测。"""
     try:
@@ -499,4 +519,4 @@ def _zip_bundle(src: Path, dst: Path, game: str = "genshin", tamper: str | None 
     return dst
 
 
-__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', '_every', 'check', 'high_quality_default', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']
+__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', '_every', 'check', 'high_quality_default', 'FIXED_PAD', 'fixed_pad', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']

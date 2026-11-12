@@ -14,6 +14,12 @@ SMALL_KANA = str.maketrans("ぁぃぅぇぉっゃゅょゎァィゥェォッャ�
 """小书写假名折成大的。日文 rec 常把大小写读反（`あてぃし` → `あていし`，同一句前后两帧也会读得不一样）。"""
 
 
+def cw(c: str) -> float:
+    """一个字占几个全角字宽：全角（含宽度不定的引号、省略号）1，其余 0.5。
+    阶段 3 折译文（`output.script.wrap_lines`）和匹配器量原文一行的宽（`analyze.textbox`）共用这一份。"""
+    return 1.0 if unicodedata.east_asian_width(c) in "WFA" else 0.5
+
+
 def fold(t: str) -> str:
     """NFKC + 小书写假名折大。"""
     return unicodedata.normalize("NFKC", t).translate(SMALL_KANA)

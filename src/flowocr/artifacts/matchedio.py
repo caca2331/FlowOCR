@@ -8,7 +8,7 @@
 一份 matched 里有什么：`cues`（一条 cue 一条记录，`ref` 是认领的剧本行或 None；剧本给得出说话人时 `ref` 带
 `speaker` / `speaker_cn`，旁白是 None——内置的 `naninovel` 匹配器给，字段名同 `gamescript` 的剧本行）、`stats`、`provenance`
 （含 `subs`：产它的那份 `*-tracks.json`），以及可选的 `overlay`（叠加层判定，`--no-overlay` 时没有）
-和 `fills`（匹配器猜的占位的值，`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …}, "how": 从哪来, …}}`；没有占位、或匹配器不猜时没有）。
+和 `fills`（匹配器猜的占位的值，`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …, "en"?: …}, "how": 从哪来, …}}`；没有占位、或匹配器不猜时没有）。
 `cues[]` 的每条记录和它的每条 `extra` 都带 `echo` / `echo_of`（回显判定，`flowocr.analyze.echo`；见 `ECHOES`），
 `overlay.items` 的 `body` / `extra` 条目带 `claim`（它是哪次认领，`[记录下标, slot]`）和那次认领的 `echo` / `echo_of`
 （SRT 投影按它们去回显：主那次认领有条目要出时才去，见 `script.srt_blocks`；叠加照画）。
@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-SCHEMA = "flowocr-matched/7"
+SCHEMA = "flowocr-matched/8"
 """`*-matched.json` 的版本。**写它的人必须有个读它的人**（2026-09-15 审计）：
 `/1` → `/2` 升过一次而全仓库没有一处读这个字符串，等于没有版本控制——
 旧产物喂给期待 `overlay` 的代码只会得到 `KeyError`，而不是"这是旧 schema"。
@@ -33,10 +33,32 @@ SCHEMA = "flowocr-matched/7"
 /7（2026-11-05）：名牌逐块分组——挂在认上的台词上的留在 `name` 组，没挂上的归 `stray_name`（`NAME_GROUPS`）；
 挂上的称号另成一层 `title`（`LAYERS`）。读 /6 的下游会把称号当未知的层、把 `stray_name` 当没声明的组，所以升版本。
 /7 之内加的**可选**字段（2026-11-05）：名牌条目的 `ink`（判过字色：和这款游戏的名牌色对不对得上，`analyze.nameink`）、
-`overlay.name_ink`（判过时各层的名牌色 `#rrggbb`）。读的一方缺了就是没判、照白字画，所以没升版本。"""
+`overlay.name_ink`（判过时各层的名牌色 `#rrggbb`）。读的一方缺了就是没判、照白字画，所以没升版本。
+/8（2026-11-10，line-breaks 计划）：叠加按原文整块摆行——`overlay.textbox`（区域号 → 文本框画像）和 `body` / `extra` 条目的
+`block` / `block_src` / `block_drawn_by`（`analyze.textbox`）。阶段 3 出叠加时缺了就报错（`output.script.need_textbox`），所以升版本；
+/7 整个拒收（这里按整串比），提示重跑匹配。"""
 
-TEXT_KEYS = ("jp", "jp_tpl", "cn", "jp_rich", "cn_rich")
-"""剧本行带进认领和叠加条目的文本字段（`text_of`）。"""
+TEXT_KEYS = ("jp", "jp_tpl", "cn", "jp_rich", "cn_rich", "en", "en_rich")
+"""剧本行带进认领和叠加条目的文本字段（`text_of`）。`en` / `en_rich` 是可选的（剧本带英文时才有，2026-11-10 en-target 计划），
+读的一方缺了照常工作，所以没升版本；要出英文时 `need_lang` 核一遍产物里有没有。"""
+LANGS = ("jp", "cn", "en")
+"""输出能选的语种（`lang`）：日文原文、中文译文、英文译文。"""
+
+
+def need_lang(doc: dict, lang: str) -> None:
+    """`lang` 不认得、或产物里一条这个语种的文本都没有（`en`：匹配器 / 剧本不带英文，或是加英文之前跑的匹配）就报错，
+    别让整份叠加悄悄退回 OCR 原文。认领的剧本行、叠加条目和阅读面板（`paras`，每段都有才算，同 `script` 的面板投影）都算。"""
+    if lang not in LANGS:
+        raise ValueError(f"lang 只能是 {' / '.join(LANGS)}：{lang!r}")
+    if lang == "jp":
+        return
+    has = any(c.get("ref") and c["ref"].get(lang) for c in doc.get("cues") or ()) \
+        or any(it.get(lang) or (it.get("paras") or {}).get(lang) and None not in it["paras"][lang]
+               for it in (doc.get("overlay") or {}).get("items") or ())
+    if not has:
+        raise ValueError(f"这份匹配产物里没有 {lang} 文本：匹配器或剧本不带这个语种"
+                         + ("；游戏文本包匹配器：剧本是加英文之前做的、或做剧本的文本包没有英文那份，用带英文的包重跑 `flowocr-gamescript`，"
+                            "再从轨道产物重跑匹配（不用重做 OCR）" if lang == "en" else ""))
 
 
 ECHOES = ("same_time", "log", "replay", "other")
@@ -131,6 +153,9 @@ NAME_GROUPS = {
     "name": {"tier": "on", "label": "名牌（挂在认上的台词上，含称号）"},
     STRAY_NAME: {"tier": "off", "label": "没挂在认上的台词上的名牌样文字（对话记录面板、队伍栏、头顶名字…）"}}
 """名牌层的两个组（owner 2026-11-05），两个内置匹配器（`gametext`、`naninovel`）的显示声明都带。"""
+SPECIAL = "special"
+"""特殊上屏形式的台词与提示（横幅、战斗喊话、白字提示…，`scriptmatch.group_of`）归的组（owner 2026-11-07）：
+阶段 3 的字幕稿用单独的样式 `Special`（`output.script.style_of`），两个 SRT 预设都不出。组仍由匹配器声明，没有这一组的匹配器照常。"""
 KEYWORDS = ("all", "fill")
 """`show` / `hide` 的关键字，不能当组名：`all` 是全部组加填位，`fill` 是填位。"""
 

@@ -782,7 +782,7 @@ def check_args(args) -> None:
         raise SystemExit("--refine-fused 要 --reuse-v2（链事件从它来）和 --decoder ffmpeg（辅助流和采样流数同一批帧）")
     if args.hwaccel and args.decoder != "ffmpeg":
         # `--decoder cv2` 是显式回退，这里不自作主张退硬解——两个都显式给了就是自相矛盾，该报错
-        raise SystemExit("--hwaccel 要 --decoder ffmpeg（要软解就 --hwaccel ''）")
+        raise SystemExit("--hwaccel 要 --decoder ffmpeg（要软解就 --hwaccel=）")
     # ⚠ 2026-09-20 之前这里还拦着 `--hwaccel` + `--refine-fused --refine-aux shared`，
     # 于是开硬解就自动退回两遍回抠（35–105 s），把硬解省下的全吃回去还倒欠。
     # 现在辅路在显存里 `scale_cuda` 缩完再 `hwdownload`，同一个 ffmpeg 分两路仍然成立。

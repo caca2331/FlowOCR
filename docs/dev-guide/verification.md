@@ -212,7 +212,7 @@
   改了没提交就跑，provenance 会指向一个并没有产生这份产物的 commit；**要引用表就先提交了重跑**。
 - 报表比**代码指纹**（`code_fp`，产物代码的内容 hash），不比 HEAD：HEAD 移动而代码没变不误报，两棵脏树也分得开。报数前先看工具印的那行指纹 / HEAD。
 - 复用判据看**解析后的生效参数**（`flowocr.extract.ocr_complete` / `ocr_args`，解析器只有一份）：第一版比命令行字面，比不出"默认值翻了"。没有 `config` 字段的旧产物一律重建。
-- 驱动缓存看参数和代码：`head2head.sh` / `gametext_eval.sh` 按 argv 和代码指纹失效（`build_tracks.cache_stale`：建轨的指纹表、`--cluster learned` / `lines` 另记的指纹、回抠结算的指纹，任何一份对不上就重建；`FORCE=1` 强制重来）；主轨文件名从 provenance 的 `main_srt` 读，**不许 glob 猜**
+- 驱动缓存看参数和代码：`head2head.sh` / `gametext_eval.sh` 按 argv 和代码指纹失效（`build_tracks.cache_stale`：建轨的指纹表、`--cluster learned` / `lines` 另记的指纹、回抠结算的指纹，任何一份对不上就重建；`FORCE=1` 强制重来；argv 不比 `--outdir` / `--tag` / `--viewport`，旧轨道要补记游戏画面位置得 `FORCE=1`）；主轨文件名从 provenance 的 `main_srt` 读，**不许 glob 猜**
   （2026-09-07：label 一变就是新文件名，`ls … | head -1` 按字典序挑中了隔夜的坏产物）。`build_tracks` 写产物前先 `clear_stale_srts()`。
 - 追溯要盖住整条链（审计三）：`merge_nameplate` 也是产匹配器输入的一级代码，写 `*-nameplate.json`（git HEAD + argv + 挑中了哪几个区域），`head2head.sh` 把它和 stdout（`-merge.log`）抄进 `tmp/h2h/`。
   `h2h_report` 按臂分组（以前四条 A/B 臂被数成"20 部片子"）。

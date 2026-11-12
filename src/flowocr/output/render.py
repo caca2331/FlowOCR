@@ -11,7 +11,7 @@
 | schema | 读法 | 内置预设 |
 | --- | --- | --- |
 | `flowocr-tracks/1` | `tracksio.load` | 叠加三个（`default` / `default_all` / `dev`，叠 OCR 原文）、`script`（只写字幕稿）、`default_srt`（主轨一份 SRT） |
-| `flowocr-matched/7` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`default_srt`（叠上去的译文一份 SRT）、`matched_srt`（拍平成 SRT） |
+| `flowocr-matched/8` | `matchedio.load` | 叠加三个（叠剧本译文）、`script`、`default_srt`（叠上去的译文一份 SRT）、`matched_srt`（拍平成 SRT） |
 | 别的（用户匹配器自己的格式） | 原样 `json.load`，**不校验** | 只有声明了这个 schema 的预设收（见 `ACCEPTS`） |
 
 不给 `--preset` 时：匹配产物里有匹配器的推荐（`provenance.recommend`，`flowocr.extensions.recommendation`）就用它（命令行 `--opt` 优先），
@@ -37,6 +37,7 @@ from pathlib import Path
 
 from flowocr import extensions, paths, provenance
 from flowocr.artifacts import matchedio, tracksio
+from flowocr.output import script
 from flowocr.output.presets import _overlay
 
 BURN = {"plate": None, "inpaint": "default", "hq": "hq"}
@@ -83,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--burn", choices=tuple(BURN),
                     help="叠加预设写完接着跑阶段 5，把最终 ASS 烧进源视频：plate 原样烧；inpaint / hq 先抹掉底板盖住的原文"
                          "（没给 plate 时带上 plate=src）。编码参数用阶段 5 的默认，要改就对最终 ASS 另跑 flowocr-burn")
+    ap.add_argument("--force", action="store_true",
+                    help="字幕稿（*.script.ass）已经在时也覆盖；不给时不覆盖、报错退出（它可能是改过的）")
     a = ap.parse_args(argv)
     opts = {}
     for kv in a.opt:
@@ -115,7 +118,13 @@ def main(argv: list[str] | None = None) -> int:
     preset = extensions.load(spec, "preset")
     check_accepts(preset, doc, spec)
     outdir = Path(a.outdir) if a.outdir else src.parent
-    written = preset.render(doc, outdir, opts)
+    token = script.OVERWRITE.set(a.force)
+    try:
+        written = preset.render(doc, outdir, opts)
+    except script.ScriptExists as ex:
+        raise SystemExit(str(ex)) from None
+    finally:
+        script.OVERWRITE.reset(token)
     for p in written:
         print(p)
     if a.burn:

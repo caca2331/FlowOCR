@@ -186,16 +186,17 @@ def t_miss_detect() -> None:
           MD.same_ref(pa, dict(pa)) == [] and MD.same_ref(pa, {**pa, "obs": "p.jsonl"}) == ["obs"]
           and raises(lambda: MD.compare({"provenance": pa, "rows": []}, {"provenance": {**pa, "gametext": "h"}, "rows": []}),
                      SystemExit))
-    # 端到端：a 已输出；g 和 a 几乎一样、没出 -> 另一版本；e 界面文字 -> 决定不显示；b 有锚点、tracks 里没有 -> 漏（建轨没留下）；
+    # 端到端：a 已输出；g 和 a 几乎一样、没出 -> 另一版本；e 界面文字 -> 决定不显示；sp 横幅（special，默认可见）没读到 -> 没读到；b 有锚点、tracks 里没有 -> 漏（建轨没留下）；
     # c 没锚点、obs 拼起来读到 -> 漏（锚点漏掉）；h 认领了、没有中文 -> 漏（画不出来）；d 只有碎片 -> 没读到；f 没播 -> 不进分母
     S = 1_000_000
     lines = [L("a", "今日はとても良い天気ですね", anchor=[10.0, 12.0]), L("g", "今日はとても良い天気ですよね"),
              L("b", "明日も晴れるといいですね", anchor=[20.0, 22.0]), L("c", "それでは一緒に行きましょうか"),
              L("h", "向こうの山はとても高いです", cn=None, anchor=[40.0, 42.0]), L("d", "全然読まれていない長い台詞です"),
-             L("e", "ここは注意が必要な場所です", kind="ReminderUI", anchor=[60.0, 62.0]), L("f", "見ていない部分の台詞", status="OutOfSpan"),
+             L("e", "ここは注意が必要な場所です", kind="Loose", role="UIText", anchor=[60.0, 62.0]), L("f", "見ていない部分の台詞", status="OutOfSpan"),
+             L("sp", "柱の氷晶を破壊して技を中断させよう", kind="ReminderUI", role="Banner", anchor=[65.0, 66.0]),
              L("v", "雨が降りそうな空模様ですね"), L("v2", "雨が降りそうな空模様だね", status="Variant", variant_of="v"),
              L("pp", "……"), L("bb", "まっ、安心してちょうだい。あんたたちの話", anchor=[24.0, 25.0]), L("nm", "カチーナ…")]
-    ts = {"a": 10.0, "g": 13.0, "b": 20.0, "c": 30.0, "h": 40.0, "d": 55.0, "e": 60.0, "f": 70.0, "v": 80.0, "v2": 80.0, "pp": 90.0, "bb": 25.0, "nm": 95.0}
+    ts = {"a": 10.0, "g": 13.0, "b": 20.0, "c": 30.0, "h": 40.0, "d": 55.0, "e": 60.0, "sp": 65.0, "f": 70.0, "v": 80.0, "v2": 80.0, "pp": 90.0, "bb": 25.0, "nm": 95.0}
     shows = [(0, 10, 12, "今日はとても良い天気ですね"), (0, 40, 42, "向こうの山はとても高いです"), (1, 50, 53, "知らない看板の文字です"),
              (0, 80, 82, "雨が降りそうな空模様だね")]
     rows = rows + [(90_000_000, [100, 800, 600, 840], "それは……どうかな"), (21_000_000, [100, 800, 600, 840], "明日も晴れるといいですね"),
@@ -227,11 +228,16 @@ def t_miss_detect() -> None:
         st = SM.match_stats(cref, res["recs"], res["suspect_raw"])
         mdoc = SM.matched_doc(cref, res["recs"], res["n_raw"], st, str(rp), res["subs_path"], res["tp"], [],
                               {"fuzzy": 0.75, "merge_gap": SM.MERGE_GAP, "feed": "nonoise", "feed_panel": "keep"},
-                              res["items"], res["ov_stats"], res["evs"])
+                              res["items"], res["ov_stats"], res["evs"], res["textbox"])
         mp.write_text(_json.dumps(mdoc, ensure_ascii=False), encoding="utf-8")
+        from flowocr.output import script as _SC
+        tb_ok = isinstance(mdoc["overlay"].get("textbox"), dict) and not raises(lambda: _SC.need_textbox(mdoc))
+        check("gametext 路径（run_match -> matched_doc）也写文本框画像和正文条目的原文整块，过阶段 3 的门",
+              tb_ok and any(it["layer"] == "body" for it in mdoc["overlay"]["items"]), mdoc["overlay"].get("textbox"))
         det = MD.Detector(mp)
         out = det.run()
         got = {r["key"]: (r["cat"], r.get("layer"), r.get("read")) for r in out["rows"]}
+        sp_hidden = MD.Detector(mp, "cn", None, "special").run()
         b = det.b_list(out["rows"], pack=False)
         saved = dict(GS.LOADERS)
         GS.LOADERS["syn"] = lambda: [GS.Unit("pk", None, [GS.Line("pk1", "Talk", "X", None, "知らない看板の文字です", None)])]
@@ -282,7 +288,7 @@ def t_miss_detect() -> None:
         bad2 = det.invariants([])
     want = {"a": (MD.OUT, None, None), "g": (MD.SIB, None, None), "e": (MD.OFF, None, None),
             "b": (MD.MISS, "建轨没留下", "锚点 + 读数"), "c": (MD.MISS, "建轨没留下", "obs 搜到（锚点漏掉）"),
-            "h": (MD.MISS, MD.L_HIDDEN, "认领过"), "d": (MD.UNREAD, None, None), "v": (MD.OUT, None, None),
+            "h": (MD.MISS, MD.L_HIDDEN, "认领过"), "d": (MD.UNREAD, None, None), "sp": (MD.UNREAD, None, None), "v": (MD.OUT, None, None),
             "pp": (MD.UNREAD, None, None), "bb": (MD.UNREAD, None, None), "nm": (MD.UNREAD, None, None)}
     why = {r["key"]: r.get("why") for r in out["rows"]}
     check("检测器·分类先后与定层：已输出 / 另一版本已输出 / 决定不显示 / 漏（带定层）/ 没读到 各落一类；没有中文的认领不算已输出；"
@@ -292,6 +298,10 @@ def t_miss_detect() -> None:
           and why["nm"] == MD.NAME_LIKE
           and [r for r in out["rows"] if r["key"] == "d"][0].get("partial") == 0.27
           and "partial" not in [r for r in out["rows"] if r["key"] == "pp"][0], (got, why))
+    check("检测器·特殊上屏形式（ReminderUI）按 special 分栏、默认进覆盖分母（这里没读到）；--hide-groups special 时记作决定不显示",
+          [(r["group"], r["cat"]) for r in out["rows"] if r["key"] == "sp"] == [("special", MD.UNREAD)]
+          and [r["cat"] for r in sp_hidden["rows"] if r["key"] == "sp"] == [MD.OFF],
+          [(r["group"], r["cat"]) for rows in (out["rows"], sp_hidden["rows"]) for r in rows if r["key"] == "sp"])
     check("检测器·三条不变量在合成产物上成立（key 回得到剧本行、事件都在、漏都带定层、没有同一时刻画两块）", out["invariants"]["ok"],
           out["invariants"])
     check("检测器·B 清单：unmatched ∪ unfed 的事件扣掉被该出现行定位到的，剩文本包外的看板字、按区域记",
@@ -602,9 +612,10 @@ def t_gametext() -> None:
                                       "#{NICKNAME}！快！", "{NICKNAME}{PLAYERAVATAR#SEXPRO[A|B]}，走", "{NICKNAME}。",
                                       "<color=#FFF>{NICKNAME}</color>？！你来了", "{NICKNAME}，{NICKNAME}，快醒醒。")]
           == ["刚刚我说过", "你好。", "嗯，走吧", "さっき", "一行\\N二行", "这是的书", "快！", "走", "。", "你来了", "快醒醒。"])
-    split = SC.overlay_lines("[`0:ねるめろ(本物)]，刚刚我说过的那件事你还记得吗", [300, 300])
-    check("译文按原文行分行时，占位标记当一个字、不拆开",
-          len(split) == 2 and "".join(split) == "[`0:ねるめろ(本物)]，刚刚我说过的那件事你还记得吗"
+    split = SC.wrap_lines("[`0:ねるめろ(本物)]，刚刚我说过的那件事你还记得吗", 6)
+    check("译文按文本框折行时，占位标记当一个字、不拆开（宽按值算：值比一行还宽也整个留在一行里）",
+          len(split) >= 2 and "".join(split) == "[`0:ねるめろ(本物)]，刚刚我说过的那件事你还记得吗"
+          and split[0] == "[`0:ねるめろ(本物)]，"
           and all(x.count("[`") == len(PH.MARK_RE.findall(x)) for x in split), split)
     check("从视频原文读名字：模板在占位前后的字在 OCR 里找得到，夹在中间的就是名字（句首 / 句中 / 句尾）；占位在句首时只在那一行找（前面的名牌行不切进来）；紧贴着另一个占位时不截（分不出两个值）；找不到是 None",
           GT.guess("ルミネ、さっき言ったように", "{NICKNAME}、さっき言ったように") == "ルミネ"
@@ -1161,35 +1172,37 @@ def t_gametext() -> None:
           got[0]["cues"] == [0, 5])
 
     # ---- 用途 2 叠加 ASS（scriptmatch --ass → 字幕稿 flowocr.output.script → 阶段 4 flowocr.typeset）----
-    check("叠加：译文分成原字幕的行数——剧本换行数对得上就照它，否则按原文各行的宽度比例分；一行的不拆",
-          OV.overlay_lines("上一句\\N下一句", [5, 5]) == ["上一句", "下一句"]
-          and OV.overlay_lines("一二三四五六", [5, 5]) == ["一二三", "四五六"]
-          and OV.overlay_lines("一二\\N三四\\N五六", [5, 5]) == ["一二三", "四五六"]
-          and OV.overlay_lines("一二三四五六七八", [6, 2]) == ["一二三四五六", "七八"]
-          and OV.overlay_lines("一二三四五六", [5]) == ["一二三四五六"])
-    check("分行：断点近处有标点就断在标点后；不在「」里断开专名；句读不放行首、左引号不放行尾；拉丁文只在空格处断、接行补空格",
-          OV.overlay_lines("一二三四，五六七八九十", [5, 5]) == ["一二三四，", "五六七八九十"]
-          and OV.overlay_lines("所以你是来面试「人间百态」板块的", [5, 5]) == ["所以你是来面试", "「人间百态」板块的"]
-          and OV.overlay_lines("一二三四五。六七八九", [5, 5])[1][:1] != "。"
-          and OV.overlay_lines("一二三四「五六七八九", [1, 1])[0][-1:] != "「"
-          and OV.overlay_lines("This is\\Na test sentence", [3, 3, 3]) == ["This is", "a test", "sentence"]
-          and OV.overlay_lines("ab\\Ncd ef", [3, 3, 3])[0] != "abcd")
+    check("叠加分行（wrap_lines）：照剧本换行切、去空行（末尾多一个 \\N 的是一行）；没有「一行几字」就不折，也不按原文行框数凑行数",
+          OV.wrap_lines("上一句\\N下一句") == ["上一句", "下一句"]
+          and OV.wrap_lines("一二三四五六") == ["一二三四五六"]
+          and OV.wrap_lines("一二\\N三四\\N五六") == ["一二", "三四", "五六"]
+          and OV.wrap_lines("一二三\\N") == ["一二三"] and OV.wrap_lines("一二\\N\\N三四") == ["一二", "三四"]
+          and OV.wrap_lines("一二三四五六七八九十" * 4) == ["一二三四五六七八九十" * 4])
+    check("叠加分行：给了「一行几个全角字」时宽过才折、尽量往后断；照剧本换行之后逐行折；没宽过的不动",
+          OV.wrap_lines("一二三四五六七八", 5) == ["一二三四五", "六七八"]
+          and OV.wrap_lines("一二三四五\\N六七八九十一二", 5) == ["一二三四五", "六七八九十", "一二"]
+          and OV.wrap_lines("一二三四五", 5) == ["一二三四五"] and OV.wrap_lines("ab一二三四", 5) == ["ab一二三四"])
+    check("叠加分行：避头（句读挂在上一行末尾）、避尾（左引号挪到下一行）；拉丁文只在空格处断、空格不进行首；没空格的长词不断",
+          OV.wrap_lines("一二三四五。六七八九", 5) == ["一二三四五。", "六七八九"]
+          and OV.wrap_lines("一二三四「五六七八九", 5)[:2] == ["一二三四", "「五六七八"]
+          and OV.wrap_lines("This is a test sentence", 5) == ["This is a", "test", "sentence"]
+          and OV.wrap_lines("abcdefghijklmnopqrstuvwxyz", 3) == ["abcdefghijklmnopqrstuvwxyz"])
     rows_p = [[100, 100, 900, 130], [300, 136, 700, 166]]
-    box_p, rows_pl, text_pl = (LY.plate_rects(rows_p, [400, 600], 500, m) for m in ("box", "rows", "text"))
-    pd = LY.OVERLAY_PAD
+    pd = 14
+    box_p, rows_pl, text_pl = (LY.plate_rects(rows_p, [400, 600], 500, m, pd) for m in ("box", "rows", "text"))
     check("叠加底板：box 一整块；rows 每行 max(原文, 译文) 区间；text 只盖译文；上下两行外扩后的交叠从中间劈开",
           box_p == [[100 - pd, 100 - pd, 900 + pd, 166 + pd]]
           and rows_pl[0][0] == 100 - pd and rows_pl[0][2] == 900 + pd and rows_pl[1][0] == 200 - pd and rows_pl[1][2] == 800 + pd
           and text_pl[0][0] == 300 - pd and text_pl[0][2] == 700 + pd
           and rows_pl[0][3] == rows_pl[1][1] == 133, (box_p, rows_pl, text_pl))
     far = [[100, 100, 300, 130], [100, 300, 900, 330]]
-    tall_pl = LY.plate_rects(far, [400, 600], 500, "rows", text_h=60)
-    box_tw = LY.plate_rects(far, [1000, 600], 500, "box", text_h=60)
+    tall_pl = LY.plate_rects(far, [400, 600], 500, "rows", pd, text_h=60)
+    box_tw = LY.plate_rects(far, [1000, 600], 500, "box", pd, text_h=60)
     check("字不出底板：正文比原文框高时底板竖直方向跟着长（以行中心为准）；box 也把译文的左右范围并进来",
-          tall_pl[0][1] == 115 - 30 - LY.OVERLAY_PAD and tall_pl[0][3] == 115 + 30 + LY.OVERLAY_PAD
-          and box_tw[0][0] == 0 - LY.OVERLAY_PAD and box_tw[0][2] == 1000 + LY.OVERLAY_PAD
-          and box_tw[0][3] == 315 + 30 + LY.OVERLAY_PAD, (tall_pl, box_tw))
-    left_pl = LY.plate_rects(rows_p, [1000, 200], 100, "text", "left")
+          tall_pl[0][1] == 115 - 30 - pd and tall_pl[0][3] == 115 + 30 + pd
+          and box_tw[0][0] == 0 - pd and box_tw[0][2] == 1000 + pd
+          and box_tw[0][3] == 315 + 30 + pd, (tall_pl, box_tw))
+    left_pl = LY.plate_rects(rows_p, [1000, 200], 100, "text", pd, "left")
     check("叠加底板按锚点算译文区间：左锚从轴往右长（不是以轴为中心）",
           left_pl[0][0] == 100 - pd and left_pl[0][2] == 1100 + pd and left_pl[1][2] == 300 + pd, left_pl)
     tw = [TS.body_of(r, "on") for r in TS.with_tw(TS.text_rows("一二\\N三")[0], 300, False)]
@@ -1300,7 +1313,7 @@ def t_gametext() -> None:
                "extra": [{"key": "b", "jp": "また後で来るね", "cn": "待会儿再来"}], "cues": [0]}]
     SM.mark_display(recs_l, cues_l, lambda c: "dialogue")
     doc_l = {"events": evs_l, "size": [1920, 1080], "frame_us": 500_000, "provenance": {}}
-    items_l, st_l = SM.overlay_items(recs_l, doc_l, evs_of_l, cues_l, ref=lref)
+    items_l, st_l, _ = SM.overlay_items(recs_l, doc_l, evs_of_l, cues_l, ref=lref)
     check("叠加分层：正文 / extra 各盖自己的行（extra 不并进正文）、名牌一块带中文名；顺序 body→…→extra→name",
           [(it["layer"], it["events"], it["cn"]) for it in items_l]
           == [("body", [1], "第一行台词"), ("extra", [2], "待会儿再来"), ("name", [0], "卡齐娜")]
@@ -1327,18 +1340,20 @@ def t_gametext() -> None:
           [SM.choice_layer(SM.choice_like(k, st)) for k, st in
            (("Choice", None), ("Talk", "OffBand"), ("Talk", None), ("Loose", None), ("Choice", "Duplicate"))]
           == ["choice", "choice", "offmain", "offmain", "offmain"])
-    check("显示协议·定组按类型（处境不改组）：选项 / 黑屏旁白 / 横幅类提示 / 散条目按 role / 带外台词 / 台词；没列到的类型落进 dialogue",
+    check("显示协议·定组按类型（处境不改组）：选项 / 黑屏旁白 / 特殊上屏形式（原神非 Normal 的语音字幕、绝区零 Tips / MiddleTips）/ "
+          "散条目按 role / 带外台词 / 台词；没列到的类型落进 dialogue",
           [SM.group_of(k, st, r) for k, st, r in (
               ("Choice", None, None), ("Choice", "Duplicate", None), ("BlackScreen", "OutOfSpan", None),
-              ("ReminderUI", None, "Banner"), ("Loose", None, "Comic"), ("Loose", None, "Cinema"),
+              ("ReminderUI", None, "Banner"), ("ReminderUI", "OutOfSpan", "WhiteMessage"), ("Loose", None, "Tips"),
+              ("Loose", "OutOfSpan", "MiddleTips"), ("Loose", None, "Comic"), ("Loose", None, "Cinema"),
               ("Loose", None, "Cissia"), ("Loose", None, "UIText"), ("Talk", "OffBand", "?"), ("NPC", None, None),
               ("Reminder", "Variant", "Normal"), ("SomethingNew", None, None))]
-          == ["choice", "choice", "narration", "ui", "cutscene", "cutscene", "ui", "ui", "offband", "dialogue", "dialogue",
-              "dialogue"])
-    check("显示协议·声明自洽：保留组在、档位合法、没用关键字当组名；dialogue 直接进 default，ui / unmatched / unfed 默认不进",
+          == ["choice", "choice", "narration", "special", "special", "special", "special", "cutscene", "cutscene", "ui", "ui",
+              "offband", "dialogue", "dialogue", "dialogue"])
+    check("显示协议·声明自洽：保留组在、档位合法、没用关键字当组名；dialogue 直接进 default，special 默认进，ui / unmatched / unfed 默认不进",
           set(MIO.RESERVED) <= set(SM.DISPLAY["groups"]) and not set(MIO.KEYWORDS) & set(SM.DISPLAY["groups"])
           and all(d["tier"] in MIO.TIERS for d in SM.DISPLAY["groups"].values())
-          and SM.DISPLAY["groups"]["dialogue"]["tier"] == "always"
+          and SM.DISPLAY["groups"]["dialogue"]["tier"] == "always" and SM.DISPLAY["groups"][MIO.SPECIAL]["tier"] == "on"
           and all(SM.DISPLAY["groups"][g]["tier"] == "off" for g in ("ui", "elsewhere", "unmatched", "unfed")))
     tref = GA.Ref(doc={"units": [{"uid": "u", "lines": [
         {"key": "t", "kind": "Talk", "status": None, "role": "x", "text": "ここで待っていてくれ", "cn": "在这里等我",
@@ -1419,7 +1434,7 @@ def t_gametext() -> None:
           and all(len(set(it["events"])) == len(it["events"]) for it in n_items + b_items),
           ([(it["layer"], it["events"]) for it in n_items], [(it["layer"], it["events"]) for it in b_items]))
     ov = SM.overlay_doc([{"group": "dialogue", "events": [3]}, {"group": "name", "events": [1]}], {},
-                        [[{"id": 3}, {"id": 1}], [{"id": 3}, {"id": 7}]])
+                        [[{"id": 3}, {"id": 1}], [{"id": 3}, {"id": 7}]], {})
     check("显示协议·overlay：fed 是喂给匹配器的事件（去重、升序），stats 按组计数",
           ov["fed"] == [1, 3, 7] and ov["stats"]["groups"] == {"dialogue": 1, "name": 1}, ov)
     check("进不进分母：类型在带内且没有处境",
@@ -1537,10 +1552,16 @@ def t_gametext() -> None:
 
     from flowocr.artifacts import tracksio
     prov = {"obs": "out/x.jsonl", "argv": ["out/x.jsonl", "--outdir", "o", "--tag", "t", "--main-band", "0"]}
-    prov2 = {"obs": "out/x.jsonl", "argv": ["--iou", "0.3", "out/x.jsonl", "--outdir=o", "--tag", "t"]}
-    check("BUILD_ARGS 按名剥掉驱动自己填的 obs / --outdir / --tag，不靠位置（audit-6 §2.4）",
-          (tracksio.build_args(prov), tracksio.build_args(prov2)) == (["--main-band", "0"], ["--iou", "0.3"]),
-          (tracksio.build_args(prov), tracksio.build_args(prov2)))
+    prov2 = {"obs": "out/x.jsonl", "argv": ["--iou", "0.3", "out/x.jsonl", "--outdir=o", "--tag", "t", "--viewport", "0,0,976,549"]}
+    prov3 = {"obs": "out/x.jsonl", "argv": ["out/x.jsonl", "--viewport=0,0,976,549", "--iou", "0.3"]}
+    check("BUILD_ARGS 按名剥掉不算旋钮的 obs / --outdir / --tag / --viewport，不靠位置（audit-6 §2.4）：驱动没带同一个 --viewport 也不重建、不丢记下的位置",
+          (tracksio.build_args(prov), tracksio.build_args(prov2), tracksio.build_args(prov3)) == (["--main-band", "0"], ["--iou", "0.3"], ["--iou", "0.3"]),
+          (tracksio.build_args(prov), tracksio.build_args(prov2), tracksio.build_args(prov3)))
+    want = "--iou 0.3 --viewport 0,0,976,549".split()
+    drivers = [(Path(__file__).resolve().parents[2] / "dev_tools" / f).read_text(encoding="utf-8") for f in ("head2head.sh", "gametext_eval.sh")]
+    check("驱动这一趟的 BUILD_ARGS 和产物那侧同一套剥法：带同一个 --viewport 重跑命中缓存，不带也命中",
+          tracksio.knob_args(want) == tracksio.knob_args(want[:2]) == tracksio.build_args(prov2)
+          and all("tracksio.knob_args(sys.argv[2].split())" in d for d in drivers))
 
 
 def t_readables() -> None:
@@ -1552,7 +1573,7 @@ def t_readables() -> None:
     from flowocr.analyze import scriptmatch as SM
     from flowocr.analyze import game_align as GA
     para_jp = "この本には古い時代の物語がたくさん書かれている"
-    paras = {GA.GS.cnorm(para_jp): (para_jp, "这本书里写着许多古老时代的故事")}
+    paras = {GA.GS.cnorm(para_jp): (para_jp, "这本书里写着许多古老时代的故事", "This book holds many tales of olden times.")}
     rows = [{"t_us": 0, "text": "第一章", "box": [500, 300, 600, 330]},                  # 小标题：不去找段，但块要长满到它
             {"t_us": 0, "text": "この本には古い時代の物語がたくさん", "box": [500, 340, 1100, 370]},
             {"t_us": 0, "text": "書かれている", "box": [500, 375, 700, 405]},
@@ -1568,13 +1589,14 @@ def t_readables() -> None:
         items, used = SM.readable_items(obs, paras, 500_000, taken)
         check("只读一遍 obs：找到段的帧留下、相邻帧同一段接着延长；没找到段的帧、台词正文框里的行不算；块长满到同一栏的小标题",
               len(items) == 1 and (items[0]["start_us"], items[0]["end_us"]) == (0, 1_000_000)
-              and items[0]["rows"][0][1] == 300 and items[0]["paras"]["cn"] == ["这本书里写着许多古老时代的故事"] and used == 2,
+              and items[0]["rows"][0][1] == 300 and items[0]["paras"]["cn"] == ["这本书里写着许多古老时代的故事"]
+              and items[0]["paras"]["en"] == ["This book holds many tales of olden times."] and used == 2,
               (items, used))
         # 一帧里某一段只认出一行、这一行只占那一段一小部分：屏上一行短 UI 恰好是长文的子串（称号撞上书，gi2 2026-10-06），不算；
         # 一句话的短段（道具说明）单行就是整段，算
         long_jp = "とある記者は「スチームバード新聞」編集長として長年にわたり街の出来事を記録し続けてきたのだった"
         short_jp = "秘境に足を踏み入れるために大事なもの"
-        paras2 = {GA.GS.cnorm(long_jp): (long_jp, "长"), GA.GS.cnorm(short_jp): (short_jp, "短")}
+        paras2 = {GA.GS.cnorm(long_jp): (long_jp, "长", None), GA.GS.cnorm(short_jp): (short_jp, "短", None)}
         one = Path(d) / "one.jsonl"
         one.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in [
             {"_meta": {}},
@@ -1598,8 +1620,10 @@ def t_readables() -> None:
         def verify_stored(self, tables, langs=("ja", "zh-Hans")):
             pass
     jp2 = "二冊目の本にはまた別の古い物語が書かれている"
-    pairs = [({"id": 1, "source": "Readable/", "text": para_jp}, {"id": 1, "source": "Readable/", "text": "这本书里写着许多古老时代的故事"}),
-             ({"id": 1, "source": "MailExcelConfigData", "text": jp2}, {"id": 1, "source": "MailExcelConfigData", "text": "第二本书里写着另一个古老的故事"})]
+    pairs = [({"id": 1, "source": "Readable/", "text": para_jp}, {"id": 1, "source": "Readable/", "text": "这本书里写着许多古老时代的故事"},
+              {"id": 1, "source": "Readable/", "text": "This book holds many tales of olden times."}),
+             ({"id": 1, "source": "MailExcelConfigData", "text": jp2}, {"id": 1, "source": "MailExcelConfigData", "text": "第二本书里写着另一个古老的故事"},
+              {"id": 1, "source": "MailExcelConfigData", "text": "One.\n\nTwo."})]
     o_b, o_p, o_root = GA.GS.bundle_of, GA.GS.paired, SM.paths.data_root
     with tempfile.TemporaryDirectory() as d2:
         GA.GS.bundle_of, GA.GS.paired, SM.paths.data_root = (lambda game: OneTable()), (lambda game, stem: iter(pairs)), (lambda: Path(d2))
@@ -1608,8 +1632,9 @@ def t_readables() -> None:
             again = SM.readable_paras("genshin")          # 第二次走缓存
         finally:
             GA.GS.bundle_of, GA.GS.paired, SM.paths.data_root = o_b, o_p, o_root
-    check("readables 表 id 重复、source 不同：两条都收进段索引；缓存读回来一样",
-          got is not None and len(got) == 2 and got == again, got)
+    check("readables 表 id 重复、source 不同：两条都收进段索引；缓存读回来一样；英文段数和日文对得上的带英文段，对不上的记 None",
+          got is not None and len(got) == 2 and got == again
+          and sorted(v[2] or "" for v in got.values()) == ["", "This book holds many tales of olden times."], got)
 
     class NoTable:
         fingerprint = "x"
@@ -1665,14 +1690,20 @@ def t_nameplate_terms() -> None:
     check("短名词·查询键：内容 ≥2 字且含假名 / 汉字才查（噪音读数 口 / E / Bi / 数字不查，免得在默认预设里被『译』出来）",
           want == {"シュラム", "傭兵", "任務アイテム"}, want)
     row = lambda i, t: {"id": i, "text": t}
-    pairs = [(row(1, "旅人"), row(1, "旅行者")), (row(2, "旅人"), row(2, "旅人")), (row(3, "旅人"), row(3, "旅行者")),
-             (row(4, "スコア"), row(4, "分数")), (row(5, "スコア"), row(5, "评分")),
-             (row(6, "シュラム"), row(6, "施拉姆")), (row(7, "{NICKNAME}"), row(7, "{NICKNAME}")),
-             (row(8, "傭兵"), row(8, None)), (row(9, "未出現"), row(9, "没出现"))]
-    got_t = GS.pick_terms(pairs, {"旅人", "スコア", "シュラム", "傭兵"}, "F")
-    check("短名词·消歧按 hash 条数取多数、打平取短的再按字典序；只收 obs 里出现过的键；中文缺的不收",
-          got_t == {"旅人": {"cn": "旅行者", "n": 2, "of": 3}, "スコア": {"cn": "分数", "n": 1, "of": 2},
-                    "シュラム": {"cn": "施拉姆", "n": 1, "of": 1}}, got_t)
+    pairs = [(row(1, "旅人"), row(1, "旅行者"), row(1, "Traveler")), (row(2, "旅人"), row(2, "旅人"), row(2, "Wanderer")),
+             (row(3, "旅人"), row(3, "旅行者"), row(3, "Traveler")),
+             (row(4, "スコア"), row(4, "分数"), row(4, "Score")), (row(5, "スコア"), row(5, "评分"), row(5, "Rating")),
+             (row(6, "シュラム"), row(6, "施拉姆"), None), (row(7, "{NICKNAME}"), row(7, "{NICKNAME}"), None),
+             (row(8, "傭兵"), row(8, None), row(8, "Mercenary")), (row(9, "未出現"), row(9, "没出现"), None)]
+    # 隊長：中文多数是 队长（4 行），英文整体多数 Leader 却全在 统领 那几行——英文要在中文取中的行里取
+    pairs += [(row(10 + i, "隊長"), row(10 + i, cn), row(10 + i, en)) for i, (cn, en) in
+              enumerate([("队长", "Captain"), ("队长", "Captain"), ("队长", "Chief"), ("队长", "Head"),
+                         ("统领", "Leader"), ("统领", "Leader"), ("统领", "Leader")])]
+    got_t = GS.pick_terms(pairs, {"旅人", "スコア", "シュラム", "傭兵", "隊長"}, "F")
+    check("短名词·消歧按 hash 条数取多数、打平取短的再按字典序；只收 obs 里出现过的键；中文缺的不收；"
+          "英文在中文取中的那些行里同法取（不和中文分开投），没有英文那份的不带 en",
+          got_t == {"旅人": {"cn": "旅行者", "n": 2, "of": 3, "en": "Traveler"}, "スコア": {"cn": "分数", "n": 1, "of": 2, "en": "Score"},
+                    "シュラム": {"cn": "施拉姆", "n": 1, "of": 1}, "隊長": {"cn": "队长", "n": 4, "of": 7, "en": "Captain"}}, got_t)
     tref = GA.Ref(doc={"units": [], "speakers": {"カチーナ": "卡齐娜"},
                        "terms": {"カチーナ": {"cn": "卡琪娜", "n": 1, "of": 1}, "シュラム": {"cn": "施拉姆", "n": 2, "of": 2}}},
                   script=[], windows=[], role={}, variant_of={})
@@ -1693,7 +1724,7 @@ def t_nameplate_terms() -> None:
     talk = [{"start": 20.0, "end": 25.0, "cues": [1], "extra": [], "how": "exact",
              "ref": {"key": "k", "kind": "Talk", "jp": "今日はいい天気ですね", "cn": "今天天气真好", "score": 1.0}}]
     SM.mark_display(talk, cues, lambda c: "dialogue")
-    items, st = SM.overlay_items(talk, doc, evs_of, cues, ref=tref)
+    items, st, _ = SM.overlay_items(talk, doc, evs_of, cues, ref=tref)
     nm = sorted((it["ocr"], it["cn"], it["name_src"]) for it in items if it["layer"] == "name")
     check("短名词·名牌层先查说话人表、查不到再查短名词表，条目记 name_src；stats 记 name_from_terms",
           SM.term_names(tref) == {SA.norm("カチーナ"): "卡琪娜", SA.norm("シュラム"): "施拉姆"}
@@ -1701,10 +1732,10 @@ def t_nameplate_terms() -> None:
           and st["name_translated"] == 2 and st["name_from_terms"] == 1, (nm, st))
     mv = [{**evs[0], "boxes": [[0, [900, 600, 1000, 640]], [30_000_000, [900, 800, 1000, 840]]]}] + evs[1:]
     mv_of = [[mv[e["id"]] for e in g] for g in evs_of]
-    _, st_mv = SM.overlay_items(talk, {**doc, "events": mv}, mv_of, cues, ref=tref)
+    _, st_mv, _ = SM.overlay_items(talk, {**doc, "events": mv}, mv_of, cues, ref=tref)
     check("名牌层 stats：在动的名牌切成几块时 `name` 数块，`name_events` / `name_translated` / `name_from_terms` 按事件去重（和切段之前的读数同口径）",
           (st_mv["name"], st_mv["name_events"], st_mv["name_translated"], st_mv["name_from_terms"]) == (3, 2, 2, 1), st_mv)
-    items0, st0 = SM.overlay_items([], doc, evs_of, cues, ref=tref)
+    items0, st0, _ = SM.overlay_items([], doc, evs_of, cues, ref=tref)
     nm0 = sorted((it["ocr"], it["cn"]) for it in items0 if it["layer"] == "name")
     check("短名词·下面没有一句被认成台词的开头行不查短名词表（任务目标、装备名这类 UI 不当名牌译）；说话人表照查；"
           "挡掉的按事件记进 stats 的 `name_terms_off`",
@@ -2070,7 +2101,7 @@ def t_name_ink() -> None:
         om = {"schema": MI.SCHEMA, "provenance": {"subs": str(tp)}, "stats": {}, "display": SM.DISPLAY, "cues": [],
               "overlay": {"items": [{**mk(ink=True), "start_us": 0, "end_us": 2 * S, "events": [0], "cn": "派蒙", **plate},
                                     {**mk(ink=False), "start_us": 10 * S, "end_us": 12 * S, "events": [1], "cn": "派蒙", **plate}],
-                          "stats": {}, "fed": [0, 1], "name_ink": {"name": "#f6c510"}}}
+                          "stats": {}, "fed": [0, 1], "name_ink": {"name": "#f6c510"}, "textbox": {}}}
         with contextlib.redirect_stdout(io.StringIO()):
             p, *_ = SC.render_script(om, td, {"lang": "cn", "show": "all"})
         ass = Path(p).read_text(encoding="utf-8-sig").splitlines()
@@ -2529,10 +2560,10 @@ def t_echo() -> None:
           EC.anchors([["v2", 9.0, []], ["v1", 10.0, []], ["w2", 7.0, []], ["w3", 5.0, []]], lambda k: {"v2": "v1", "w2": "w1", "w3": "w1"}.get(k, k))
           == {"v1": 10.0, "w1": 5.0})
     # 产物：schema 升版，旧版明确报错；字段每条都有
-    check("matched schema 是 /7；读到 /6、/5 明确报错、提示重跑匹配",
-          matchedio.SCHEMA == "flowocr-matched/7"
+    check("matched schema 是 /8；读到 /7、/6 明确报错、提示重跑匹配",
+          matchedio.SCHEMA == "flowocr-matched/8"
           and all(raises(lambda v=v: matchedio.validate({"schema": f"flowocr-matched/{v}", "provenance": {}, "stats": {}, "cues": []}),
-                         matchedio.MatchedSchemaError) for v in (5, 6)))
+                         matchedio.MatchedSchemaError) for v in (6, 7)))
     try:
         matchedio.validate({"schema": "flowocr-matched/3", "provenance": {}, "stats": {}, "cues": []})
         msg = ""
@@ -2659,7 +2690,7 @@ def t_body_lent() -> None:
     recs = [{"start": 6.0, "end": 30.0, "cues": [0], "extra": [], "how": "fuzzy",
              "ref": {"key": "si", "kind": "Loose", "jp": "SKILL INFO", "cn": "技能信息", "score": 0.9}}]
     SM.mark_display(recs, cues, lambda c: "ui")
-    items, _ = SM.overlay_items(recs, doc, [[misread]], cues, ref=ref)
+    items, *_ = SM.overlay_items(recs, doc, [[misread]], cues, ref=ref)
     body = [it for it in items if it["layer"] == "body"]
     check("正文块借来定起点的同一句读数记进它的 events（排在正文事件后面，区域仍取正文事件的）；选项路不再拿它出块",
           [(it["start_us"], it["events"]) for it in body] == [(6 * S, [1, 0])]
@@ -2675,3 +2706,584 @@ def t_body_lent() -> None:
     kept, n = SM.yield_to_body(names, body)
     check("名牌层让出已记进正文块 events 的事件（借来定起点的读数被认成了名牌：《魔裁》f3「裁判の後。」在同一个框里叠画 OCR 原文）；别的名牌照留",
           [it["events"] for it in kept] == [[7]] and n == 1, (kept, n))
+
+    # 名牌块被正文整块借成首行：位置离前后名牌远的去掉，贴着名牌处的不动
+    evs = [{"id": i, "region": 0 if i < 10 else 1} for i in range(12)]
+
+    def nm(i, y, t):
+        return {"layer": "name", "events": [i], "start_us": t * S, "rows": [[100, y - 30, 200, y]]}
+    body_it = {"layer": "body", "events": [10], "start_us": 50 * S, "block": [[100, 880, 400, 909], [100, 936, 400, 965]],
+               "block_drawn_by": [None, None]}
+    refs = [nm(i, 835, i) for i in range(5)]
+    for y, want in ((909, 1), (850, 0)):
+        its = [dict(body_it, block_drawn_by=[7, None]), *[dict(r) for r in refs], nm(5, 835, 5), nm(6, y, 50)]
+        out, n = SM.yield_to_block(its, {"events": evs}, {"1": {"pitch": 56.0}})
+        check(f"名牌块被正文整块借成首行、下沿离前后名牌下沿中位差半个行距以上的去掉，整块那一行改记没人画；贴着名牌处的不动（下沿 {y}）",
+              n == want and len(out) == 8 - want and out[0]["block_drawn_by"] == ([None, None] if want else [7, None]),
+              (n, out[0]["block_drawn_by"]))
+    # 去掉的块不在末尾：后面名牌在 block_drawn_by 里的下标跟着前移；参照不够、行距量不出的不动
+    other = {"layer": "body", "events": [11], "start_us": 60 * S, "block": [[100, 805, 200, 835]], "block_drawn_by": [9]}
+    its = [dict(body_it, block_drawn_by=[8, None]), dict(other), *[dict(r) for r in refs], nm(5, 835, 5), nm(6, 909, 50), nm(9, 835, 60)]
+    out, n = SM.yield_to_block(its, {"events": evs}, {"1": {"pitch": 56.0}})
+    few_out, few_n = SM.yield_to_block([dict(body_it, block_drawn_by=[3, None]), *[dict(r) for r in refs[:2]], nm(6, 909, 50)],
+                                       {"events": evs}, {"1": {"pitch": 56.0}})
+    nop_out, nop_n = SM.yield_to_block([dict(it) for it in its], {"events": evs}, {"1": {}})
+    check("yield_to_block：去掉中间一块后，后面名牌在 block_drawn_by 里的下标前移；前后名牌不到 INERTIA_MIN_REF 块、或行距量不出的不去",
+          n == 1 and out[0]["block_drawn_by"] == [None, None] and out[1]["block_drawn_by"] == [8] and out[8]["events"] == [9]
+          and few_n == 0 and len(few_out) == 4 and nop_n == 0 and len(nop_out) == len(its),
+          (n, [it.get("block_drawn_by") for it in out[:2]], few_n, nop_n))
+
+
+def _sq():
+    """守卫用的视口：1000 × 1000 的录像、游戏画面就是整个画面，条目的 `dx` = 区域 `cx` − 0.5。"""
+    from flowocr.analyze import textbox as TB
+    return TB.Viewport(0, 0, 1000, 1000, (1000, 1000), "frame")
+
+
+def _prof(drafts, meta, layout=None):
+    """按 `_sq` 的视口出画像。"""
+    from flowocr.analyze import textbox as TB
+    return TB.profile(TB.region_of(drafts, meta), layout, _sq() if layout else None)
+
+
+def t_textbox() -> None:
+    """匹配器写的原文整块与文本框画像（`analyze.textbox`，line-breaks 计划第 1 步 B 段）：折行证据、`valign` / `pitch` / `em`、补行、惯性，
+    以及两条匹配路径都把契约字段写进产物、名牌层不受影响。
+
+    存在的理由：这几样错了阶段 3 不会报错，只会把译文摆错一行、折错地方——缺首行的条目整体低一行画、断在标点处的折行把中文误折、
+    居中的游戏按行号取参照错开半行、横向吸附把投票判对齐的区域拖到一条边上。"""
+    print("文本框画像与原文整块")
+    import json as _json
+    from flowocr import extensions as X
+    from flowocr.analyze import scriptmatch as SM
+    from flowocr.analyze import textbox as TB
+    from flowocr.artifacts import matchedio, tracksio
+    from flowocr.output import layout as LY
+    from flowocr.output import script as SC
+
+    def ev(i, text, box, flags=()):
+        return {"id": i, "text": text, "box": list(box), "flags": list(flags), "region": 0, "t_start": 0, "t_end": 1}
+
+    def dr(jp, rows, idx=0):
+        """剧本 `jp`、收进条目的 OCR 行 [(字, 框, 标)] 的原文整块（补行之前）。"""
+        return TB.draft_of(idx, {"jp": jp, "start_us": 0}, 0, [ev(100 + k, t, b, *f) for k, (t, b, *f) in enumerate(rows)])
+
+    check("文本框：valign 的取值和阶段 3 的 VALIGNS 相同；新模块进匹配产物的代码指纹表（naninovel 并进 scriptmatch 那张）",
+          TB.MODES == LY.VALIGNS and "src/flowocr/analyze/textbox.py" in SM.CODE_FP_FILES)
+
+    # ---- 折行证据与 chars
+    wrap31 = dr("たしかに集中していて周りの音が聞こえなくなることはあるでしょうけど、\\Nそれは違う。",
+                [("たしかに集中していて周りの音が聞こえなくなることはあるでしょ", [100, 100, 1180, 130]),
+                 ("うけど、", [100, 150, 240, 180]), ("それは違う。", [100, 200, 320, 230])])
+    wrap20 = dr("あかさたなはまやらわいきしちにひみりゐえけせてねへめれ",
+                [("あかさたなはまやらわいきしちにひみりゐえ", [100, 100, 800, 130]), ("けせてねへめれ", [100, 150, 350, 180])])
+    ev31, ev20 = TB.wrap_evidence(wrap31), TB.wrap_evidence(wrap20)
+    n31 = float(len("たしかに集中していて周りの音が聞こえなくなることはあるでしょ"))
+    check("折行证据：剧本同一行落在两个 OCR 行上、断点前后是两个能断开的全角字——下界是被折那一截的宽（全角字），上界多下一截首字；"
+          "整块按屏上的行排（被折的那行占两个位置）",
+          [(x["lo"], x["hi"]) for x in ev31] == [(n31, n31 + 1)] and [(x["lo"], x["hi"]) for x in ev20] == [(20.0, 21.0)]
+          and [s.line for s in wrap31.slots] == [0, 0, 1], (ev31, ev20, [s.line for s in wrap31.slots]))
+    punct = [dr("見た者はいない……　正体は誰も知らない", [("見た者はいない……", [100, 100, 500, 130]), ("正体は誰も知らない", [100, 150, 500, 180])]),
+             dr("あるでしょうけど、それは違う", [("あるでしょうけど、", [100, 100, 500, 130]), ("それは違う", [100, 150, 400, 180])]),
+             dr("あるでしょうけどそれはコーヒー", [("あるでしょうけどそれはコ", [100, 100, 500, 130]), ("ーヒー", [100, 150, 400, 180])])]
+    check("折行证据：断在空格、标点处的不算（可能是按词断的），断点后是长音这类不放行首的字也不算",
+          [TB.wrap_evidence(d) for d in punct] == [[], [], []], [TB.wrap_evidence(d) for d in punct])
+    ruby_ui = dr("少女は項垂れたまま動かなかった", [("うなだ", [200, 60, 260, 75]), ("少女は項垂れたまま動かなかった", [100, 80, 700, 110]),
+                                                ("NO DATA", [100, 130, 300, 160])])
+    ruby_flag = dr("あいうえおかきくけこさしすせそ", [("あいうえおかき", [100, 60, 400, 75], ["ruby"]), ("くけこさしすせそ", [100, 80, 500, 110])])
+    check("折行证据不计 Ruby 行和 UI 行：没标出的注音（读音对不上剧本）、混进来的界面字对不上任何一行；打了 ruby 标的行对得上也不算；"
+          "剧本只有一行的条目，原文整块就是 OCR 行",
+          TB.wrap_evidence(ruby_ui) == [] and TB.wrap_evidence(ruby_flag) == []
+          and [s.box for s in ruby_ui.slots] == [r.box for r in ruby_ui.rows] and {s.src for s in ruby_ui.slots} == {"ocr"},
+          (TB.wrap_evidence(ruby_ui), TB.wrap_evidence(ruby_flag), ruby_ui.hits))
+    p2, diag2 = _prof([wrap31, wrap20], {"align_how": {"by": "stats"}})
+    p1, _ = _prof([wrap31], {"align_how": {"by": "vote"}})
+    check("chars：证据按单个匹配产物数，不到 WRAP_MIN_EVIDENCE 条不给（不折）；两条互不相容时成立条数并列、取大的那条的下界，诊断里报成立 / 不成立各几条；"
+          "没量出 em 时没有 box_w；量不出 em 时对齐用建轨判的、横向不吸",
+          TB.WRAP_MIN_EVIDENCE == 2 and p1["chars"] is None and p1["evidence"] == 1
+          and p2["chars"] == n31 and p2["evidence"] == 2 and (diag2["wrap_held"], diag2["wrap_broken"]) == (1, 1)
+          and p2["em"] is None and p2["box_w"] is None and p2["h_inertia"] is False and p2["align"] == "center", (p1, p2, diag2))
+
+    # 对齐打分：整行读全的行按字格边比离散
+    lines = ["あいうえおかきくけ", "さしすせそ", "たちつてとなにぬねの", "はひふへほ", "まみむめもやゆよ", "（らりるれろわをん"]
+
+    def rows_at(edge):
+        out = []
+        for i, t in enumerate(lines):
+            w = len(t) * 30.0 - (15.0 if t[0] == "（" else 0.0)
+            x0 = {"left": 100.0 + (15.0 if t[0] == "（" else 0.0), "right": 900.0 - w, "center": 500.0 - w / 2}[edge]
+            out.append(dr(t, [(t, [x0, 100 + 60 * i, x0 + w, 130 + 60 * i])]))
+        return out
+    got = {e: TB.align_of(rows_at(e), 30.0, {"align": "center"})[:2] for e in ("left", "right", "center")}
+    few = TB.align_of(rows_at("left")[:4], 30.0, {"align": "right"})[:2]
+    check("对齐打分：整行读全的行按字格边（行首左括号往外补半格）比左沿 / 右沿 / 中心的离散，最小的够小、又和次好的分得开就用它、横向吸附；"
+          "整行读全的行不到 ALIGN_MIN_ROWS 个用建轨判的、不吸",
+          got == {"left": ("left", True), "right": ("right", True), "center": ("center", True)} and few == ("right", False), (got, few))
+    same = TB.align_of([dr(lines[0], [(lines[0], [100.0, 100.0, 100.0 + len(lines[0]) * 30.0, 130.0])]) for _ in range(6)], 30.0, {"align": "right"})
+    check("对齐打分：三种离散全是 0（同一行反复出现、分不出对齐）时不判，用建轨判的、不吸", same[:2] == ("right", False), same)
+    wide = [dr(t, [(t, [100.0, 100.0, 100.0 + len(t) * 30.0, 130.0])]) for t in lines]
+    keep = TB.BOX_MIN_LINES
+    try:
+        TB.BOX_MIN_LINES = len(lines)
+        bw, ch_bw, ev_bw = TB.box_width(wide, 30.0, None, 1), TB.box_width(wide, 30.0, 20, 5), TB.box_width(wide, 30.0, None, TB.WRAP_MIN_EVIDENCE)
+        rep_bw = TB.box_width(wide[1:] + wide[1:2] * 5, 30.0, None, 0)
+    finally:
+        TB.BOX_MIN_LINES = keep
+    check("文本框宽：有 chars 是 chars × em；没有、折行证据又不到 WRAP_MIN_EVIDENCE 条时，不同的剧本行到 BOX_MIN_LINES 句取最宽那行的字格宽加 WIDEN_TOL 个 em；"
+          "同一行反复读到只算一句，不够、或有折行证据却定不出 chars 的是 None",
+          (bw[0], bw[1]["by"], ch_bw[0], ev_bw[0], rep_bw[0]) == (300.0 + TB.WIDEN_TOL * 30.0, "rows", 600.0, None, None), (bw, ch_bw, ev_bw, rep_bw))
+    lay = {"aspect": 1.0, "boxes": [{"id": "b", "dx": 0.0, "cy": 0.5, "em_h": 0.03, "pitch_em": 1.5, "valign": "bottom", "chars": 20, "box_em": 20, "align": "right"}]}
+    meta = {"features": {"cx": 0.52, "cy": 0.49}, "align": "left"}
+    few = rows_at("left")[:4]
+    p_in, d_in = _prof(few, meta, lay)
+    p_far, d_far = _prof(few, {**meta, "features": {"cx": 0.7, "cy": 0.5}}, lay)
+    narrow = {**lay, "boxes": [{**lay["boxes"][0], "chars": 3, "box_em": 3}]}
+    p_rej, d_rej = _prof(rows_at("left"), meta, narrow)
+    check("版式文件：区域中心在 LAYOUT_NEAR 以内就补量不出的字段（em、行距、竖直对齐、chars、框宽、判不出的对齐，长度按 em 换算）；"
+          "离得远的不补；区域自己的行宽过条目框宽的不认这一条",
+          (p_in["em"], p_in["pitch"], p_in["valign"], p_in["chars"], p_in["box_w"], p_in["align"], p_in["h_inertia"]) == (30.0, 45.0, "bottom", 20, 600.0, "right", True)
+          and d_in["layout"] == {"entry": "b", "fields": ["em", "pitch", "valign", "chars", "align"]}
+          and p_far["em"] is None and d_far["layout"] is None and d_rej["layout"] == {"rejected": "b"} and p_rej["chars"] is None,
+          (p_in, d_in["layout"], d_far["layout"], d_rej["layout"]))
+    # 量得出的不被覆盖：竖直对齐按组判得出、对齐行够了却分不开、判出整块居中行左对齐的，都不补
+    by_mode_d = [dr("あいう\\Nかきく" if i % 2 else "さしす", [("あいう", [100.0, 100.0, 190.0, 130.0])]
+                    + ([("かきく", [100.0, 160.0, 190.0, 190.0])] if i % 2 else [])) for i in range(12)]
+    p_vm, d_vm = _prof(by_mode_d, meta, lay)
+    spread_d = [dr(t, [(t, [100.0 + 37 * i, 100 + 60 * i, 100.0 + 37 * i + len(t) * 30.0, 130 + 60 * i])]) for i, t in enumerate(lines)]
+    p_sp, d_sp = _prof(spread_d, meta, lay)
+    check("版式文件只补量不出的：现量的竖直对齐（按组判出）不改；整行读全的行够了、三种对齐分不开的不补对齐、不吸",
+          d_vm["layout"]["entry"] == "b" and d_sp["layout"]["entry"] == "b"
+          and d_vm["valign"]["by"] != "none" and p_vm["valign"] == "top" and "valign" not in d_vm["layout"]["fields"]
+          and d_sp["align"]["n"] >= TB.ALIGN_MIN_ROWS and d_sp["align"]["by"] == "tracks" and p_sp["align"] == "left" and p_sp["h_inertia"] is False,
+          (d_vm["valign"], d_vm["layout"], d_sp["align"], p_sp["align"]))
+    two = {"aspect": 1.0, "boxes": [{"id": "far", "dx": 0.06, "cy": 0.5, "em_h": 0.03}, {"id": "near", "dx": 0.03, "cy": 0.5, "em_h": 0.03},
+                                    {"id": "big", "dx": 0.02, "cy": 0.49, "em_h": 0.05}]}
+    ev_bad = [{"lo": 45.0, "hi": 46.0}]
+    check("版式条目：几条都对上取中心最近的；量出的一字宽和条目差过 LAYOUT_EM_TOL 的对不上；折行证据在条目的 chars 下不成立的不认",
+          TB.layout_entry(two, meta, 30.0, _sq())["id"] == "near" and TB.layout_entry({**two, "boxes": two["boxes"][2:]}, meta, 30.0, _sq()) is None
+          and TB.entry_fits({"chars": 55}, [], 30.0, ev_bad) is False and TB.entry_fits({"chars": 45}, [], 30.0, ev_bad) is True)
+    with tempfile.TemporaryDirectory() as td:
+        good, bad = Path(td) / "g.json", Path(td) / "b.json"
+        good.write_text(_json.dumps({"schema": TB.LAYOUT_SCHEMA, "aspect": 1.5, "boxes": []}), encoding="utf-8")
+        bad.write_text(_json.dumps({"schema": "flowocr-layout/1", "aspect": 1.5, "boxes": []}), encoding="utf-8")
+        try:
+            TB.layout_for(str(bad), None)
+            bad_err = False
+        except ValueError:
+            bad_err = True
+        got_lf = (TB.layout_for("none", "genshin"), TB.layout_for(str(good), "genshin")["boxes"], (TB.layout_for(None, "genshin") or {}).get("source"),
+                  TB.layout_for(None, "no-such-game"), TB.layout_for(None, None))
+        ok_box = {"id": "b", "dx": -0.3, "cy": 0.8, "em_h": 0.03, "chars": 41.0, "valign": "top", "align": "left"}
+        rejected = []
+        for broken in ({"valign": "middle"}, {"align": "justify"}, {"em_h": 0}, {"box_em": -3}, {"chars": 40.5}, {"chars": "41"},
+                       {"cy": 1.4}, {"id": 7}, {"em_h": None}, {"em_h": float("inf")}, {"chars": float("inf")}, {"dx": None}, {"aspect": 0}):
+            top = {"aspect": broken.get("aspect", 1.5)}
+            bad.write_text(_json.dumps({"schema": TB.LAYOUT_SCHEMA, **top, "boxes": [{**ok_box, **{k: v for k, v in broken.items() if k != "aspect"}}]}),
+                           encoding="utf-8")
+            try:
+                TB.load_layout(bad)
+            except ValueError as e:
+                rejected.append(next(iter(broken)) in str(e))
+        good.write_text(_json.dumps({"schema": TB.LAYOUT_SCHEMA, "aspect": 1.5, "boxes": [ok_box]}), encoding="utf-8")
+        ok_chars = TB.load_layout(good)["boxes"][0]["chars"]
+        builtin = [TB.load_layout(p)["game"] for p in sorted(TB.LAYOUT_DIR.glob("*.json"))]
+    check("layout_for：none 不用；给了路径读那份；没给按游戏找随代码走的文件；没有这款游戏的文件、没给游戏是 None；schema 不对（含按整个录像画面存的旧版）报错",
+          got_lf == (None, [], "layouts/genshin.json", None, None) and bad_err, got_lf)
+    check("load_layout：条目的非法枚举、非正长度、非整数 chars、出界的 cy、非字符串 id、缺 em_h、无穷大、缺 dx、非正的 aspect 都在读时报错并点出字段；"
+          "chars 存成整数；随代码走的几份都读得进",
+          rejected == [True] * 13 and ok_chars == 41 and type(ok_chars) is int and len(builtin) >= 4, (rejected, ok_chars, builtin))
+
+    # ---- 视口：版式条目按游戏画面存，匹配时先定游戏画面在录像里的位置（`locate`）
+    zl = {"aspect": 16 / 9, "viewport": None, "boxes": [{"id": "main", "dx": -0.01, "cy": 0.83, "em_h": 0.0264}]}
+
+    def reg(i, W, H, x, y, em, n=4):
+        """区域 i：中心在录像的 (x, y) 像素、一字宽 em、n 条台词。"""
+        return TB.Region({"index": i, "features": {"cx": x / W, "cy": y / H}}, rows_at("left")[:n], em, n, [])
+
+    def at(vx, vy, vh, W, H, i=0, n=4):
+        """游戏画面左上 (vx, vy)、高 vh 时主对话框所在的区域。"""
+        return reg(i, W, H, vx + vh * 16 / 9 / 2 - 0.01 * vh, vy + 0.83 * vh, 0.0264 * vh, n)
+    full = TB.locate(zl, [at(0, 0, 1080, 1920, 1080)], 1920, 1080)
+    corner = TB.locate(zl, [at(0, 0, 549, 1280, 720, i=1, n=6), reg(2, 1280, 720, 300, 620, 14.0, 2)], 1280, 720)
+    ultra = TB.locate(zl, [at(320, 0, 1080, 2560, 1080)], 2560, 1080)
+    small = TB.locate(zl, [at(1400, 800, 250, 1920, 1080)], 1920, 1080)
+    pinned = TB.locate({**zl, "viewport": (100, 50, 976, 549)}, [at(0, 0, 1080, 1920, 1080)], 1920, 1080)
+    # 整个画面对得上就不反推：另一个区域条目更多、能配出别的视口也不换
+    keep = TB.locate(zl, [at(0, 0, 1080, 1920, 1080, n=2), at(200, 100, 700, 1920, 1080, i=1, n=8)], 1920, 1080)
+    check("视口：全屏录像按整个画面；游戏缩在一角（主播布局）时按主对话框的一字宽和中心反推，几个配法取对得上的台词多的；"
+          "带鱼屏按 aspect 居中放进录像、对得上；反推的视口小过录像高的 VIEWPORT_MIN_H 不认、退回整个画面（记 fallback，和对上了的 frame 分开）；"
+          "--ctx viewport 给了就用；整个画面对得上就不反推",
+          full[1] == {"by": "frame", "box": [0, 0, 1920, 1080]}
+          and corner[1]["by"] == "inferred" and corner[1]["region"] == 1 and corner[1]["entry"] == "main"
+          and all(abs(a - b) < 0.5 for a, b in zip(corner[1]["box"], [0, 0, 976, 549]))
+          and ultra[1] == {"by": "frame", "box": [320, 0, 1920, 1080]}
+          and small[1] == {"by": "fallback", "box": [0, 0, 1920, 1080]} and pinned[1] == {"by": "ctx", "box": [100, 50, 976, 549]} and keep[1]["by"] == "frame",
+          (full[1], corner[1], ultra[1], small[1], pinned[1], keep[1]))
+    vp_c = corner[0]
+    p_c, d_c = TB.profile(reg(5, 1280, 720, 488 - 0.01 * 549, 0.83 * 549, None), zl, vp_c)
+    check("视口：量不出一字宽的区域照旧只凭位置对条目，一字宽按视口高换算（em_h × 视口高）",
+          d_c["layout"] == {"entry": "main", "fields": ["em"]} and abs(p_c["em"] - 0.0264 * 549) < 0.05, (p_c, d_c["layout"]))
+    out_err = raises(lambda: TB.locate({**zl, "viewport": (500, 0, 976, 549)}, [], 1280, 720), ValueError)
+    parse_err = [raises(lambda s=s: tracksio.parse_viewport(s), ValueError) for s in ("1,2,3", "0,0,0,5", "a,b,c,d", "0,0,inf,5")]
+    check("视口：--ctx viewport 出了录像画面、不是四个数、宽高不为正都报错；layout_for 把它记在 viewport 里",
+          out_err and all(parse_err) and TB.layout_for(None, "zzz", "0,0,976,549")["viewport"] == (0.0, 0.0, 976.0, 549.0)
+          and TB.layout_for(None, "zzz")["viewport"] is None, parse_err)
+    import importlib.util as _ilu
+    spec = _ilu.spec_from_file_location("layout_export", Path(__file__).resolve().parents[2] / "dev_tools" / "layout_export.py")
+    LE = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(LE)
+    with tempfile.TemporaryDirectory() as td:
+        mp = Path(td) / "m.json"
+        exp_err = []
+        for by in ("inferred", "fallback"):
+            mp.write_text(_json.dumps({"overlay": {"stats": {"textbox": {"viewport": {"by": by, "box": [0, 0, 976, 549]}}}}}), encoding="utf-8")
+            exp_err.append(raises(lambda: LE.candidates(mp, 1), SystemExit))
+        v1 = Path(td) / "v1.json"
+        v1.write_text(_json.dumps({"schema": "flowocr-layout/1", "boxes": [{"id": "b", "cx": 0.5, "cy": 0.8, "em_h": 0.03, "latin_em": 0.6}]}),
+                      encoding="utf-8")
+        old_v1, old_none = LE.old_boxes(v1), LE.old_boxes(Path(td) / "nope.json")
+    check("导出版式文件：匹配时反推出来的视口、没对上退回整个画面的都不收（前者拿旧文件配出来，后者游戏画面多半不占满录像）；"
+          "输出文件是读不了的旧格式时不带它的 latin_em、照样导出；两条的中心差横向按视口宽算",
+          exp_err == [True, True] and old_v1 == [] and old_none == []
+          and LE.dist({"dx": 0.16, "cy": 0.5}, {"dx": 0.0, "cy": 0.5}, 2.0) == 0.08, (exp_err, old_v1))
+
+    def two_rows(i, w1, w2):
+        t1, t2 = "あ" * w1, "い" * w2
+        x0 = 500.0 - w1 * 15.0
+        return dr(t1 + "\\N" + t2, [(t1, [x0, 100 + 90 * i, x0 + w1 * 30.0, 130 + 90 * i]), (t2, [x0, 160 + 90 * i, x0 + w2 * 30.0, 190 + 90 * i])])
+    hybrid = rows_at("center") + [two_rows(i, 10 + i, 3 + i) for i in range(5)]
+    hyb = TB.align_of(hybrid, 30.0, {"align": "left"})
+    check("对齐打分：整块居中、块里各行左对齐的版式（多行条目各行左沿齐、中心不齐）不判居中，用建轨判的、不吸",
+          hyb[:2] == ("left", False) and hyb[2]["by"] == "inner_left", hyb)
+
+    def evs(*los):
+        return [{"lo": float(x), "hi": float(x) + 1} for x in los]
+    gi = TB.fit_chars(evs(*[40] * 5, *[41] * 4, 50, 50))
+    check("chars 取让最多条证据成立的值（lo ≤ C ≤ hi，候选只取下界）：下界多在 40–41、2 条在 50 时取 41（41 让 40、41 两组都成立）；"
+          "单条矛盾的样本不把它拉高；不到 WRAP_MIN_EVIDENCE 条不给",
+          gi == (41.0, 9) and TB.fit_chars(evs(30, 30, 45)) == (30.0, 2) and TB.fit_chars(evs(34, 34, 34, 68)) == (34.0, 3)
+          and TB.fit_chars(evs(30)) == (None, 0),
+          (gi, TB.fit_chars(evs(30, 30, 45)), TB.fit_chars(evs(34, 34, 34, 68))))
+    scatter = evs(30, 30, 36, 40, 44, 50)
+    check("chars：取出的值下成立的不到 WRAP_MIN_HELD（一半）就不给——证据不是同一个框宽折出来的（次要区域常见）；正好一半照给",
+          TB.WRAP_MIN_HELD == 0.5 and TB.fit_chars(scatter) == (None, 2) and TB.fit_chars(evs(30, 30, 40, 50)) == (30.0, 2),
+          (TB.fit_chars(scatter), TB.fit_chars(evs(30, 30, 40, 50))))
+
+    # ---- em、valign、pitch
+    kanji = "亜伊宇絵於加機久計古佐志須世曽多知津手登奈仁奴根野波比"
+    em_ds = [dr(kanji[:n], [(kanji[:n], [100, 100, 100 + 35 * n + 12, 130])]) for n in range(5, 26)]
+    pe, _ = _prof(em_ds, None)
+    check("em：行宽对行字宽（全角字）的回归斜率，检测框外扩的常数项不算进去", pe["em"] == 35.0, pe)
+
+    def slots_draft(idx, start, bottoms, h=30, x0=100, x1=600, srcs=None, tops=None):
+        srcs = srcs or ["ocr"] * len(bottoms)
+        tops = tops or [b - h for b in bottoms]
+        return TB.Draft(idx, 0, start, [], [], [], [TB.Slot([x0, t, x1, b], s, i) for i, (t, b, s) in enumerate(zip(tops, bottoms, srcs))])
+
+    def by_mode(m, ruby=False):
+        out = []
+        for k in (1, 2, 3):
+            for r in range(5):
+                bots = [500 + TB.offset(m, i, k, 50) for i in range(k)]
+                tops = [b - 30 - (15 if ruby and i == 0 else 0) for i, b in enumerate(bots)]
+                out.append(slots_draft(len(out), len(out), bots, tops=tops))
+        return out
+    got_va = {m: TB.valign_of(by_mode(m), 50)[0] for m in TB.MODES}
+    one_k = [slots_draft(i, i, [500, 550]) for i in range(6)]
+    pr, _ = _prof(by_mode("top", ruby=True), None)
+    check("valign：按整块的行数分组比三种锚，上对齐 / 下对齐 / 居中都判得出；只有一种行数时判不出、取 top",
+          got_va == {m: m for m in TB.MODES} and TB.valign_of(one_k, 50) == ("top", {"groups": {"2": 6}, "by": "none"}), got_va)
+    check("valign / pitch 按下沿量：首行带 Ruby（上沿高出 15）不带偏行距和对齐", pr["pitch"] == 50.0 and pr["valign"] == "top", pr)
+
+    # ---- 按位置核对行：误读把首行读成第 2 行的字时，留位置对得上的真第 2 行（f1「ありえない可能性を除けば……」）
+    mis = [TB.Row([400, 870, 1000, 909], "(【ありえたかもしれない可能性】"), TB.Row([400, 925, 1200, 967], "【ありえたかもしれない可能性】が残ります。"),
+           TB.Row([400, 985, 800, 1025], "それが真実です。")]
+    mis_lines = ["ありえない可能性を除けば……", "【ありえたかもしれない可能性】が残ります。", "それが真実です。"]
+    by_text, by_pos = [h[0] for h in TB.assign(mis, mis_lines)], [h[0] for h in TB.assign(mis, mis_lines, 58.0)]
+    off = [TB.Row([400, 870, 900, 909], "一行目の文章です"), TB.Row([400, 925, 900, 967], "二行目の文章です"),
+           TB.Row([400, 1100, 900, 1140], "三行目の文章です")]
+    check("原文整块·给了行距就按位置核：同一句读了两遍时留位置和其余行对得上的那个（只按字会丢掉真的第 2 行）；"
+          "推出的首行下沿离中位半个行距以上的行不收",
+          by_text == [1, -1, 2] and by_pos == [-1, 1, 2]
+          and [h[0] for h in TB.assign(off, ["一行目の文章です", "二行目の文章です", "三行目の文章です"], 58.0)] == [0, 1, -1],
+          (by_text, by_pos))
+
+    # ---- 补行：同一条 cue 里的真实事件优先，找不到才合成
+    three = "一行目の文章です\\N二行目の文章です\\N三行目の文章です"
+
+    def fill_case(cue_evs, owner=None):
+        d = dr(three, [("一行目の文章です", [100, 100, 500, 130]), ("三行目の文章です", [120, 200, 400, 230])], idx=0)
+        d.cue_evs, d.own = cue_evs, {100, 101}
+        TB.fill(d, 50.0, owner or {})
+        return [(s.src, s.box, s.drawn_by) for s in d.slots]
+    real_ev = ev(7, "二行目の文章です", [100, 150, 450, 180])
+    far_ev = ev(8, "二行目の文章です", [100, 300, 450, 330])
+    check("补行：缺的行先用同一条 cue 里字对得上、位置对得上的真实事件（记 event:<id>，它被别的条目画了就记那个条目的下标）",
+          fill_case([far_ev, real_ev], {7: [0, 5]})[1] == ("event:7", [100.0, 150.0, 450.0, 180.0], 5), fill_case([far_ev, real_ev], {7: [0, 5]}))
+    check("补行：找不到（字对得上但位置差得远的不用）就按行距合成：下沿从最近的真实行推，横向取真实几行合起来的范围",
+          fill_case([far_ev])[1] == ("synth", [100, 150.0, 500, 180.0], None), fill_case([far_ev]))
+
+    # ---- 每一行该显示的日文、按字数放宽
+    folded = dr("あいうえおかきくけこさしすせそ\\Nたちつてと",
+                [("うえおかきくけこ", [200, 100, 480, 130]), ("さしすせそ", [100, 150, 275, 180]), ("つてと", [140, 200, 245, 230])])
+    check("每一行该显示的日文：被游戏折开的行按后一截的起点切开、各取一截（前一截 OCR 只读到中间也从行首起算）；只落在一个 OCR 行上的取剧本整行",
+          [s.jp for s in folded.slots] == ["あいうえおかきくけこ", "さしすせそ", "たちつてと"], [s.jp for s in folded.slots])
+
+    def wide(box, jp, align, chars=None, src="ocr", cap=None):
+        d = TB.Draft(0, 0, 0, [], [], [], [TB.Slot(list(box), src, 0, jp=jp)])
+        got = TB.widen(d, 35.0, chars, align, cap)
+        return d.slots[0].box, got
+    ten = "あいうえおかきくけこ"
+    check("按字数放宽：期望宽 = 墨迹宽 × em，从对齐边往外放（左对齐放右沿、右对齐放左沿、居中两边对称）；已经够宽的不收窄，差不到 WIDEN_TOL 个 em 的不放；"
+          "行首左括号、行尾句读点各扣半格（行尾省略号不扣）；宽过 chars 的行、期望宽超过区域 OCR 行宽上限的行（chars 为 null 时整行日文的合成行；游戏会折开、不知道是哪一截）和对不上剧本的行（jp 为 None）不动",
+          wide([100, 0, 200, 30], ten, "left") == ([100, 0, 450.0, 30], [("ocr", 250.0)])
+          and wide([600, 0, 700, 30], ten, "right")[0] == [350.0, 0, 700, 30]
+          and wide([300, 0, 400, 30], ten, "center")[0] == [175.0, 0, 525.0, 30]
+          and wide([100, 0, 500, 30], ten, "left") == ([100, 0, 500, 30], [])
+          and wide([100, 0, 440, 30], ten, "left") == ([100, 0, 440, 30], [])
+          and wide([100, 0, 200, 30], "（" + ten[:8] + "。", "left", src="synth") == ([100, 0, 415.0, 30], [("synth", 215.0)])
+          and TB.ink_cw(ten[:8] + "……") == 10.0
+          and wide([100, 0, 200, 30], ten, "left", chars=6.0) == ([100, 0, 200, 30], [])
+          and wide([100, 0, 200, 30], ten, "left", src="synth", cap=300.0) == ([100, 0, 200, 30], [])
+          and wide([100, 0, 200, 30], ten, "left", cap=340.0) == ([100, 0, 450.0, 30], [("ocr", 250.0)])
+          and wide([100, 0, 200, 30], None, "left") == ([100, 0, 200, 30], []),
+          [wide([100, 0, 200, 30], ten, a) for a in ("left", "right", "center")])
+
+    # ---- 惯性
+    def snap(drafts, va="top", h=False, align="left", p=50.0):
+        st = TB.inertia(drafts, {"valign": va, "h_inertia": h}, p, align)
+        return st, {d.idx: [s.box for s in d.slots] for d in drafts}
+    refs_c = [slots_draft(i, i, [500]) for i in range(3)] + [slots_draft(4 + i, 4 + i, [450, 500, 550]) for i in range(3)]
+    _, bc = snap(refs_c + [slots_draft(3, 3, [478, 528])], "center")
+    refs_b = [slots_draft(i, i, [600]) for i in range(3)] + [slots_draft(4 + i, 4 + i, [550, 600]) for i in range(3)]
+    _, bb = snap(refs_b + [slots_draft(3, 3, [505, 555, 605])], "bottom")
+    check("惯性·竖直按 valign 把真实行换算成整块的锚，不同行数的条目共用一个参照（居中：两行的条目吸到 1 行、3 行参照的中心两侧；下对齐：3 行吸到末行下沿）",
+          [b[3] for b in bc[3]] == [475.0, 525.0] and [b[3] for b in bb[3]] == [500.0, 550.0, 600.0], (bc[3], bb[3]))
+    refs_t = [slots_draft(i, i, [500]) for i in (0, 1, 2, 5, 6, 7)]
+    st_t, bt_ = snap(refs_t + [slots_draft(3, 3, [509]), slots_draft(4, 4, [560], x0=300)])
+    check("惯性·竖直差得少（0.3 行高）的吸过去，差得多（2 行高）的当成另一种版式、用自己的框",
+          bt_[3][0][3] == 500.0 and bt_[4][0] == [300, 530, 600, 560] and st_t["other_layout"] == 1, (bt_[3], bt_[4], st_t))
+    refs_h = [slots_draft(i, i, [500], x0=426, x1=900) for i in (0, 1, 2, 4, 5, 6)]
+    item_h = slots_draft(3, 3, [503, 553], x0=442, x1=900)
+    item_h.slots[1].box = [600, 523, 800, 553]                     # 开头的「……」整个没读到的那一行
+    _, bh = snap(refs_h + [item_h], h=True)
+    item_v = slots_draft(3, 3, [503, 553], x0=442, x1=900)
+    _, bv = snap([slots_draft(i, i, [500], x0=426, x1=900) for i in (0, 1, 2, 4, 5, 6)] + [item_v], h=False)
+    tail = slots_draft(3, 3, [503], x0=1062, x1=1308)              # OCR 只读到行尾的单行（「…思うよ！」）
+    _, bt2 = snap(refs_h + [tail], h=True)
+    check("惯性·同一版式时横向一律吸到参照真实行对齐边的中位：开头是括号的行（左沿 442）、差得多的行（漏读了开头的省略号，左沿 600）都吸到 426；"
+          "只挪对齐那条边、不平移，右沿不动（原文行尾不露出来）；OCR 只读到行尾的单行，整块盖住原框；对齐不是统计判出的区域横向不吸、竖直照吸",
+          bh[3] == [[426, 470.0, 900, 500.0], [426, 520.0, 800, 550.0]] and bt2[3] == [[426, 470.0, 1308, 500.0]]
+          and bv[3] == [[442, 470.0, 900, 500.0], [442, 520.0, 900, 550.0]], (bh[3], bt2[3], bv[3]))
+    refs_q = [slots_draft(i, i, [500], x0=x, x1=900) for i, x in zip((0, 1, 2, 4, 5, 6), (426, 450, 450, 426, 450, 450))]
+    _, bq = snap(refs_q + [slots_draft(3, 3, [503], x0=446, x1=900)], h=True)
+    check("惯性·左对齐的参照边取前后真实行左沿的低分位（INERTIA_EDGE_Q）：开头是括号的行多、中位偏到 450 的几段里，本身缩进的行（446）照样吸回真左沿 426；"
+          "右对齐取右沿的高分位、居中取中心的中位",
+          bq[3] == [[426, 470.0, 900, 500.0]] and TB.ref_edge([[0, 0, x, 1] for x in (900, 880, 880, 880, 880, 900)], "right") == 900
+          and TB.ref_edge([[x, 0, x + 100, 1] for x in (0, 10, 20)], "center") == 60, bq[3])
+    refs_r = [slots_draft(i, i, [500], x0=450, x1=900) for i in (0, 1, 2, 4, 5, 6)]
+    _, br = snap(refs_r + [slots_draft(3, 3, [503], x0=426, x1=700)], h=True)
+    check("惯性·吸附只放宽、不收窄：参照偏右（参照左沿 450）时左沿不往右收（426 留着）",
+          br[3] == [[426, 470.0, 700, 500.0]], br[3])
+    check("惯性·横向只放宽：左对齐右沿不动、左沿只往左；右对齐对称；居中按参照中心对称放到盖住原框",
+          TB.snap_x([534, 0, 1092, 10], "left", 428) == [428, 0, 1092, 10] and TB.snap_x([400, 0, 1092, 10], "left", 428) == [400, 0, 1092, 10]
+          and TB.snap_x([100, 0, 500, 10], "right", 520) == [100, 0, 520, 10] and TB.snap_x([100, 0, 560, 10], "right", 520) == [100, 0, 560, 10]
+          and TB.snap_x([500, 0, 700, 10], "center", 650) == [500, 0, 800, 10] and TB.snap_x([500, 0, 700, 10], "center", 580) == [460, 0, 700, 10],
+          [TB.snap_x([500, 0, 700, 10], "center", c) for c in (650, 580)])
+    refs_s = [slots_draft(i, i, [10, 550], x0=426, x1=900, srcs=["synth", "ocr"]) for i in (0, 1, 2)]
+    for d in refs_s:
+        d.slots[0].box = [0, 0, 10, 10]
+    _, bs = snap(refs_s + [slots_draft(3, 3, [503], x0=440, x1=900)], h=True)
+    refs_3 = [slots_draft(i, i, [500, 533, 566]) for i in (0, 1, 2, 4, 5, 6)]
+    st_3, b3 = snap(refs_3 + [slots_draft(3, 3, [500, 533, 627])])
+    check("惯性·整块的锚对得上、但吸过去会把某个真实行挪半个行高以上的（hsr 聊天记录：整块两行相隔 30 px、参照行距约 67 px，按参照行距排会推到日文下一行）当成另一种版式、不吸",
+          b3[3] == [[100, 470, 600, 500], [100, 503, 600, 533], [100, 597, 600, 627]] and st_3["other_layout"] == st_3["other_layout_row"] == 1,
+          (b3[3], st_3))
+    st_f, bf = snap([slots_draft(0, 0, [500]), slots_draft(1, 1, [500]), slots_draft(2, 2, [520], x0=300)], h=True)
+    check("惯性·参照只用前后条目的真实行（合成的行不算）；参照不到 INERTIA_MIN_REF 条的用自己的框",
+          bs[3] == [[426, 470.0, 900, 500.0]] and bf[2] == [[300, 490, 600, 520]] and st_f["few_ref"] == 3, (bs[3], bf[2], st_f))
+
+    # ---- 两条匹配路径都把字段写进产物；缺首行的条目从同一条 cue 的名牌事件补；名牌层逐条不变、rows 不变
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "Scripts" / "Act").mkdir(parents=True)
+        bodies = ["ねえ、ここどこなのかな！？", "それはきっと、この証拠品で証明できると思うよ！", "だったら見せてみなよ！"]
+        (d / "Scripts" / "Act" / "T01.bytes").write_text("".join(
+            f"# T01_Ema00{k}\n; > Ema: |#T01_Ema00{k}|\n; ……エマさん。<br>{b}\n……艾玛同学。<br>\n第{k}句。\n\n" for k, b in enumerate(bodies))
+            + "# T01_Narrative001\n; ここは牢獄だ。\n这里是囚牢。\n", encoding="utf-8")
+        tevs, tcues = [], []
+        for k, (a, b) in enumerate(zip((0, 20, 40), bodies)):
+            ids = [len(tevs), len(tevs) + 1]
+            tevs += [{"id": ids[0], "region": 0, "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": "……エマさん。", "flags": [],
+                      "box": [400, 850, 700, 880]},
+                     {"id": ids[1], "region": 0, "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "text": b, "flags": [],
+                      "box": [400, 892, 1500, 922]}]
+            tcues.append({"id": f"t{k}", "t_start": int(a * 1e6), "t_end": int((a + 3) * 1e6), "events": ids})
+        tevs.append({"id": 6, "region": 0, "t_start": 60_000_000, "t_end": 63_000_000, "text": "ここは牢獄だ。", "flags": [], "box": [400, 850, 800, 880]})
+        tcues.append({"id": "t3", "t_start": 60_000_000, "t_end": 63_000_000, "events": [6]})
+        tdoc = tracksio.dump(d / "t-tracks.json", {"meta": {}, "frame_us": 500_000, "size": [1920, 1080],
+                                                   "provenance": {"main_track": "r00", "main_srt": "t-r00.srt"}, "regions": [{"index": 0}],
+                                                   "events": tevs, "tracks": [{"id": "r00", "kind": "region", "region": 0, "label": "subtitle",
+                                                                               "srt": "t-r00.srt", "cues": tcues}]})
+        m = X.load("naninovel", "matcher")
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = m.match(tdoc, {"script": str(d / "Scripts")}, {})
+            real_annotate = TB.annotate
+            TB.annotate = lambda items, doc, shown, layout=None: ({}, {"regions": {}, "block_src": {}, "ocr_rows_dropped": 0, "first_missing": 0, "first_filled": 0,
+                                                         "drawn_by": 0, "inertia": {}, "widened": {"rows": 0, "by_src": {}, "dx": {}}})
+            try:
+                plain = m.match(tdoc, {"script": str(d / "Scripts")}, {})
+            finally:
+                TB.annotate = real_annotate
+        ov = out["overlay"]
+        items = ov["items"]
+        names = [(k, it) for k, it in enumerate(items) if it["layer"] == "name"]
+        body = [it for it in items if it["layer"] == "body"]
+        two = [it for it in body if "\\N" in it["jp"]]
+        ok_contract = True
+        try:
+            matchedio.validate(out, need_overlay=True)
+            SC.need_textbox(out)
+        except Exception as e:      # noqa: BLE001
+            ok_contract = repr(e)
+        check("naninovel 产物：schema 当前版本、overlay.textbox 按区域号给画像，每个正文条目 block 非空、block_src / block_drawn_by 和它等长，过阶段 3 的门",
+              ok_contract is True and out["schema"] == matchedio.SCHEMA and set(ov["textbox"]) == {"0"}
+              and ov["textbox"]["0"]["valign"] in TB.MODES and set(ov["textbox"]["0"]) >= {"valign", "pitch", "em", "chars", "box_w", "h_inertia", "evidence"}
+              and all(it["block"] and len(it["block_src"]) == len(it["block"]) == len(it["block_drawn_by"]) for it in body),
+              (ok_contract, ov["textbox"]))
+        plate_of = {it["events"][0]: k for k, it in names}
+        check("原文整块：缺的首行（被认成名牌的「……エマさん。」）从同一条 cue 的那个事件补，记下画着它的名牌条目；rows 不变（只有收进来的正文行）；"
+              "剧本只有一行的条目整块就是 OCR 行",
+              len(two) == 3 and len(names) == 3
+              and all(it["rows"] == [[400, 892, 1500, 922]] and len(it["block"]) == 2
+                      and it["block_src"][0].startswith("event:") and it["block_src"][1] == "ocr"
+                      and it["block_drawn_by"][0] == plate_of[int(it["block_src"][0][6:])] for it in two)
+              and [(it["block"], it["block_src"]) for it in body if it["jp"] == "ここは牢獄だ。"] == [([[400, 850, 800, 880]], ["ocr"])]
+              and ov["stats"]["textbox"]["first_filled"] == 3 and ov["stats"]["textbox"]["drawn_by"] == 3,
+              [(it["rows"], it["block"], it["block_src"], it["block_drawn_by"]) for it in body])
+        strip = ("block", "block_src", "block_drawn_by")
+        check("名牌层逐条不变：原文整块只写正文条目的新字段，名牌的组、层、框和不建整块时逐条相同；正文条目的其余字段也相同",
+              [it for it in items if it["layer"] not in ("body", "extra")] == [it for it in plain["overlay"]["items"] if it["layer"] not in ("body", "extra")]
+              and [{k: v for k, v in it.items() if k not in strip} for it in body]
+              == [it for it in plain["overlay"]["items"] if it["layer"] == "body"],
+              _json.dumps([it for it in items if it["layer"] == "name"], ensure_ascii=False)[:400])
+
+
+def t_en_target() -> None:
+    """英文译文（en-target 计划）：剧本日中英三份配对、名牌带英文名、出英文要产物里有英文、英文按游戏字宽折行和定字号、
+    阅读面板的英文段在空格处断、占位删掉后不留双空格、版式文件的 latin_em 带进画像。"""
+    print("\n## 英文译文")
+    import json
+    from types import SimpleNamespace as _NS
+    from flowocr import placeholders as PH
+    from flowocr.analyze import gamescript as GS
+    from flowocr.analyze import gtdbundle as GB
+    from flowocr.analyze import textbox as TB
+    from flowocr.artifacts import matchedio as MIO
+    from flowocr.output import layout as LO
+    from flowocr.output import script as SC
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        b3 = GB.open_bundle(_mini_bundle(td / "b3", langs=(("ja", "jp"), ("zh-Hans", "chs"), ("en", "en"))))
+        b2 = GB.open_bundle(_mini_bundle(td / "b2"))
+        saved = dict(GS._BUNDLES)
+        try:
+            GS._BUNDLES["genshin"] = b3
+            three = list(GS.paired("genshin", "quests"))
+            GS._BUNDLES["genshin"] = b2
+            two = list(GS.paired("genshin", "quests"))
+        finally:
+            GS._BUNDLES.clear()
+            GS._BUNDLES.update(saved)
+    check("剧本：包里有英文那份时日中英三份逐行配对，没有时第三项一律 None（旧包照读）",
+          [e["text"] for _, _, e in three] == ["quests-en-0", "quests-en-1", "quests-en-2"] and all(e is None for _, _, e in two)
+          and [a["text"] for a, _, _ in two] == ["quests-ja-0", "quests-ja-1", "quests-ja-2"], (three, two))
+
+    def fake(en_rows):
+        rows = {"ja": [{"id": i, "text": "j"} for i in range(3)], "zh-Hans": [{"id": i, "text": "c"} for i in range(3)], GS.EN: en_rows}
+        return _NS(iter_rows=lambda stem, lang: iter(rows[lang]), has=lambda tables, langs: True)
+    short = []
+    for en_rows in ([{"id": 0, "text": "e"}, {"id": 1, "text": "e"}], [{"id": i if i != 1 else 9, "text": "e"} for i in range(3)]):
+        saved = dict(GS._BUNDLES)
+        try:
+            GS._BUNDLES["genshin"] = fake(en_rows)
+            short.append(raises(lambda: list(GS.paired("genshin", "quests")), SystemExit))
+        finally:
+            GS._BUNDLES.clear()
+            GS._BUNDLES.update(saved)
+    check("剧本：英文那份少一行、或逐行 id 对不上，当场报错（不静默截断、不错配）", short == [True, True], short)
+
+    doc = {"cues": [{"ref": {"key": "k", "jp": "あ", "cn": "啊"}}], "overlay": {"items": [{"layer": "body", "cn": "啊"}]}}
+    check("出英文：产物里一条英文都没有（Naninovel、加英文之前的匹配）就报错，有就放行；jp 不核；不认得的语种报错",
+          raises(lambda: MIO.need_lang(doc, "en"), ValueError) and not raises(lambda: MIO.need_lang(doc, "cn"), ValueError)
+          and not raises(lambda: MIO.need_lang({**doc, "overlay": {"items": [{"layer": "body", "cn": "啊", "en": "Ah"}]}}, "en"), ValueError)
+          and not raises(lambda: MIO.need_lang({}, "jp"), ValueError) and raises(lambda: MIO.need_lang(doc, "fr"), ValueError))
+    panel = {"cues": [{"ref": None}], "overlay": {"items": [{"layer": "panel", "paras": {"jp": ["あ", "い"], "cn": ["啊", "咦"], "en": ["Ah", None]}}]}}
+    check("只有阅读面板带译文的片段：面板每段都有这个语种就放行（cn），有一段缺就不算（en），同面板投影",
+          not raises(lambda: MIO.need_lang(panel, "cn"), ValueError) and raises(lambda: MIO.need_lang(panel, "en"), ValueError))
+
+    # 折行：拉丁字按 `latin`（一个字占几个全角字）量；宽字母（W）多的句子同样字数会早折
+    narrow, wide_ = "aaaa aaaa aaaa aaaa", "WWWW WWWW WWWW WWWW"
+    lat = {c: 0.5 for c in "a "} | {"W": 1.0}
+    check("英文折行：按每个拉丁字的宽（`latin`）量、只在空格处断；宽字母多的同样字数早折；不给 `latin` 照 cw 一律半个字",
+          SC.wrap_lines(narrow, 10, None, lat) == [narrow]
+          and SC.wrap_lines(wide_, 10, None, lat) == ["WWWW WWWW", "WWWW WWWW"]
+          and SC.wrap_lines(wide_, 10) == [wide_], (SC.wrap_lines(wide_, 10, None, lat), SC.wrap_lines(wide_, 10)))
+
+    F = "F"
+    widths = {(F, LO.EM_REF): 20.0, (F, LO.EM_REF * 2): 40.0,
+              (F, LO.LATIN_REF): 0.5 * len(LO.LATIN_REF), (F, LO.LATIN_REF + " " + LO.LATIN_REF): 0.5 * (2 * len(LO.LATIN_REF) + 1),
+              (F, "Hello there"): 4.4, (F, "你好"): 2.0}
+    rows = [[100, 100, 900, 130]]
+    s_en = LO.body_size(rows, ["Hello there"], F, widths, 31.0, None, 1920, 0.6)
+    s_def = LO.body_size(rows, ["Hello there"], F, widths, 31.0, None, 1920)
+    s_cn = LO.body_size(rows, ["你好"], F, widths, 31.0, None, 1920)
+    check("英文字号：拉丁字平均宽 = latin_em × em（字号 1 时平均 0.5 → 31 × 0.6 / 0.5 = 37.2）；没给 latin_em（不是输出英文）内容是拉丁字也按全角字 = em（31）",
+          (s_en, s_def, s_cn) == (37, 31, 31), (s_en, s_def, s_cn))
+    rel = LO.latin_rel(F, {**widths, **{(F, c * n): (1.0 if c == "W" else 0.5) * n for c in LO.LATIN_CHARS for n in (10, 20)},
+                           (F, "xx"): 1.0, (F, "x" + " " * 10 + "x"): 1.0 + 2.5})
+    check("拉丁字相对宽：步进宽 / 平均拉丁字宽（W 是 2、普通字 1、空格 0.5）",
+          [round(rel[c], 9) for c in "Wa "] == [2.0, 1.0, 0.5], {k: rel.get(k) for k in "Wa "})
+
+    _, lines = LO.block_layout([0, 0, 100, 1000], ["alpha beta gamma delta"], 10, F, {(F, "alpha beta gamma delta"): 22.0}, size=10, latin=True)
+    _, cjk = LO.block_layout([0, 0, 100, 1000], ["alpha beta gamma delta"], 10, F, {(F, "alpha beta gamma delta"): 22.0}, size=10)
+    check("阅读面板：英文段在空格处断、不切在词中间，断处的空格留在行尾（拼回去就是原段）；不是输出英文的照旧按字数切",
+          lines == ["alpha beta ", "gamma ", "delta"] and cjk == ["alpha beta", " gamma del", "ta"], (lines, cjk))
+    pan = {"layer": "panel", "start_us": 0, "end_us": 1, "rows": [[0, 0, 100, 100]], "row_h": 10,
+           "paras": {"jp": ["あ", "い"], "cn": ["甲", "乙"], "en": ["Alpha", None]}}
+    check("阅读面板：英文缺一段（段数和日文对不上）的整块不画英文、不崩；中文照画",
+          SC._project_one(pan, {}, "en", None, {}, PH.Marks(), latin={"a": 1.0}) is None
+          and SC._project_one(pan, {}, "cn", None, {}, PH.Marks()).lines == ["甲", "乙"])
+
+    check("占位删掉后（英文）：词间不留两个空格、标点前不留空格；中文照旧",
+          PH.drop("I'm {NICKNAME} and you?") == "I'm and you?" and PH.drop("Thanks {NICKNAME}.") == "Thanks."
+          and PH.drop("Hello, {NICKNAME}!") == "Hello!" and PH.drop("你好，{NICKNAME}。") == "你好。"
+          and PH.drop("当前清缴积分：[ {X} ]") == "当前清缴积分：[  ]" and PH.drop("{NICKNAME} and I.\n{NICKNAME} went") == "and I.\nwent",
+          (PH.drop("I'm {NICKNAME} and you?"), PH.drop("Thanks {NICKNAME}."), PH.drop("Hello, {NICKNAME}!")))
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "l.json"
+        f.write_text(json.dumps({"schema": TB.LAYOUT_SCHEMA, "aspect": 1.0, "boxes": [{"id": "b", "dx": 0.0, "cy": 0.5, "em_h": 0.03, "latin_em": 0.66}]}),
+                     encoding="utf-8")
+        lay = TB.load_layout(f)
+        f.write_text(json.dumps({"schema": TB.LAYOUT_SCHEMA, "aspect": 1.0, "boxes": [{"id": "b", "dx": 0.0, "cy": 0.5, "em_h": 0.03, "latin_em": 0}]}),
+                     encoding="utf-8")
+        bad = raises(lambda: TB.load_layout(f), ValueError)
+    meta = {"features": {"cx": 0.5, "cy": 0.5}, "align": "left"}
+    prof, diag = _prof([], meta, lay)
+    prof0, _ = _prof([], meta)
+    from flowocr.analyze import game_align as GA
+    from flowocr.analyze import scriptmatch as SM
+    from flowocr.analyze import script_align as SA
+    nref = GA.Ref(doc={"units": [{"uid": "u", "lines": [{"speaker": "パイモン", "speaker_cn": "派蒙", "speaker_en": "Paimon"}]}],
+                       "speakers": {"パイモン": "派蒙"}, "speakers_en": {"ウェンティ": "Venti"},
+                       "terms": {"傭兵": {"cn": "佣兵", "en": "Mercenary"}, "隊長": {"cn": "队长"}}},
+                  script=[], windows=[], role={}, variant_of={})
+    check("名牌的英文名：说话人表按 speaker_en / speakers_en、短名词表按 terms 的 en 查（没有英文的不收）",
+          SM.speaker_names(nref, "en") == {SA.norm("パイモン"): "Paimon", SA.norm("ウェンティ"): "Venti"}
+          and SM.term_names(nref, "en") == {SA.norm("傭兵"): "Mercenary"} and SM.term_names(nref) == {SA.norm("傭兵"): "佣兵", SA.norm("隊長"): "队长"},
+          (SM.speaker_names(nref, "en"), SM.term_names(nref, "en")))
+    check("版式文件的 latin_em：对上的条目带进画像（诊断记进补的字段），不合规（非正）读时报错；没有版式文件的画像不带",
+          prof.get("latin_em") == 0.66 and "latin_em" in diag["layout"]["fields"] and bad and "latin_em" not in prof0, (prof, diag["layout"]))

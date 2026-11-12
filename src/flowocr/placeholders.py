@@ -2,7 +2,7 @@
 
 这里只认**花括号本身**，不管它是什么、该填什么——猜值是匹配器的事（原神从视频原文读玩家名，`flowocr.analyze.matchers.gametext`），
 猜出来的写进匹配产物的 `fills`（`{占位: {"value": 值或 None, "by_lang": {"jp": …, "cn": …}, "how": 从哪来, …}}`：
-玩家起的名字各语种相同，记 `value`；从候选里选的名字（星铁 `{TEXTJOIN#n}`）各语种不同，记 `by_lang`，输出哪种语言取哪个）。
+玩家起的名字各语种相同，记 `value`；从候选里选的名字（星铁 `{TEXTJOIN#n}`）各语种不同，记 `by_lang`（`jp` / `cn`，剧本带英文时另有 `en`），输出哪种语言取哪个）。
 
 * 阶段 2（`gamescript`）：性别、注音、按平台的写法先按游戏处理掉，剩下的花括号就是占位，在**译文**和原文模板里原样留着；
   用来匹配的原文里删掉（`drop`）。
@@ -54,6 +54,10 @@ def tidy(t: str) -> str:
     t = re.sub(rf"(^|\n)({_TAGS}){_SP}{DROP}+{_SP}[{SEP}]+{_SP}(?=\n|$)", r"\1\2", t)   # 整行只剩占位 + 分隔号：留成空行
     t = re.sub(rf"{_SP}[{SEP}]{_SP}{DROP}+{_SP}(?=[{END}]|\n|$)", "", t)
     t = re.sub(rf"([{SEP}]){_SP}{DROP}+{_SP}[{SEP}]", r"\1", t)
+    # 拉丁文的词间空格：`I'm {X} and` 删完不留两个空格，`thanks {X}.` 不留标点前的空格（前面是拉丁字时才收，绝区零中文的 `[ {X} ]` 照旧）
+    t = re.sub(rf"(?<=[A-Za-z0-9.,!?;:'\"]) {DROP}+ ", " ", t)
+    t = re.sub(rf"(?<=[A-Za-z0-9'\"]) {DROP}+(?=[.,!?;:])", "", t)
+    t = re.sub(rf"(^|\n)({_TAGS}){DROP}+ (?=[A-Za-z])", r"\1\2", t)             # 行首：`{X} and I…` 不留行首空格
     return t.replace(DROP, "")
 
 
@@ -70,7 +74,7 @@ SAFE = str.maketrans({"[": "［", "]": "］", "{": "｛", "}": "｝", "\\": "＼
 
 
 class Marks:
-    """一份输出里的占位：按出现先后编号、换成标记，记下每个编号出现了几处。`fills` 是匹配产物的 `fills`，`lang` 是输出的语种（`jp` / `cn`）。"""
+    """一份输出里的占位：按出现先后编号、换成标记，记下每个编号出现了几处。`fills` 是匹配产物的 `fills`，`lang` 是输出的语种（`jp` / `cn` / `en`）。"""
 
     def __init__(self, fills: dict | None = None, lang: str | None = None):
         self.fills = fills or {}

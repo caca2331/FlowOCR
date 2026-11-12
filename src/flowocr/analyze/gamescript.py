@@ -89,7 +89,7 @@ CODE_FP_FILES = ("src/flowocr/analyze/gamescript.py", "src/flowocr/analyze/gtdbu
                  "src/flowocr/placeholders.py", "src/flowocr/richtext.py", "src/flowocr/textfold.py")
 """产剧本的代码（本文件 + 它 import 的本地模块，仓库相对路径；`paths` 是 shim，记真实现），
 `build_tracks.code_fp` 按内容算指纹。"""
-SCHEMA = "flowocr-gameref/6"
+SCHEMA = "flowocr-gameref/7"
 """/2（2026-09-11，audit-6）：锚点带 `unique`、绝区零变体组折成 `Variant` + `variant_of`、
 provenance 带 `integrity_warnings`。/3（同日）：锚点带框位置 `y` / `in_band`、新类型 `OffBand`、
 `stats.band`。/4（2026-09-25，发布前）：库改成读文本包，provenance 的 `db` / `upstream` / `extractor` /
@@ -99,11 +99,13 @@ provenance 带 `integrity_warnings`。/3（同日）：锚点带框位置 `y` / 
 /6（2026-10-07）：行的 `kind` 只放库里来的类型，这段视频里的处境（没播、没走的分支、变体、重演拷贝、不在字幕带）
 另放 `status`（`STATUSES`；之前直接写进 `kind`、盖掉类型）；`stats.kinds` 按类型数，另加 `stats.statuses`。
 旧剧本不做兼容，`game_align` 见到就让你重跑。
+/7（2026-11-10，en-target 计划）：文本包有英文那份时，行另带 `en` / `en_rich` / `speaker_en`、顶层另带 `speakers_en`，
+`terms` 的条目另带 `en`、`textjoins` 的候选另带 `en`；英文只是载荷，圈单元、认领、名牌投票照旧只看日文和中文。
 /4 之内加的**可选**顶层 `terms`（2026-09-26，`term_table`）：文本包有短名词表时才有，读的一方缺了照常工作，所以没升版本。
 /5 之内加的**可选**顶层 `textjoins`（2026-10-05，`used_textjoins`）：星铁剧本行用到的 `{TEXTJOIN#n}` 的候选，同理没升版本。"""
 
 GAMES = {
-    # 游戏 -> {loader 要读的表（文本包清单里的 `table`）: 认得的内容契约主版本}。语种按标准码取 `ja` / `zh-Hans`，
+    # 游戏 -> {loader 要读的表（文本包清单里的 `table`）: 认得的内容契约主版本}。语种按标准码取 `ja` / `zh-Hans`（有英文那份时另读 `en`），
     # 文件后缀由清单给。主版本对不上的包 `gtdbundle.Bundle.require` 拒绝：那是字段含义变了，这里的读法要先跟上。
     "genshin": {"quests": 1, "reminders": 1},
     "starrail": {"missions": 1, "dialogues": 1, "sentences": 1},
@@ -160,6 +162,9 @@ NON_BAND_KINDS = frozenset({"Choice", "BlackScreen", "Loose", "ReminderUI"})
   `Banner` 摆帧 gi1 7456 s 在画面上方横幅，gi1 / gi2 主轨命中 0/4、0/8（obs 全读到过），
   `WhiteMessage` 0/4。其余 style 没见过上屏，保守地不进分母。
 
+画不画是另一回事（显示协议，`scriptmatch.group_of`）：`ReminderUI` 和绝区零散条目里的 `Tips` / `MiddleTips` 归 `special`（特殊上屏形式的台词与提示，默认画），
+其余散条目除过场字幕外归 `ui`（界面文字，默认不画）。
+
 其余类型（原神的上游角色 `NPC` / `PLAYER`…、`Reminder`、星铁 / 绝区零的 `Talk`）是台词。"""
 
 STATUSES = ("OutOfSpan", "Unwalked", "Ambiguous", "Variant", "Duplicate", "OffBand")
@@ -215,17 +220,28 @@ def bundle_of(game: str) -> "gtdbundle.Bundle":
     return _BUNDLES[game]
 
 
+EN = "en"
+"""英文译文在文本包里的语种码（**可选**：包里这张表没有英文就不读，剧本行的 `en` 为 None）。"""
+_NONE = ()
+
+
+def has_en(game: str, stem: str) -> bool:
+    return bundle_of(game).has([stem], (EN,))
+
+
 def paired(game: str, stem: str):
-    """同一张表的日文 / 中文两份，**逐行 id 相同**（game-text-data 的不变量），这里再核一遍。
-    两份都读到底，`iter_rows` 读完各自核一遍哈希。"""
+    """同一张表的日文 / 中文 / 英文三份，**逐行 id 相同**（game-text-data 的不变量），这里再核一遍；包里没有英文那份时第三项一律 None。
+    几份都读到底，`iter_rows` 读完各自核一遍哈希。"""
     bd = bundle_of(game)
+    en = bd.iter_rows(stem, EN) if has_en(game, stem) else _NONE
     # 按最长的配：只核 id 相等核不出"一份少了尾巴"，裸 zip 会静默截断
-    for a, b in zip_longest(bd.iter_rows(stem, "ja"), bd.iter_rows(stem, "zh-Hans")):
-        if a is None or b is None:
-            raise SystemExit(f"{game}/{stem} 日中两份行数不一样（{'日文' if a is None else '中文'}那份先完）")
-        if a["id"] != b["id"]:
-            raise SystemExit(f"{game}/{stem} 日中两份逐行 id 对不上：{a['id']} vs {b['id']}")
-        yield a, b
+    for a, b, e in zip_longest(bd.iter_rows(stem, "ja"), bd.iter_rows(stem, "zh-Hans"), en):
+        if a is None or b is None or (en is not _NONE and e is None):
+            short = "日文" if a is None else "中文" if b is None else "英文"
+            raise SystemExit(f"{game}/{stem} 日中英几份行数不一样（{short}那份先完）")
+        if a["id"] != b["id"] or (e is not None and e["id"] != a["id"]):
+            raise SystemExit(f"{game}/{stem} 日中英几份逐行 id 对不上：{a['id']} / {b['id']} / {e and e['id']}")
+        yield a, b, e
 
 
 @dataclass
@@ -243,6 +259,9 @@ class Line:
     speaker_cn: str | None = None
     """说话人的中文名（上游中文那份的 `speaker`；原神任务对话多半为空、绝区零 scene 没有这个字段）。
     叠加 ASS 的名牌层译文从这里来（`scriptmatch.speaker_names`）。"""
+    en: str | None = None
+    """英文译文（包里有英文那份时；同 `cn`，只是载荷：判断照旧只看 `cn`）。"""
+    speaker_en: str | None = None
 
 
 @dataclass
@@ -296,10 +315,11 @@ def branch_kind(memberships: list[tuple[str, str]], walked: dict[str, set]) -> s
 def load_genshin() -> list[Unit]:
     units: dict[int, Unit] = {}
     pron = pronoun_table("genshin")
-    sx = (lambda t, lang: sexpro(t, pron[lang])) if pron else (lambda t, lang: t)   # noqa: E731
-    for q, qc in paired("genshin", "quests"):
+    sx = (lambda t, lang: sexpro(t, pron[lang]) if lang in pron else t) if pron else (lambda t, lang: t)   # noqa: E731
+    for q, qc, qe in paired("genshin", "quests"):
         cn_of = {d["dialog_id"]: sx(d["text"], "zh-Hans") for d in qc["dialog"]}
         spk_of = {d["dialog_id"]: d.get("speaker") for d in qc["dialog"]}
+        en_of = {d["dialog_id"]: (sx(d["text"], EN), d.get("speaker")) for d in (qe or {}).get("dialog") or ()}
         talks: dict[int, list[dict]] = defaultdict(list)
         for d in q["dialog"]:
             talks[d["talk_id"]].append(d)
@@ -324,9 +344,11 @@ def load_genshin() -> list[Unit]:
                     kind = "BlackScreen"
                 else:
                     kind = role
+                en, spk_en = en_of.get(d["dialog_id"], (None, None))
                 lines[d["dialog_id"]] = Line(key=f"gi:{d['dialog_id']}", kind=kind, role=role,
                                              speaker=d.get("speaker"), raw=sx(d["text"] or "", "ja"),
-                                             cn=cn_of.get(d["dialog_id"]), speaker_cn=spk_of.get(d["dialog_id"]))
+                                             cn=cn_of.get(d["dialog_id"]), speaker_cn=spk_of.get(d["dialog_id"]),
+                                             en=en, speaker_en=spk_en)
             nexts = {i: [n for n in (d.get("next") or []) if n in by] for i, d in by.items()}
             for x, ms in exclusive_members(nexts).items():
                 lines[x].memberships.extend((f"gi:{g}", str(o)) for g, o in ms)
@@ -334,21 +356,22 @@ def load_genshin() -> list[Unit]:
     out = list(units.values())
     # 语音字幕（`reminders_*`：边玩边说的对白，不在任何 talk 里）：一条链一个单元，
     # 单句链一条锚点就算。role 记上游的 style；只有 `Normal` 在字幕带（见 NON_BAND_KINDS）
-    for r, rc in paired("genshin", "reminders"):
+    for r, rc, re_ in paired("genshin", "reminders"):
         for l in r["lines"]:
             note_value("genshin.reminders.lines[].style", l["style"])
         lines = [Line(key=f"gi:rem:{l['reminder_id']}",
                       kind="Reminder" if l["style"] == "Normal" else "ReminderUI",
                       role=l["style"] or "?", speaker=l["speaker"], raw=sx(l["text"], "ja"), cn=sx(c["text"], "zh-Hans"),
-                      speaker_cn=c.get("speaker"))
-                 for l, c in zip(r["lines"], rc["lines"], strict=True) if l["text"]]
+                      speaker_cn=c.get("speaker"), en=sx(e.get("text"), EN), speaker_en=e.get("speaker"))
+                 for l, c, e in zip(r["lines"], rc["lines"], re_["lines"] if re_ else [{}] * len(r["lines"]), strict=True)
+                 if l["text"]]
         if lines:
             out.append(Unit(uid=f"gi:rem:{r['id']}", title=None, lines=lines, solo=len(lines) == 1))
     warn_unseen()
     return out
 
 
-def _hsr_script(uid: str, title: str | None, ev: list[dict], evc: list[dict]) -> Unit:
+def _hsr_script(uid: str, title: str | None, ev: list[dict], evc: list[dict], eve: list[dict] | None = None) -> Unit:
     """星铁一个脚本：`talk`/`trigger` 是上屏的台词，`option` 是选项（它的 `reply` 是 NPC 的回答，
     上屏、属于这个选项的分支），`wait <选项的 trigger>` 之后到下一个 `wait` 之间是那个选项的分支段。
 
@@ -373,13 +396,14 @@ def _hsr_script(uid: str, title: str | None, ev: list[dict], evc: list[dict]) ->
     lines: dict[int, Line] = {}
     where: dict[int, set] = defaultdict(set)      # sentence -> {选项 id 或 None(主干)}
 
-    def add(sid, kind, role, src, src_c):
+    def add(sid, kind, role, src, src_c, src_e):
         if sid not in lines:
             lines[sid] = Line(key=f"hsr:{sid}", kind=kind, role=role, speaker=src.get("speaker"),
-                              raw=src["text"], cn=src_c.get("text"), speaker_cn=src_c.get("speaker"))
+                              raw=src["text"], cn=src_c.get("text"), speaker_cn=src_c.get("speaker"),
+                              en=src_e.get("text"), speaker_en=src_e.get("speaker"))
 
     cur = None
-    for e, c in zip(ev, evc, strict=True):
+    for e, c, en in zip(ev, evc, eve if eve is not None else [{}] * len(ev), strict=True):
         k = e["kind"]
         sid = e.get("sentence_id")
         if k == "wait":
@@ -388,13 +412,13 @@ def _hsr_script(uid: str, title: str | None, ev: list[dict], evc: list[dict]) ->
             continue
         if sid is None or not e.get("text"):
             continue
-        add(sid, "Choice" if k == "option" else "Talk", e.get("carrier") or k, e, c)
+        add(sid, "Choice" if k == "option" else "Talk", e.get("carrier") or k, e, c, en)
         if k != "option":
             where[sid].add(cur)
             continue
         r = e.get("reply") or {}
         if r.get("sentence_id") is not None and r.get("text"):
-            add(r["sentence_id"], "Talk", "OptionReply", r, c.get("reply") or {})
+            add(r["sentence_id"], "Talk", "OptionReply", r, c.get("reply") or {}, en.get("reply") or {})
             where[r["sentence_id"]].add(sid)
     for sid, ws in where.items():
         if len(ws) == 1 and None not in ws:
@@ -405,22 +429,23 @@ def _hsr_script(uid: str, title: str | None, ev: list[dict], evc: list[dict]) ->
 
 def load_starrail() -> list[Unit]:
     out = []
-    for m, mc in paired("starrail", "missions"):
-        for s, sc in zip(m["scripts"], mc["scripts"], strict=True):
-            out.append(_hsr_script(f"hsr:{s['source']}", m.get("name"), s["events"], sc["events"]))
-    for d, dc in paired("starrail", "dialogues"):
+    for m, mc, me in paired("starrail", "missions"):
+        for s, sc, se in zip(m["scripts"], mc["scripts"], me["scripts"] if me else [None] * len(m["scripts"]), strict=True):
+            out.append(_hsr_script(f"hsr:{s['source']}", m.get("name"), s["events"], sc["events"], se and se["events"]))
+    for d, dc, de in paired("starrail", "dialogues"):
         out.append(_hsr_script(f"hsr:{d['id']}", d.get("interact_title") or d.get("location"),
-                               d["events"], dc["events"]))
+                               d["events"], dc["events"], de and de["events"]))
     # 全量台词表里**没有脚本引用**的那些（过场时间轴里念的，`.playable` 不在上游仓库）。
     # 按 id 的百位块成组：同一脚本的台词 id 连号（game-text-data 的 docs/starrail），
     # 块内按 id 排。这是本工具的归组，库那边刻意不做。
     blocks: dict[int, list[Line]] = defaultdict(list)
-    for s, sc in paired("starrail", "sentences"):
+    for s, sc, se in paired("starrail", "sentences"):
         if s["sources"] or not s["text"]:
             continue
+        se = se or {}
         blocks[s["id"] // 100].append(Line(key=f"hsr:{s['id']}", kind="Talk", role="Timeline",
                                            speaker=s["speaker"], raw=s["text"], cn=sc["text"],
-                                           speaker_cn=sc.get("speaker")))
+                                           speaker_cn=sc.get("speaker"), en=se.get("text"), speaker_en=se.get("speaker")))
     out.extend(Unit(uid=f"hsr:block:{b}", title=None, lines=ls) for b, ls in sorted(blocks.items()))
     warn_unseen()
     return out
@@ -460,10 +485,11 @@ def load_zzz() -> list[Unit]:
     这 47 行被主轨命中了 10 行；②obs 一个框的文字常常同时"包含于"两种说法，两行都被锚住、
     都留在分母里，于是必有一行记成漏。"""
     out = []
-    for s, sc in paired("zzz", "scenes"):
+    for s, sc, se in paired("zzz", "scenes"):
         cn = {l["key"]: l["text"] for l in sc["lines"]}
+        en = {l["key"]: l["text"] for l in (se or {}).get("lines") or ()}
         lines = [Line(key=f"zzz:{l['key']}", kind="Talk", role=s.get("kind") or "?",
-                      speaker=l.get("speaker"), raw=l["text"] or "", cn=cn.get(l["key"]))
+                      speaker=l.get("speaker"), raw=l["text"] or "", cn=cn.get(l["key"]), en=en.get(l["key"]))
                  for l in s["lines"]]
         for g in variant_groups([clean(ln.raw, "F") for ln in lines]):
             for i in g:
@@ -473,12 +499,12 @@ def load_zzz() -> list[Unit]:
     # （AutoEvent<事件>_<序号>）成组按序号排，读不出的一条一个单元，都只参与检索与对齐
     groups: dict[str, list] = defaultdict(list)
     band: dict[str, list] = defaultdict(list)
-    for r, rc in paired("zzz", "loose"):
+    for r, rc, re_ in paired("zzz", "loose"):
         if not r["text"]:
             continue
         slot = band_loose_slot(r["head"], r["id"])
         ln = Line(key=f"zzz:{r['id']}", kind="Talk" if slot else "Loose", role=r["head"],
-                  speaker=None, raw=r["text"], cn=rc["text"])
+                  speaker=None, raw=r["text"], cn=rc["text"], en=(re_ or {}).get("text"))
         if slot:
             base, seq, pc = slot
             if pc:
@@ -646,20 +672,19 @@ _PRON: dict[str, dict | None] = {}
 
 
 def pronoun_table(game: str) -> dict[str, dict[str, str]] | None:
-    """`{语种: {键: 文本}}`（`ja` / `zh-Hans`）；包里没有这张表是 None。"""
+    """`{语种: {键: 文本}}`（`ja` / `zh-Hans`，包里有英文那份时另有 `en`）；包里没有这张表是 None。"""
     if game not in _PRON:
         bd = bundle_of(game)
         if not bd.has([PRONOUNS_TABLE]):
             _PRON[game] = None
         else:
             bd.require({PRONOUNS_TABLE: PRONOUNS_CONTRACT})
-            ja, zh = {}, {}
-            for a, b in paired(game, PRONOUNS_TABLE):
-                if a["text"]:
-                    ja[a["id"]] = a["text"]
-                if b["text"]:
-                    zh[b["id"]] = b["text"]
-            _PRON[game] = {"ja": ja, "zh-Hans": zh}
+            tabs: dict[str, dict] = {"ja": {}, "zh-Hans": {}, **({EN: {}} if has_en(game, PRONOUNS_TABLE) else {})}
+            for row in paired(game, PRONOUNS_TABLE):
+                for lang, r in zip(("ja", "zh-Hans", EN), row):
+                    if r is not None and r["text"]:
+                        tabs[lang][r["id"]] = r["text"]
+            _PRON[game] = tabs
         if _PRON[game] is None:
             print(f"  称谓表：文本包里没有（旧包），按性别取的称谓留成占位、出字幕时删掉；换 game-text-data 带 {PRONOUNS_TABLE}_* 的包", flush=True)
     return _PRON[game]
@@ -691,23 +716,24 @@ TEXTJOIN_RE = re.compile(r"\{TEXTJOIN#(\d+)\}")
 
 
 def textjoin_table(game: str, gender: str) -> dict[int, dict] | None:
-    """`{n: {"default": 下标或 None, "jp": [候选…], "cn": [候选…]}}`（候选和台词一样 `clean`：性别写法按投出的性别选、去掉注音和富文本标记、
+    """`{n: {"default": 下标或 None, "jp": [候选…], "cn": [候选…], "en": [候选…]}}`（`en` 只在包里有英文那份时有；候选和台词一样 `clean`：性别写法按投出的性别选、去掉注音和富文本标记、
     占位留着——n=22 的默认项就是 `{NICKNAME}`，匹配器换成玩家名）；包里没有这张表是 None。"""
     bd = bundle_of(game)
     if not bd.has([TEXTJOINS_TABLE]):
         return None
     bd.require({TEXTJOINS_TABLE: TEXTJOINS_CONTRACT})
     out = {}
-    for a, b in paired(game, TEXTJOINS_TABLE):
-        out[a["id"]] = {"default": a["default"], "jp": [clean(t, gender, keep=True) or None if t else None for t in a["items"]],
-                        "cn": [clean(t, gender, keep=True) or None if t else None for t in b["items"]]}
+    def cands(r):
+        return [clean(t, gender, keep=True) or None if t else None for t in r["items"]]
+    for a, b, e in paired(game, TEXTJOINS_TABLE):
+        out[a["id"]] = {"default": a["default"], "jp": cands(a), "cn": cands(b), **({EN: cands(e)} if e else {})}
     return out
 
 
 def used_textjoins(game: str, out_units: list[dict], gender: str) -> dict[str, dict] | None:
     """圈出的剧本行（译文 / 原文模板）里用到的 `{TEXTJOIN#n}` 的候选，写进剧本的 `textjoins`（匹配器按视频认是哪个）；
     没用到或包里没有候选表是 None。"""
-    used = sorted({int(n) for u in out_units for ln in u["lines"] for k in ("cn", "jp_tpl")
+    used = sorted({int(n) for u in out_units for ln in u["lines"] for k in ("cn", EN, "jp_tpl")
                    for n in TEXTJOIN_RE.findall(ln.get(k) or "")})
     if not used:
         return None
@@ -740,7 +766,7 @@ def term_key(t: str) -> str:
 
 
 def term_table(game: str, obs_raw, gender: str) -> tuple[dict | None, dict]:
-    """这段视频用得上的短名词：日文键（`term_key`）-> {`cn`, `n`（取中的中文对应几个 hash）, `of`（这个键共几个 hash）}。
+    """这段视频用得上的短名词：日文键（`term_key`）-> {`cn`, `n`（取中的中文对应几个 hash）, `of`（这个键共几个 hash）, `en`（同法取的英文，包里有英文那份时）}。
 
     * 只收 obs 里**逐字出现过**的键（归一后相等，内容 ≥`TERM_MIN_CONTENT` 字、含假名或汉字）：整张表二十多万条，
       名牌层只按屏幕上的字查，别的键写进剧本也用不上。
@@ -771,12 +797,14 @@ def term_wanted(obs_raw) -> set[str]:
 
 
 def pick_terms(pairs, want: set[str], gender: str) -> dict[str, dict]:
-    """(日文行, 中文行) 逐对 -> 键在 `want` 里的那些：按 hash 条数取最多的中文，打平取短的、再按字典序。
+    """(日文行, 中文行, 英文行或 None) 逐行 -> 键在 `want` 里的那些：按 hash 条数取最多的中文，打平取短的、再按字典序；
+    英文只在中文取中的那些行里同法取（分开投会把另一个条目的英文配给这个中文），`n` / `of` 只记中文的。
 
     ⚠ 观察项（09-26 审计定级：中度，只在匹配器这一层）："短"的上限是各游戏说话人名的 P99（15 / 13 / 9），查询门、消歧规则都是手定；
     五段切片新译出的 54 块里真名牌 24、任务目标 / 奖励提示 30（game-text-corpus 报告 7.8）。看 `overlay.stats.name_from_terms` 和 `name_src = terms` 的块。"""
     cnt: dict[str, Counter] = defaultdict(Counter)
-    for a, b in pairs:
+    cnt_en: dict[tuple[str, str], Counter] = defaultdict(Counter)    # (键, 中文) -> 那些行的英文
+    for a, b, e in pairs:
         if not a["text"] or not b["text"]:
             continue
         k = term_key(clean(a["text"], gender))
@@ -784,10 +812,15 @@ def pick_terms(pairs, want: set[str], gender: str) -> dict[str, dict]:
             cn = clean(b["text"], gender)
             if cn:
                 cnt[k][cn] += 1
+                if e and e["text"] and (en := clean(e["text"], gender)):
+                    cnt_en[k, cn][en] += 1
+
+    def pick(c: Counter) -> tuple[str, int]:
+        return min(c.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))
     out = {}
     for k, c in sorted(cnt.items()):
-        cn, n = min(c.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))
-        out[k] = {"cn": cn, "n": n, "of": sum(c.values())}
+        cn, n = pick(c)
+        out[k] = {"cn": cn, "n": n, "of": sum(c.values()), **({EN: pick(cnt_en[k, cn])[0]} if cnt_en.get((k, cn)) else {})}
     return out
 
 
@@ -1115,6 +1148,8 @@ def library(game: str) -> tuple[list[Unit], list[tuple[int, int, str]], list[str
     cp = paths.data_root() / "out" / "_cache" / "gamescript" / f"{game}-{key}.pkl"
     if cp.exists():
         b.verify_stored(GAMES[game])
+        if en := [t for t in GAMES[game] if b.has([t], (EN,))]:
+            b.verify_stored(en, (EN,))
         with open(cp, "rb") as f:
             units, flat, texts, h, ids = pickle.load(f)
         idx = Index.__new__(Index)
@@ -1277,6 +1312,10 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
                           "text": text, "cn": (cn := clean(ln.cn or "", gender, keep=True) or None),
                           **({"jp_tpl": tpl} if (tpl := clean(ln.raw, gender, keep=True)) != text else {}),
                           **({"cn_rich": r} if cn and (r := clean(ln.cn, gender, rich=True)) != cn else {}),
+                          **({EN: en} if (en := clean(ln.en or "", gender, keep=True) or None) else {}),
+                          # 英文的注音不带：原神标在单个拉丁字母上（`rule-b{RUBY#[S]Varka}reaker`），按字算中心的写法放不对
+                          **({"en_rich": r} if en and (r := clean(RUBY_RE.sub("", ln.en), gender, rich=True)) != en else {}),
+                          **({"speaker_en": ln.speaker_en} if ln.speaker_en else {}),
                           **({"jp_rich": r} if (r := clean(ln.raw, gender, rich=True)) != tpl else {}),
                           "anchor": None if a is None else
                           {"t0": a[0][0][0], "t1": a[0][-1][1], "queries": a[1],
@@ -1311,10 +1350,13 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
     # 整库的说话人 日文 -> 中文（同名取出现最多的写法）：叠加 ASS 名牌层的译文从这里取。只看圈中的剧本行不够——
     # 原神任务对话的剧本行多半没有说话人，gi-s2 的 4 个名牌只看剧本行一个都翻不出，整库查得到 3 个（2026-09-14）
     spk: dict[str, Counter] = defaultdict(Counter)
+    spk_en: dict[str, Counter] = defaultdict(Counter)
     for u in units:
         for ln in u.lines:
             if ln.speaker and ln.speaker_cn:
                 spk[ln.speaker][ln.speaker_cn] += 1
+            if ln.speaker and ln.speaker_en:
+                spk_en[ln.speaker][ln.speaker_en] += 1
     # 说话人表查不到的名牌（原神隐藏名字的 NPC、星铁 / 绝区零没有说话人的场景）再查短名词表
     terms, tstat = term_table(game, ot, gender) if game in GAMES else (None, {"table": False})
     print("  短名词表：" + (f"obs 里 {tstat['obs_keys']:,} 个候选键、查到 {tstat['keys']:,} 个，"
@@ -1323,6 +1365,7 @@ def build(game: str, obs: Path, qmin: int, min_contain: float, max_units: int,
     textjoins = used_textjoins(game, out_units, gender) if game in GAMES else None
     return {"units": out_units, "sequence": sequence(out_units, claim_back, claim_fwd),
             "speakers": {k: c.most_common(1)[0][0] for k, c in sorted(spk.items())},
+            **({"speakers_en": {k: c.most_common(1)[0][0] for k, c in sorted(spk_en.items())}} if spk_en else {}),
             **({"terms": terms} if terms is not None else {}),
             **({"textjoins": textjoins} if textjoins else {}),
             "gender": gender, "gender_votes": dict(votes),

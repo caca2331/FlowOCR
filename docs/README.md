@@ -15,7 +15,11 @@
 
 | 文档 | 主题 | 状态 |
 | --- | --- | --- |
-| [manual/README.md](manual/README.md) | 使用手册：安装、三步跑一段视频、产物、匹配原文（面向使用者） | 规范 |
+| [manual/README.md](manual/README.md) | 使用手册入口：先选要做的事、安装、第一次跑通、只要字幕 SRT、产物怎么读（面向使用者，下面四份同） | 规范 |
+| [manual/script.md](manual/script.md) | 使用手册·字幕稿：画面文字翻译、改稿与出特效、时间疑点 | 规范 |
+| [manual/matching.md](manual/matching.md) | 使用手册·对上原文：游戏文本包、Naninovel 剧本、画哪些、名牌、译文怎么分行 | 规范 |
+| [manual/burn.md](manual/burn.md) | 使用手册·烧进视频 | 规范 |
+| [manual/reference.md](manual/reference.md) | 使用手册·参考：输出预设、精度档位、设备与 TensorRT、识别范围与语言、扩展、排错 | 规范 |
 | [dev-guide/README.md](dev-guide/README.md) | 开发指南 | 规范 |
 | [architecture/README.md](architecture/README.md) | 架构说明 | 规范 |
 

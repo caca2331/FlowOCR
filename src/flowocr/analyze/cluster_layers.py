@@ -74,7 +74,7 @@ def _code(part: str) -> str:
 def _args(tag: str, extra: list[str]) -> dict:
     a = bt.apply_matcher_patch(bt.make_parser(),
                                ["<obs>", "--outdir", "<out>", "--tag", tag, "--matcher", "gametext", *extra])
-    return {k: v for k, v in vars(a).items() if k not in ("matcher", "matcher_ctx", "matcher_patch", "matcher_overridden")}
+    return {k: v for k, v in vars(a).items() if k not in ("matcher", "matcher_ctx", "matcher_patch", "matcher_overridden", "matcher_context")}
 
 
 def layer_key(obs: Path, a: dict) -> str:

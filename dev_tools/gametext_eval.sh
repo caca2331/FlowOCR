@@ -50,7 +50,7 @@ try:
 except Exception as exc:
     print(f'  [rebuild] 读不到 provenance（{exc}）'); sys.exit(1)
 got = ' '.join(tracksio.build_args(prov)) if 'argv' in prov else '?'
-want = ' '.join(sys.argv[2].split())
+want = ' '.join(tracksio.knob_args(sys.argv[2].split()))
 if 'argv' not in prov or got != want:
     print(f'  [rebuild] BUILD_ARGS 对不上：产物是 [{got}]，这次要 [{want}]'); sys.exit(1)
 # 代码指纹（建轨的表、--cluster learned / lines 另记的代码 + 模型、回抠结算）：只比 mtime 会静默复用
