@@ -20,6 +20,8 @@ project-structure 计划："少量入口，直接可改"——普通 Python 模�
   （输入阶段 2 的分析产物 `*-tracks.json` 的 dict，返回带匹配结果的产物 `*-matched.json` 的 dict；`context` 里的 `game`
   没在匹配时给的话，可能来自建轨时给同一个匹配器的 `--matcher-ctx game=`，`flowocr.analyze.match.context_of`）；
   可选的 `PRESET = "<预设名>"` / `PRESET_OPTS = {…}`：这个匹配器的产物最适合哪个输出预设（`recommendation`）；
+  可选的 `CONTEXT_KEYS` / `OPTION_KEYS`（键名的元组）：它认哪些 `--ctx`（建轨的 `--matcher-ctx` 也查这份）/ `--opt` 键，
+  命令行给了别的键就打警告（`warn_unknown_keys`）；没声明的不查；
 * 输出预设：`render(document: dict, output_dir: Path | str, options: dict | None) -> list[Path]`
   （输入分析产物，写文件，返回写了哪些）；
 * 扩展效果：`NAME`（它在字幕稿 Effect 字段 `fo:…` 里的参数名）+ `elements(line, value)` / `tags(line, value, element)` 至少一个
@@ -67,6 +69,28 @@ def recommendation(module: ModuleType, spec: str) -> dict | None:
         spec = str(Path(spec).resolve())
     # 路径过 `portable()`：产物会被分享，用户匹配器 / 预设的 .py 路径别带出本机目录与用户名；`render` 用时过 `local()`
     return {"preset": portable(preset), "opts": {str(k): str(v) for k, v in dict(opts).items()}, "by": portable(spec)}
+
+
+KEY_ATTRS = {"--ctx": "CONTEXT_KEYS", "--matcher-ctx": "CONTEXT_KEYS", "--opt": "OPTION_KEYS"}
+"""命令行旗标 -> 匹配器声明它认哪些键的属性名。"""
+
+
+def warn_unknown_keys(module: ModuleType, spec: str, flag: str, keys) -> list[str]:
+    """命令行给匹配器的 `flag`（`--ctx` / `--matcher-ctx` / `--opt`）里，匹配器没声明认得的键：打一行警告（不退出），返回这些键。
+    匹配器没声明（`CONTEXT_KEYS` / `OPTION_KEYS` 不在）就不查——用户的匹配器可以不写。
+    写错了边（`--ctx` 的键写进 `--opt` 或反过来）时顺带说该写在哪边：两边都只是不起作用，不报错就很难发现（2026-11-11 冷读）。"""
+    known = getattr(module, KEY_ATTRS[flag], None)
+    if known is None:
+        return []
+    bad = sorted(set(keys) - set(known))
+    if not bad:
+        return []
+    other = {"--ctx": "--opt", "--opt": "--ctx"}.get(flag)
+    hints = [f"{k} 要写在 {other}" for k in bad if other and k in (getattr(module, KEY_ATTRS[other], None) or ())]
+    print(f"⚠ 匹配器 `{spec}` 不认得 {flag} 的 {'、'.join(bad)}，不起作用"
+          + (f"（{'；'.join(hints)}）" if hints else "")
+          + f"；它认的 {flag} 键：{'、'.join(known) or '（无）'}", file=sys.stderr, flush=True)
+    return bad
 
 
 def load(spec: str, kind: str) -> ModuleType:

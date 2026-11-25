@@ -29,7 +29,7 @@ def load_obs(path: Path) -> tuple[dict, list[dict]]:
 
 
 def compare_obs(a: list[dict], b: list[dict], min_conf: float = 0.5) -> dict:
-    """两份观测对账。**框序列相同就逐行比；不同就按 (帧, 框) 配对比共有的那批**。
+    """两份观测对账。**框序列相同就逐行比；不同就按 (t_us, 框) 配对比共有的那批（帧身份就是 t_us，frame-pts 计划）**。
 
     ⚠ **2026-09-20 修的一个会骗人的 0**：原来"框序列不同"时直接返回
     `text_diff=None`（这个保守选择本身是对的），可汇总那边写的是 `tot[k] += c[k] or 0`
@@ -45,9 +45,9 @@ def compare_obs(a: list[dict], b: list[dict], min_conf: float = 0.5) -> dict:
     那边现在 import 这里。
     """
     same_boxes = len(a) == len(b) and all(
-        x["frame"] == y["frame"] and x["box"] == y["box"] for x, y in zip(a, b))
-    ka = {(x["frame"], tuple(x["box"])): x for x in a}
-    kb = {(y["frame"], tuple(y["box"])): y for y in b}
+        x["t_us"] == y["t_us"] and x["box"] == y["box"] for x, y in zip(a, b))
+    ka = {(x["t_us"], tuple(x["box"])): x for x in a}
+    kb = {(y["t_us"], tuple(y["box"])): y for y in b}
     common = sorted(ka.keys() & kb.keys())
     conf = lambda o: o.get("conf") or 0.0
     td = [k for k in common if ka[k].get("text") != kb[k].get("text")]

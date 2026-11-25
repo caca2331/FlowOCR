@@ -52,10 +52,25 @@
 !/explore/plate-color/README.md
 !/explore/plate-color/evidence/
 # ↑ 底板 / 字色原型：脚本、说明，加重跑得不回来的人工判读和测时（evidence/，2026-10-23）；out/plate-color/ 已删
+!/explore/inpaint-static/
+/explore/inpaint-static/*
+!/explore/inpaint-static/*.py
+!/explore/inpaint-static/README.md
+# ↑ 修补器静止判据的离线测量：脚本和说明；读数在数据根 out/inpaint-static/
+!/explore/clean-plate/
+/explore/clean-plate/*
+!/explore/clean-plate/*.py
+!/explore/clean-plate/README.md
+!/explore/clean-plate/evidence/
+/explore/clean-plate/evidence/*
+!/explore/clean-plate/evidence/ghosts.json
+# ↑ 干净底（拿字出现前的原图当底）的离线测量：脚本、说明和人工标的鬼字句子（evidence/）；读数在数据根 out/clean-plate/
 
 # 产物与临时文件
 /out/
 /tmp/
+# Git Bash（MSYS2）的程序崩溃时在当前目录写的调用栈转储，没有可用信息
+*.stackdump
 # 官方 ONNX 模型（`python -m flowocr.models fetch` 取到数据根的 models/）
 /models/
 /trt/
@@ -90,3 +105,8 @@ __pycache__/
 
 # 维护者的私有补充：追踪但发布时剥离（项目约定；全局 ignore 的 *.local.md 在这里放行）
 !/AGENTS.local.md
+!/explore/vertical-rec/
+/explore/vertical-rec/*
+!/explore/vertical-rec/*.py
+!/explore/vertical-rec/README.md
+!/explore/vertical-rec/*.json

@@ -69,7 +69,7 @@ def snap(v: float, pk: list[float], bw: float) -> int:
 def stitch(L, bw_y: float = BW_Y, bw_x: float = BW_X, min_support: int = MIN_SUPPORT) -> list[list[int]]:
     wr = L.win_regions
     from flowocr.analyze import build_tracks as bt          # 在这里 import：`slot_lines` 只借本模块的 peaks / snap，别把管线拖进来
-    g = [bt.region_geom(L.runs, w["runs"]) for w in wr]          # (cx, x0, x1, y0, y1, h)
+    g = [bt.region_geom(L.runs, w["runs"]) for w in wr]          # (cx, x0, x1, y0, y1, h, ch, v)
     feats = {
         "yt": [q[3] / L.H for q in g], "yb": [q[4] / L.H for q in g], "ym": [(q[3] + q[4]) / 2 / L.H for q in g],
         "xl": [q[1] / L.W for q in g], "xr": [q[2] / L.W for q in g], "xc": [q[0] / L.W for q in g],

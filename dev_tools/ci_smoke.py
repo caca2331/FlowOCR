@@ -93,16 +93,17 @@ def main() -> int:
         raise SystemExit(f"单独重跑第 4 步的输出和 render 写的不同，第 {i + 1} 行起：\n"
                          f"  render  {a_lines[i] if i < len(a_lines) else '<没有>'!r}\n"
                          f"  typeset {b_lines[i] if i < len(b_lines) else '<没有>'!r}")
-    # 阶段 5 的底板路线（CPU 编码）：源视频按 ASS 里记的 FlowOCR Video 找，输出和源同尺寸、同时长
+    # 阶段 5 的底板路线（CPU 编码；--device cpu 时修补推理也走 CPU）：源视频按 ASS 里记的 FlowOCR Video 找，输出和源同尺寸、同时长
     burnt = out / "smoke-burn.mp4"
-    run([str(bin_dir / "flowocr-burn"), str(out / "smoke-default.ass"), "--codec", "libx264", "-o", str(burnt)])
+    burn_dev = ["--device", "cpu"] if a.device == "cpu" else []
+    run([str(bin_dir / "flowocr-burn"), str(out / "smoke-default.ass"), "--codec", "libx264", *burn_dev, "-o", str(burnt)])
     check_video(burnt, 10, 0.2)
     if a.inpaint:
         inpaint_ass = out / "smoke-inpaint.ass"
         run([str(bin_dir / "flowocr-typeset"), str(out / "smoke-default.script.ass"),
              "--opt", "plate=src", "-o", str(inpaint_ass)])
         inpaint_mp4 = out / "smoke-inpaint.mp4"
-        log = run([str(bin_dir / "flowocr-burn"), str(inpaint_ass), "--inpaint", "--codec", "libx264",
+        log = run([str(bin_dir / "flowocr-burn"), str(inpaint_ass), "--inpaint", "--codec", "libx264", *burn_dev,
                    "--start", "1.0", "--end", "1.2", "-o", str(inpaint_mp4)], capture=True)
         if not re.search(r"推理 [1-9][0-9]* 窗", log) or "出 NaN" in log:
             raise SystemExit("阶段 5 修补冒烟未成功推理至少一个窗")

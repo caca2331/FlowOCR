@@ -316,55 +316,38 @@ def t_persistence_invariance() -> None:
 def t_refine_no_evidence() -> None:
     """回抠：**"没找到边界"不能写成"成功定位"**（methodology-audit-4 报告 C5）。
 
-    `first_true`/`last_true` 找不到时返回区间端点，而 `finalize` 拿这个端点当边界
-    还记 `refined=True`；常量图（空白/纯色）的归一化相关系数恒为 0，
-    于是**一次都没观测到边界，也会写出一组"精确"的新时间**。
+    原来开视频测时 `first_true` / `last_true` 找不到返回区间端点、被当成边界写出"精确"的新时间；现在只有 obs 证据那条路
+    （离线测量 frame-pts 计划删了），同一条契约落在证据上：没量到的那一侧原样退回，量没量到要说清楚。
     """
     print("回抠的证据契约")
     import types
-    # `refine_boundaries` 顶层 import cv2（候选 venv 才有）；这里测的是纯逻辑，
-    # 把 cv2 桩掉即可，**测的仍是真实现**。
     sys.modules.setdefault("cv2", types.ModuleType("cv2"))
     from flowocr.analyze import refine_boundaries as rb
+    from flowocr.extract import edge_refine as ER
+    from flowocr.extract.framegrid import AuxClock, Clock, SampleClock
 
-    i, ok = rb.first_true(0, 5, lambda k: k >= 3)
-    check("找到了：返回下标 + True", (i, ok) == (3, True), (i, ok))
-    i, ok = rb.first_true(0, 5, lambda k: False)
-    check("**没找到：第二个返回值是 False**（不是悄悄给端点）", (i, ok) == (5, False), (i, ok))
-    i, ok = rb.last_true(0, 5, lambda k: k <= 2)
-    check("last_true 找到了", (i, ok) == (2, True), (i, ok))
-    i, ok = rb.last_true(0, 5, lambda k: False)
-    check("last_true 没找到也说清楚", (i, ok) == (0, False), (i, ok))
-    # 端到端走 finalize：全是常量图时终点观测不到，**原样退回**（反例原样见 audit-probes 实验里的 audit-core-probes.py C5）
-    import numpy as np
+    clk = AuxClock(Clock(60), SampleClock(2))
     rs = dict(t_start=500_000, t_end=1_500_000, text="hello", box=[0, 0, 10, 10], n_obs=1)
-    job = rb.make_job(rs, 500_000, 500_000)
-    job["crops"] = {i: (np.zeros((10, 10), np.uint8), (0, 0, 10, 10)) for i in range(job["hi"] + 1)}
-    short = rb.make_job(dict(t_start=1_000_000, t_end=2_000_000, t_full_sampled=1_500_000, text="x",
-                             box=[0, 0, 10, 10], n_obs=2), 500_000, 1_000_000 / 60)
-    check("**打字机窗（模板帧）不越过末次观测帧**（短条目模板落到字已消失的帧上，全字晚 45 帧）",
-          short["hi_start"] <= short["e"], (short["hi_start"], short["e"]))
-    rb.measure(job, .8)
+    job = rb.make_job(rs, 500_000)
+    m = ER.measured_from_records(None, None, None, rs["t_end"], 500_000, clk)
     rb.apply(job, None, None)
-    check("**常量图：终点没观测到就不记 refined、时间原样**",
-          not job["refined"] and rs["t_start"] == 500_000 and rs["t_end"] == 1_500_000 and "t_full" not in rs,
-          (job["refined"], rs))
-    rng = np.random.default_rng(0)
-    txt, bg = rng.integers(0, 255, (10, 10), dtype=np.uint8), rng.integers(0, 255, (10, 10), dtype=np.uint8)
-
-    def end_how(gone_at, last_decoded=None):
-        r = dict(t_start=500_000, t_end=1_500_000, text="hello", box=[0, 0, 10, 10], n_obs=3)
-        j = rb.make_job(r, 500_000, 100_000)
-        top = j["hi"] if last_decoded is None else last_decoded
-        j["crops"] = {i: (txt if gone_at is None or i < gone_at else bg, (0, 0, 10, 10)) for i in range(top + 1)}
-        rb.measure(j, .8)
-        return j.get("measured", (None,) * 5)[4], j
-    h_gone, j_gone = end_how(17)
-    h_win, _ = end_how(None)
-    h_eof, _ = end_how(None, last_decoded=j_gone["hi"] - 3)
-    check("**开放边界**（开视频测）：最后还像的那帧之后窗里再没有真解到的帧——一路像到窗尾、或视频先结束（片尾还在屏上）——记 open；"
-          "窗里看到它消失了照旧是量到（这张图上曲线先给出，curve）",
-          h_gone in ("ncc", "curve") and (h_win, h_eof) == ("open", "open"), (h_gone, h_win, h_eof, j_gone["e"], j_gone["hi"]))
+    check("**一条证据都没有：measured 为 None、不记 refined、时间原样**",
+          m is None and not job["refined"] and rs["t_start"] == 500_000 and rs["t_end"] == 1_500_000 and "t_full" not in rs,
+          (m, job["refined"], rs))
+    off = {"lo": 1_150_000, "hi": 1_700_000, "last_us": 1_000_000, "n": 5, "text": "hello",
+           "ncc_end": None, "ncc_open": False, "last_full": None, "gone": None}
+    check("结尾证据里 ncc 没找到（ncc_end 是 None）、曲线也没给：不算量到，原样退回",
+          ER.measured_from_records(None, None, off, 1_500_000, 500_000, clk) is None)
+    m_ncc = ER.measured_from_records(None, None, dict(off, ncc_end=1_116_667), 1_500_000, 500_000, clk)
+    m_open = ER.measured_from_records(None, None, dict(off, ncc_end=1_516_667, ncc_open=True, last_full=1_400_000),
+                                      1_500_000, 500_000, clk)
+    check("**开放边界**：最后还像的帧到了链断的那个采样点（ncc_open）记 open、t_end 只是下界、完全显示结束不填；"
+          "窗里看到它消失了是 ncc，t_end = 它后面那一个辅助帧（ncc_end）",
+          m_ncc[0] == 1_116_667 and m_ncc[4] == "ncc" and m_open[4] == "open" and m_open[0] == 1_516_667 and m_open[3] is None,
+          (m_ncc, m_open))
+    check("short / stale 的证据当没量到", ER.measured_from_records(None, None, dict(off, ncc_end=1_116_667, short=True),
+                                                             1_500_000, 500_000, clk) is None
+          and not ER.usable(dict(off, stale=True)))
 
     # 建轨默认 `--refine auto`（owner 2026-09-25）：要**真的有**证据才结算；没有就原样、不开视频、不报错
     import contextlib
@@ -381,8 +364,11 @@ def t_refine_no_evidence() -> None:
         real = obs_with({"src_fps": 60.0, "config": {"refine_fused": True}, "edge": {"on": 12}})
         noop = obs_with({"src_fps": 60.0, "config": {"refine_fused": True}, "edge": {"on": 0, "noop": True}})
         old = obs_with({"src_fps": 60.0, "config": {}})
+        oldkey = obs_with({"src_fps": 60.0, "config": {"refine_fused": True}, "edge": {"on": 12}, "stride": 30})
         check("回抠的证据判定：配置开了融合、而且 edge 真有条数才算；空臂（noop）、旧 obs 都不算",
               rb.obs_evidence(real)[1] and not rb.obs_evidence(noop)[1] and not rb.obs_evidence(old)[1])
+        check("**有证据、但帧身份是旧的帧号（没有 frame_key）的 obs：要回抠就报错退出、说重跑阶段 1**（`--refine off` 照读）",
+              raises(lambda: bt.settle_refine({"events": []}, oldkey, "t"), SystemExit))
         with contextlib.redirect_stdout(io.StringIO()) as said:
             untouched = {"events": []}
             settled = bt.settle_refine(untouched, old, "t")
@@ -622,8 +608,8 @@ def t_typewriter_fuse() -> None:
 
 
 def t_edge_refine() -> None:
-    """两遍合一遍（tools/edge_refine.py，reuse-budget 计划 §7.6）：合成一段打字机，帧环 + 链事件 -> `edge` 证据，
-    再从证据重建 measure() 的输出走 refine_boundaries.apply——三个时刻都要落在合成的真值上。"""
+    """两遍合一遍（edge_refine，reuse-budget 计划 §7.6）：合成一段打字机，帧环 + 链事件 -> `edge` 证据，
+    再从证据重建 measured 走 refine_boundaries.apply——三个时刻都要落在合成的真值上。时间全是帧自己的 `t_us`（frame-pts 计划）。"""
     print("edge_refine（两遍合一遍）")
     import threading
     import types
@@ -632,55 +618,47 @@ def t_edge_refine() -> None:
 
     sys.modules.setdefault("cv2", types.ModuleType("cv2"))
     from flowocr.extract import edge_refine as ER
-    from flowocr.extract import framegrid as AG
     from flowocr.extract import framesource as fs
     from flowocr.extract import ocr_args
     from flowocr.extract import ocr_parallel
+    from flowocr.extract.framegrid import AuxClock, Axis, Clock, SampleClock
     from flowocr.analyze import refine_boundaries as rb
 
-    cmd = fs.build_ffmpeg_fullrate_cmd("a.mp4", start_sec=1.5, n_frames=10, step=2, scale=0.5)
-    check("辅助流命令：-ss/-copyts 同采样流、select 隔帧、缩放、只送灰度",
-          "-copyts" in cmd and cmd.index("-ss") < cmd.index("-i") and "mod(n" in " ".join(cmd)
-          and "scale=trunc(iw*0.5/2)*2" in " ".join(cmd) and cmd[cmd.index("-pix_fmt") + 1] == "gray"
-          and cmd[cmd.index("-frames:v") + 1] == "10")
-    check("辅助流命令：坏参数会响", raises(lambda: fs.build_ffmpeg_fullrate_cmd("a.mp4", start_sec=0, n_frames=0), ValueError))
-    dual = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4,
-                               aux={"grid": [1, 2, 1, 30], "scale": 0.5, "n_frames": 60, "url": "tcp://127.0.0.1:5"})
+    dual = fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60)),
+                               aux={"clock": [30, 1, 2, 1], "scale": 0.5, "url": "tcp://127.0.0.1:5"})
     ds = " ".join(dual)
-    check("**同一次解码分两路**：split 双输出，采样帧走 pipe:1（带 showinfo）、辅助流走 TCP（灰度、缩、隔帧、自己的 -frames:v）",
+    check("**同一次解码分两路**：split 双输出，采样帧走 pipe:1（带 showinfo）、辅助流走 TCP（灰度、缩、按辅助桶取帧），都读到 EOF",
           "-filter_complex" in dual and "split=2" in ds and "showinfo@main=checksum=0[sa]" in ds
           and "format=gray,showinfo@aux=checksum=0[sb]" in ds
-          and dual[dual.index("pipe:1") - 1] == "nv12" and dual[-1] == "tcp://127.0.0.1:5" and dual[-8] == "60"
+          and dual[dual.index("pipe:1") - 1] == "nv12" and dual[-1] == "tcp://127.0.0.1:5" and "-frames:v" not in dual
           and "-vf" not in dual, ds)
-    # 2026-09-20 改了：双输出**现在和 hwaccel 组合得了**（辅路 scale_cuda 在显存里缩），
-    # 细节在 t_frame_grid。这里只钉住"缩放要的宽高没给就报错，不许默默按别的尺寸缩"
+    # 双输出和 hwaccel 组合得了（辅路 scale_cuda 在显存里缩），细节在 t_frame_grid。这里只钉住"缩放要的宽高没给就报错"
     check("硬解辅路没给宽高就报错（scale_cuda 不吃表达式）",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda",
-                                             aux={"grid": [1, 1, 1, 30], "scale": 0.5, "n_frames": 6, "url": "tcp://x"})))
+          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60)), hwaccel="cuda",
+                                             aux={"clock": [60, 1, 2, 1], "scale": 0.5, "url": "tcp://x"})))
     vid = str(Path(__file__).resolve())
     cfg0 = ocr_args.config_of([vid, "--out", "x"])
     offs = [ocr_args.config_of([vid, "--out", "x", *extra]) for extra in
-            (["--no-refine-fused"], ["--decoder", "cv2"], ["--no-reuse-v2"], ["--no-reuse"])]
-    # ⚠ `--hwaccel cuda` **2026-09-20 从这张"自动不开"的名单里拿掉了**：辅路改成显存里 scale_cuda
-    # 缩完再下传，硬解也能同一次解码分两路。原来那条让"开硬解 = 自动退回两遍回抠"（35–105 s），
-    # 把硬解省下的全吃回去还倒欠（defaults.md §1.8）
-    check("**`--refine-fused` 是默认**（owner 09-17，能开就开）：默认就在 config 里；`--no-refine-fused`、`--decoder cv2`、"
-          "`--no-reuse-v2`、`--no-reuse` 时自动不开（**`--hwaccel` 不再在这张名单里**）、那组键一个不留（OPT_IN_FUSED）",
+            (["--no-refine-fused"], ["--no-reuse-v2"], ["--no-reuse"])]
+    check("**`--refine-fused` 是默认**（owner 09-17，能开就开）：默认就在 config 里；`--no-refine-fused`、"
+          "`--no-reuse-v2`、`--no-reuse` 时自动不开（`--hwaccel` 不在这张名单里）、那组键一个不留（OPT_IN_FUSED）",
           ocr_args.OPT_IN_FUSED <= set(cfg0) and cfg0["refine_fused"] is True
           and all(not (ocr_args.OPT_IN_FUSED & set(c)) for c in offs))
-    m = ocr_parallel.merge_metas([{"edge": {"on": 2, "worker_busy_sec": 1.5}, "reuse_v2": {"cache_peak": 7_000_000, "refresh": 3},
-                                   "frames_advanced": 1, "frames_requested": 1, "complete": True},
-                                  {"edge": {"on": 3, "worker_busy_sec": 0.25}, "reuse_v2": {"cache_peak": 6_000_000, "refresh": 4},
-                                   "frames_advanced": 1, "frames_requested": 1, "complete": True}],
-                                 {}, wall=1.0, cuts_sec=[0.5], interval=0.5)
-    check("--workers 拼 _meta 时 edge / reuse_v2 的计数逐键相加", m["edge"] == {"on": 5, "worker_busy_sec": 1.75}, m.get("edge"))
+    m = ocr_parallel.merge_metas([{"edge": {"on": 2, "worker_busy_sec": 1.5, "aux_last_key": 5_000_000},
+                                   "reuse_v2": {"cache_peak": 7_000_000, "refresh": 3},
+                                   "advanced_us": 1, "requested_us": 1, "complete": True},
+                                  {"edge": {"on": 3, "worker_busy_sec": 0.25, "aux_last_key": 9_000_000},
+                                   "reuse_v2": {"cache_peak": 6_000_000, "refresh": 4},
+                                   "advanced_us": 1, "requested_us": 1, "complete": True}],
+                                 {}, wall=1.0, cuts_sec=[0.5])
+    check("--workers 拼 _meta 时 edge / reuse_v2 的计数逐键相加；辅助流最后一帧的位置（aux_last_key）取最大",
+          m["edge"] == {"on": 5, "worker_busy_sec": 1.75, "aux_last_key": 9_000_000}, m.get("edge"))
     check("**峰值不相加**：三个 worker 各自的缓存峰值取 max，不然 8 MB 上限会被拼成 21 MB（2026-09-17）",
           m["reuse_v2"] == {"cache_peak": 7_000_000, "refresh": 7}, m.get("reuse_v2"))
     check("并行产物也记实际用了几个 worker（不然读的人分不出『三个 worker』和『旧产物』）",
           m["workers_effective"] == 2, m.get("workers_effective"))
-    check("`--refine-aux` 是产物参数（noop 不产 edge、nvdec/cuvid 的 edge 不一样）：空臂和默认的 config 必须不等",
-          "refine_aux" in cfg0 and not ocr_args.same_arm([vid, "--out", "x"], [vid, "--out", "x", "--refine-aux", "noop"])
-          and not ocr_args.same_arm([vid, "--out", "x"], [vid, "--out", "x", "--refine-aux", "nvdec"]))
+    check("`--refine-aux` 是产物参数（noop 不产 edge）：空臂和默认的 config 必须不等",
+          "refine_aux" in cfg0 and not ocr_args.same_arm([vid, "--out", "x"], [vid, "--out", "x", "--refine-aux", "noop"]))
     check("**A/B 的臂撞没撞比解析后的配置、不比参数字面**：默认值一翻，"
           "`--reuse-v2 --reuse-corr 0.8 --refresh-every 32` 就和空参数是同一条臂了（dev_tools/arm_check.py）",
           ocr_args.same_arm([vid, "--out", "a"], [vid, "--out", "b", "--reuse-v2", "--reuse-corr", "0.8",
@@ -691,7 +669,7 @@ def t_edge_refine() -> None:
           and {"src/flowocr/extract/run_ocr2.py", "src/flowocr/extract/reuse_v2.py"} <= set(ocr_args.CODE_FP_FILES)
           and {"src/flowocr/extract/edge_refine.py", "src/flowocr/extract/typewriter_fuse.py"} <= set(ocr_args.CODE_FP_FILES)
           and "code_fp" not in ocr_args.config_of([vid, "--out", "x"]))
-    # obs 指纹表的 import 闭包（2026-09-24：新加的网格模块决定证据窗口取哪些帧，漏进表里差点没人发现）。
+    # obs 指纹表的 import 闭包（2026-09-24：新加的选帧模块决定证据窗口取哪些帧，漏进表里差点没人发现）。
     # 例外：timeline（--timeline 的计时，NON_PRODUCT）、paths（文件放哪，不改数）
     import re
     _fp = set(ocr_args.CODE_FP_FILES)
@@ -706,8 +684,6 @@ def t_edge_refine() -> None:
                     _miss.add(_p.relative_to(ROOT).as_posix())
     _miss -= _fp | {"src/flowocr/extract/timeline.py", "src/flowocr/paths.py"}
     check("obs 指纹表盖住它 import 的本地模块（例外只有 timeline / paths）", not _miss, sorted(_miss))
-    # **换了后端也要换指纹**（2026-09-18 审计）：ORT 那条路的前后处理 / CTC 解码 / IPC /
-    # 服务端都产数，漏进指纹就等于"换了产数的代码而指纹没动"（这个项目为追溯栽过四次）。
     fp_ocr = set(ocr_args.CODE_FP_FILES)
     check("OCR 指纹覆盖 ORT 那条路（recdecode / recort / ortclient / 服务端）",
           {"src/flowocr/extract/recdecode.py", "src/flowocr/extract/recort.py", "src/flowocr/extract/ortclient.py",
@@ -715,16 +691,14 @@ def t_edge_refine() -> None:
           sorted(fp_ocr))
     import json
     from flowocr.analyze import refine_boundaries as RB
-    check("回抠指纹覆盖时钟和取帧（窗口开在哪一帧、帧号换回什么时刻都由它们定）",
-          {"src/flowocr/extract/ptsclock.py", "src/flowocr/extract/framesource.py"} <= set(RB.CODE_FP_FILES),
-          RB.CODE_FP_FILES)
+    check("回抠指纹覆盖吸附目标点的时间桶（framegrid：结算时把候选时刻吸附到哪些点由它定）",
+          "src/flowocr/extract/framegrid.py" in RB.CODE_FP_FILES, RB.CODE_FP_FILES)
     # 五张表 2026-09-21 统一成仓库相对路径（flowocr.provenance 文件头）；basename 混进来就是又一处旧口径
     check("五张指纹表全是仓库相对路径（tools/… src/… `explore/`…）",
           all("/" in f for m in (importlib.import_module("flowocr.analyze.build_tracks"), RB, ocr_args,
                                  importlib.import_module("flowocr.analyze.gamescript"), importlib.import_module("flowocr.analyze.scriptmatch"))
               for f in m.CODE_FP_FILES))
-    # **运行时必需的源文件必须在版本库里**：`.gitignore` 的 `/explore/*` 曾把 `ort_server.py` 整个吞掉，
-    # 于是 ORT 那条路在新 checkout / 新 worktree 上跑不起来，而本机因为文件躺在槽里看不出来。
+    # **运行时必需的源文件必须在版本库里**：`.gitignore` 的 `/explore/*` 曾把 `ort_server.py` 整个吞掉
     import subprocess
     tracked = set(subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                                  text=True, check=True).stdout.split())
@@ -732,36 +706,87 @@ def t_edge_refine() -> None:
     check("**指纹里的每个文件都在 git 里**（不然新 checkout 上根本没有这份代码）",
           need <= tracked, sorted(need - tracked))
     ring = ER.FrameRing(5)
-    ring.release(10)
+    ring.release(10_000)
     for i in range(15):
-        ring.push(i, np.zeros((2, 2), np.uint8))
+        ring.push(i * 1000, np.zeros((2, 2), np.uint8))
     check("**帧环：放掉之后才推进来的旧帧不占位**（第一版就是被这些旧帧填满而死锁的）",
-          len(ring.frames) == 5 and ring.highest == 14 and ring.dropped == 10 and ring.wait_for(14),
+          len(ring.frames) == 5 and ring.highest == 14_000 and ring.dropped == 10 and ring.wait_for(14_000),
           (len(ring.frames), ring.highest, ring.dropped))
-    er2 = ER.EdgeRefiner(src_fps=60, start_idx=0, width=64, height=32, scale=1.0, grid=[1, 2, 1, 6], thr=.8)
-    seg2 = er2._open(7, {}, "ab", [4, 4, 40, 20], 30, 5)
+    r2 = ER.FrameRing(100)
+    for k in (0, 16_667, 33_333, 116_667, 133_333, 150_000, 400_000):      # 键不等距（VFR、缺口）
+        r2.push(k, np.full((1, 1), k % 251, np.uint8))
+    r2.release(30_000)
+    check("**帧环按 t_us 做键、二分取帧**：键不等距时 [lo, hi] 取的就是落在里面的帧（升序）；放帧按时刻；键不递增当场抛",
+          [k for k, _ in r2.take(20_000, 150_000)] == [33_333, 116_667, 133_333, 150_000]
+          and [k for k, _ in r2.take(0, 10**9)] == [33_333, 116_667, 133_333, 150_000, 400_000]
+          and r2.take(200_000, 399_999) == [] and r2.covers(30_000) and not r2.covers(29_999)
+          and raises(lambda: r2.push(400_000, np.zeros((1, 1), np.uint8)), RuntimeError))
+    clk60 = AuxClock(Clock(60), SampleClock(2))
+    er2 = ER.EdgeRefiner(start_us=0, width=64, height=32, scale=1.0, clock=clk60.as_list(), ref_fps=60, thr=.8)
+    seg2 = er2._open(7, {}, "ab", [4, 4, 40, 20], 500_000, 5)
+    seg3 = er2._open(8, {}, "ab", [4, 4, 40, 20], 20_000, 5)
     er2.abort()
-    check("**网格隔帧时窗口起点对齐到格子**（不对齐首字会吸附到比 t_start 晚 1 帧、产物校验拒收）",
-          seg2.lo == 20 and seg2.lo % 2 == 0, seg2.lo)
+    check("**打字机窗从上一个采样帧再往前 LEAD 起、按时间取环里的帧**（不再对齐网格）；不越过窗口起点",
+          seg2.lo == 450_000 and seg3.lo == 0, (seg2.lo, seg3.lo))
     check("**落盘前等的是『这一批开的段都停变了』那一批**，不是这一批本身（辅助流落后时证据会挂在已落盘的行上）",
           er2.settled_by(10) == 10 + ER.MAX_OPEN_SAMPLES + 1)
-    nv = fs.build_ffmpeg_fullrate_cmd("a.mp4", start_sec=2.0, n_frames=9, step=1, scale=0.5, hwaccel="cuda", size=(960, 540))
-    check("辅助流走 NVDEC：-hwaccel 在 -i 前、scale_cuda 在 hwdownload 前、带 showinfo（首帧 pts 对齐）、出 nv12",
-          nv.index("-hwaccel") < nv.index("-i") and "scale_cuda=960:540,hwdownload,format=nv12,showinfo" in " ".join(nv)
-          and nv[nv.index("-pix_fmt") + 1] == "nv12"
-          and raises(lambda: fs.build_ffmpeg_fullrate_cmd("a.mp4", start_sec=0, n_frames=9, hwaccel="cuda"), ValueError))
-    # **帧环的容量必须装得下批 det 的前瞻**（2026-09-17 实测的死锁）：主循环要先攒够 det_batch 个采样帧
-    # 才处理第一帧、也才 release 出空间，而采样帧和辅助流出自同一个 ffmpeg——环一满整个 ffmpeg 就停。
-    # 30 秒窗口实测：`--det-batch 8` + 默认环（5 个间隔 = 173 帧）100 秒都出不了一帧；`--refine-ring 16` 11 秒跑完
-    # 2026-09-23：下界从"det 批的前瞻 + 1"改成"解码头到工作线程之间的全部在途 + 4"（decode-buffer §8.16）
-    check("没有在途（EdgeRefiner 的缺省）：5 个采样间隔 + lead + tail + 8 = 173 帧",
-          ER.ring_capacity(30, 3, 12) == 173, ER.ring_capacity(30, 3, 12))
-    check("**容量 = 在途 + 4 个间隔**：默认 20 -> 24 个间隔、拆进程 36 -> 40 个（`--refine-ring` 更大时按它）",
-          ER.ring_capacity(30, 3, 12, 5, in_flight=20) == 24 * 30 + 23
-          and ER.ring_capacity(30, 3, 12, 5, in_flight=36) == 40 * 30 + 23
-          and ER.ring_capacity(30, 3, 12, 48, in_flight=20) == 48 * 30 + 23,
-          (ER.ring_capacity(30, 3, 12, 5, in_flight=20), ER.ring_capacity(30, 3, 12, 5, in_flight=36)))
-    # 原来只能查 run_ocr2 源码里有没有那几个参数名（run_ocr2 顶层 import 推理库），函数挪进 edge_refine 之后按行为测
+    check("放帧按上一个采样帧的时刻往回留：一个名义间隔 + max(LEAD, 半个间隔 + END_LEAD)（VFR 上采样帧常晚到，按名义间隔从当前帧倒推会判 short）",
+          er2.interval_us == 500_000 and er2.keep_back_us == 500_000 + 300_000 + 1)
+    # 结尾窗起点：末次观测 − 0.5 个名义采样间隔 − 50 ms（owner 2026-11-23）。**CFR 上和旧的帧号口径逐位相同**：
+    # 旧 = 下一格 − round(1.5 × 间隔帧数) − round(50 ms 的帧数)、再落到辅助网格上；终点 = 下一格 + 200 ms 的帧数、落到辅助网格上
+    bad = []
+    for fps, q, step in ((60, 30, 1), (60, 30, 2), (60, 6, 1), (30, 15, 1), (24, 12, 1), (60, 12, 4)):
+        us_ = 1e6 / fps
+        for last in range(q * 3, q * 40, q):
+            t_end = last + q
+            old_lo = t_end - int(round(1.5 * (t_end - last))) - int(round(ER.END_LEAD_US / us_))
+            old_lo += (-old_lo) % step                  # 旧的往下落到辅助网格上；现在按时间取，不对齐网格（取环里 ≥ lo 的第一帧）
+            old_hi = t_end + int(round(ER.END_TAIL_US / us_))
+            old_hi += (-old_hi) % step
+            lo, hi = ER.end_window(round(last * us_), round(t_end * us_), q * us_)
+            new = [i for i in range(0, q * 50, step) if lo <= round(i * us_)]
+            new_hi = [i for i in range(0, q * 50, step) if round(i * us_) <= hi][-1]
+            if new[0] != old_lo or (fps % 5 == 0 and new_hi != old_hi):
+                bad.append((fps, q, step, last, new[0], old_lo, new_hi, old_hi))
+    check("**结尾窗起点在 CFR 上和旧的帧号口径取到同一帧**（60/30/24 fps、各种采样间隔；辅助流隔帧时旧的还往下对齐网格，现在不对齐，"
+          "比的是不对齐时的那一帧；owner 2026-11-23）；"
+          "终点 t_end + 200 ms 在 200 ms 是整帧数的帧率上也相同（24 fps 上旧的按帧取整多取 8 ms，现在按微秒）",
+          not bad, bad[:3])
+    check("结尾窗在 VFR 上不跟着实际间隔往回伸：t_end 晚很多时起点照样是末次观测 − 半个名义间隔 − 50 ms；不早于链首",
+          ER.end_window(10_000_000, 15_000_000, 500_000) == (9_700_000, 15_200_000)
+          and ER.end_window(10_000_000, 10_500_000, 500_000, first_us=9_900_000) == (9_900_000, 10_700_000))
+    # **帧环的容量必须装得下批 det 的前瞻**（2026-09-17 实测的死锁），按时间算（frame-pts 计划第 5 节）：
+    # 跨度 = max(5, strides, 在途 + 4) 个名义采样间隔 + LEAD + END_LEAD + END_TAIL，× (辅助帧率 + 采样帧率) + 8
+    check("容量按时间算：没有在途时 5 个采样间隔 + 窗口头尾，×（辅助 60 + 采样 2）+ 8 = 182 帧",
+          ER.ring_capacity(500_000, 60, 2) == 182, ER.ring_capacity(500_000, 60, 2))
+    check("**容量 = 在途 + 4 个间隔**：默认 20 -> 24 个间隔、拆进程 36 -> 40 个（`--refine-ring` 更大时按它）；辅助流 30 时约减半",
+          ER.ring_capacity(500_000, 60, 2, 5, in_flight=20) == -(-(24 * 500_000 + 300_000) * 62 // 1_000_000) + 8
+          and ER.ring_capacity(500_000, 60, 2, 5, in_flight=36) == -(-(40 * 500_000 + 300_000) * 62 // 1_000_000) + 8
+          and ER.ring_capacity(500_000, 60, 2, 48, in_flight=20) == -(-(48 * 500_000 + 300_000) * 62 // 1_000_000) + 8
+          and ER.ring_capacity(500_000, 30, 2) == -(-2_800_000 * 32 // 1_000_000) + 8)
+    # 容量够用：按辅助桶取的辅助流里，连续 n 个采样帧之间的辅助帧数不超过 (n + 1) 个名义间隔 × (辅助 + 采样) 帧率——
+    # VFR 上空桶里没有帧，不让上界失效。合成一条不规则的 120 fps 时间轴（片段 4 那种稀密不均）核这条上界
+    import random as _rnd
+    _r = _rnd.Random(5)
+    _t, _ts = 0, []
+    while _t < 120 * 60:
+        _ts.append(_t)
+        _t += _r.choice([1, 1, 2, 3, 5, 8, 13, 40])
+    _clk = AuxClock(Clock(60), SampleClock(2))
+    _pa, _sel, _samp = None, [], []
+    for _p in _ts:
+        _c = _clk.cells(_p, Axis((1, 120)))
+        if _c != _pa:
+            _sel.append(_p)
+            if _pa is None or _c[0] != _pa[0]:
+                _samp.append(_p)
+        _pa = _c
+    _worst = 0
+    for _i in range(len(_samp) - 30):
+        _n = sum(1 for _p in _sel if _samp[_i] <= _p <= _samp[_i + 30])
+        _worst = max(_worst, _n / (31 * 0.5 * 62))
+    check("容量按时间算够用：不规则时间轴上任意 30 个连续采样帧之间的辅助帧数不超过 31 个名义间隔 ×（辅助 + 采样）帧率",
+          _worst <= 1.0, round(_worst, 3))
     from types import SimpleNamespace as _NS
     from flowocr.extract import decode_proc as _DP
     base = dict(prefetch=4, det_batch=4, det_prefetch=2, det_lookahead=1, rec_window=4, decode_shards=0,
@@ -778,76 +803,70 @@ def t_edge_refine() -> None:
     check("回补异步时扣着等回补的回抠批次也压着帧环：在途加 RECOVER_HOLD；同步 rec 池用不上它、不加",
           ER.ring_in_flight(_NS(**{**base, "recover_async": True})) == n0 + ER.RECOVER_HOLD
           and ER.ring_in_flight(_NS(**{**base, "recover_async": True, "rec_async": False})) == n0)
-    check("帧环按辅助流的帧数给容量：每帧都进环时同源帧数；120 fps 片子隔帧取（步长 2）约减半；不等距时两个网格的上界相加",
-          ER.ring_capacity(30, 3, 12, aux=AG.AuxGrid(AG.TimeGrid.every(1), AG.TimeGrid.every(30))) == 173
-          and ER.ring_capacity(60, 6, 24, aux=AG.AuxGrid(AG.TimeGrid.every(2), AG.TimeGrid.every(60)))
-          == -(-(5 * 60 + 6 + 24 + 8) // 2) + 1
-          and ER.aux_frames_in(AG.AuxGrid(AG.TimeGrid(2, 5), AG.TimeGrid(1, 15)), 150) == 61 + 11,
-          (ER.ring_capacity(60, 6, 24, aux=AG.AuxGrid(AG.TimeGrid.every(2), AG.TimeGrid.every(60))),))
     stall = ER.FrameRing(2, stall_sec=0.2)
     for i in range(4):                               # 塞满又没人取
         stall.push(i, np.zeros((2, 2), np.uint8))
     check("**互等有出口**：环满、没人取、流没结束，卡过 stall_sec 就抛，不再挂到天荒地老"
           "（同一条教训的第三次：§7.6 的帧环、§7.12 的负 pts）",
           stall.stalled and raises(lambda: stall.wait_for(99), RuntimeError), stall.stalled)
-    _erg = ER.EdgeRefiner(src_fps=60, start_idx=0, width=64, height=32, scale=1.0, grid=[1, 2, 2, 15], thr=.8)
-    _erg.abort()
-    check("edge_refine 的采样网格从辅助流网格里来（嵌套）；窗口的上一个 / 下一个采样帧按网格问（不等距时间隔差一帧）",
-          _erg.sgrid == AG.TimeGrid(2, 15) and _erg.sgrid.prev(15) == 8 and _erg.sgrid.next(15) == 23)
 
-    # 合成：200x40 灰度，暗底 20；框 [20,10,120,30] 里 5 个字格，字 c 在第 30+3c 帧弹出（亮 220），第 90 帧整行消失。
-    # 采样间隔 6 帧：第 5 个采样点（帧 30）新链 "a"，帧 36 "abc"，帧 42 "abcde"，帧 48 起不变，帧 90 那个采样点没框了。
+    # 合成：200x40 灰度，暗底 20；框 [20,10,120,30] 里 5 个字格，字 c 在第 30+3c 帧弹出（亮 220），第 gone_at 帧整行消失。
+    # 60 fps、采样 10 fps（每 6 帧）：第 5 个采样点（帧 30）新链 "a"，帧 36 "abc"，帧 42 "abcde"，帧 48 起不变，帧 90 那个采样点没框了。
     us = 1_000_000 / 60
     box = [20, 10, 120, 30]
 
-    def frame(i: int) -> np.ndarray:
+    def frame(i: int, gone_at: int = 90) -> np.ndarray:
         f = np.full((40, 200), 20, np.uint8)
-        if i < 90:
+        if i < gone_at:
             for c in range(5):
                 if i >= 30 + 3 * c:
                     f[15:25, 25 + 20 * c:35 + 20 * c] = 220
         return f
-    def run_synth(pts, stale_at: int | None = None, grid=(1, 1, 1, 6)):
-        """喂一遍这段合成素材，返回 (on, off, stats)。`pts(帧号) -> t_us` 是**真实时间轴**——
-        丢帧缺口的素材上它和 `帧号 / 平均帧率` 差得越来越多（yuka f4 20 分钟窗口末尾 −257.7 ms）。
-        `stale_at` = 在第几个采样点报"这条链的历史被回补改过"；`grid` = 辅助流网格（只推网格上的帧，同 ffmpeg 辅路）。"""
-        grid = list(grid)
-        g_ = AG.AuxGrid.from_list(grid)
-        er = ER.EdgeRefiner(src_fps=60, start_idx=0, width=200, height=40, scale=1.0, grid=grid, thr=0.8)
+    CLK = AuxClock(Clock(60), SampleClock(10))
+
+    def run_synth(pts, stale_at: int | None = None, clock=CLK, gone_at: int = 90):
+        """喂一遍这段合成素材，返回 (on, off, stats)。`pts(帧号) -> t_us` 是真实时间轴；辅助流只推 `clock` 选中的帧
+        （同 ffmpeg 辅路：辅助桶或采样桶换了）。`stale_at` = 在第几个采样点报"这条链的历史被回补改过"。"""
+        er = ER.EdgeRefiner(start_us=pts(0), width=200, height=40, scale=1.0, clock=clock.as_list(), ref_fps=60, thr=0.8)
 
         def feed() -> None:
+            prev = None
             for i in range(121):
-                if g_.member(i):
-                    er.ring.push(i, frame(i))
+                c = clock.cells(i, Axis((1, 60)))
+                if c != prev:
+                    er.ring.push(pts(i), frame(i, gone_at))
+                prev = c
             er.ring.close()
         threading.Thread(target=feed, daemon=True).start()
         rows_ = {}
         texts = {5: ("a", "new"), 6: ("abc", "changed"), 7: ("abcde", "changed")}
+        for k in range(0, 5):                      # 前几个采样点没有框：工作线程照样记下它们的时刻（"上一个采样帧"从这里取）
+            er.sample(k, pts(6 * k), [], [])
         for k in range(5, 15):
-            rows_[k] = {"frame": 6 * k, "t_us": pts(6 * k), "box": box, "text": "abcde"}
+            rows_[k] = {"t_us": pts(6 * k), "box": box, "text": "abcde"}
             text, kind = texts.get(k, ("abcde", "same"))
-            er.sample(k, 6 * k, pts(6 * k), [(1, rows_[k], box, text, kind)],
-                      [], {1} if stale_at == k else ())
-        er.sample(15, 90, pts(90), [], [(1, rows_[14], box, "abcde", 84)], {1} if stale_at == 15 else ())
-        st_ = er.finish(120)
+            er.sample(k, pts(6 * k), [(1, rows_[k], box, text, kind)], [], {1} if stale_at == k else ())
+        er.sample(15, pts(90), [], [(1, rows_[14], box, "abcde", pts(84))], {1} if stale_at == 15 else ())
+        st_ = er.finish(pts(120))
         return rows_[5]["edge"]["on"], rows_[14]["edge"]["off"], st_
 
-    on, off, st = run_synth(lambda i: int(round(i * us)))
-    check("链首行挂上 `edge.on`：窗从首字前一个间隔 + LEAD 到停变那个采样点，模板 = 帧 48",
-          st["on"] == 1 and st["off"] == 1 and (on["lo"], on["hi"], on["n"]) == (21, 48, 5), (st, on))
-    check("首字格开始出现 = 帧 30、尾字格定稿 = 帧 42、逐字格直线首尾也落在 30 / 42",
-          on["first_rise"] == round(30 * us) and on["full_glyph"] == round(42 * us)
+    P = lambda i: int(round(i * us))
+    on, off, st = run_synth(P)
+    check("链首行挂上 `edge.on`：窗从首字前一个采样帧 − LEAD 到停变那个采样帧（µs），模板 = 帧 48",
+          st["on"] == 1 and st["off"] == 1 and (on["lo"], on["hi"], on["n"]) == (P(24) - 50_000, P(48), 5)
+          and not any(k in on for k in ("a_idx", "a_us", "step", "grid")), (st, on))
+    check("首字格开始出现 = 帧 30、尾字格定稿 = 帧 42、逐字格直线首尾也落在 30 / 42（时刻是帧自己的 t_us）",
+          on["first_rise"] == P(30) and on["full_glyph"] == P(42)
           and on["cell"] and abs(on["cell"][0] - 30 * us) < us and abs(on["cell"][1] - 42 * us) < us, on)
-    check("链末行挂上 `edge.off`：退回判据在帧 89 还像模板、曲线说完全显示结束 89 / 完全消失 90",
-          off["ncc_gone"] == 89 and off["last_full"] == round(89 * us) and off["gone"] == round(90 * us), off)
-    # 结尾窗要到帧 102；之后的帧 finish() 关环时喂帧线程还卡在满环上、不再计数，所以只要求"窗口要的都进过环"
+    check("链末行挂上 `edge.off`：last_us = 末次观测；退回判据在帧 89 还像模板 -> ncc_end = 它后面那一个辅助帧（帧 90）、没到链断的采样点（ncc_open 假）；"
+          "曲线说完全显示结束 89 / 完全消失 90",
+          off["last_us"] == P(84) and off["ncc_end"] == P(90) and off["ncc_open"] is False
+          and off["last_full"] == P(89) and off["gone"] == P(90) and "last_idx" not in off and "ncc_gone" not in off, off)
     check("帧环没死锁、窗口要的帧都进过环", st["frames_pushed"] >= 103 and st["short_windows"] == 0, st)
-    # 第二遍：证据 -> measured -> 原来的 apply()
-    run = dict(t_start=round(30 * us), t_end=round(90 * us), t_full_sampled=round(42 * us), text="abcde", box=box, n_obs=10)
-    job = rb.make_job(run, round(6 * us), us)
-    SG6 = AG.TimeGrid.every(6)                     # 合成素材每 6 帧采一次
-    meas = ER.measured_from_records(on, on, off, run["t_end"], us, round(6 * us), SG6)
-    job["measured"] = meas
+    # 第二遍：证据 -> measured -> apply()
+    run = dict(t_start=P(30), t_end=P(90), t_full_sampled=P(42), text="abcde", box=box, n_obs=10)
+    job = rb.make_job(run, P(6))
+    job["measured"] = ER.measured_from_records(on, on, off, run["t_end"], P(6), CLK)
     rb.apply(job, None, None)
     check("**从 obs 证据重建后三个时刻落在合成真值上**：首字 30、全字 42、完全显示结束 89、完全消失 90（帧）",
           job["refined"] and abs(run["t_start"] - 30 * us) < 1 and abs(run["t_full"] - 42 * us) < 1
@@ -855,123 +874,122 @@ def t_edge_refine() -> None:
 
     # 末段在动的门（defaults.md 1.65）：同一份证据，run 的采样级终点放在帧 96（晚于真值 90），看终点认不认结尾窗
     def settle(boxes, starts=True, t_end=96, **job_extra):
-        r = dict(run, t_start=round(30 * us), t_end=round(t_end * us), t_full=None, **({"boxes": boxes} if boxes else {}))
+        r = dict(run, t_start=P(30), t_end=P(t_end), t_full=None, **({"boxes": boxes} if boxes else {}))
         r.pop("t_end_how", None), r.pop("t_full_end", None)
-        j = dict(rb.make_job(r, round(6 * us), us), **job_extra)
-        j["measured"] = ER.measured_from_records(on if starts else None, on if starts else None, off, r["t_end"],
-                                                 us, round(6 * us), SG6)
+        j = dict(rb.make_job(r, P(6)), **job_extra)
+        j["measured"] = ER.measured_from_records(on if starts else None, on if starts else None, off, r["t_end"], P(6), CLK)
         rb.apply(j, None, None)
         return r, j
-    t78, t84 = round(78 * us), round(84 * us)
+    t78, t84 = P(78), P(84)
     bx = [200, 10, 300, 30]                                                    # 轨迹离屏边远（字高 20 px）
     mv = lambda k: [bx[0] - k, bx[1], bx[2] - k, bx[3]]                        # 往左飞 k px
-    r_fly, j_fly = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]])                  # 最后一步 20 px = 1 个字高
-    r_slow, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(48)]])                     # 最后一步 8 px = 0.4 个字高
-    r_stop, _ = settle([[round(30 * us), bx], [round(42 * us), mv(40)], [t84, mv(48)]])          # 早停：收尾点隔 7 个间隔、摊下来 0.06
-    r_out, _ = settle([[round(30 * us), bx], [t78, [0, 10, 40, 30]], [t84, [0, 12, 20, 28]]])     # 出屏：左沿贴屏边、右沿走 20 px，框被裁矮
+    r_fly, j_fly = settle([[P(30), bx], [t78, mv(40)], [t84, mv(60)]])                  # 最后一步 20 px = 1 个字高
+    r_slow, _ = settle([[P(30), bx], [t78, mv(40)], [t84, mv(48)]])                     # 最后一步 8 px = 0.4 个字高
+    r_stop, _ = settle([[P(30), bx], [P(42), mv(40)], [t84, mv(48)]])                   # 早停：收尾点隔 7 个间隔、摊下来 0.06
+    r_out, _ = settle([[P(30), bx], [t78, [0, 10, 40, 30]], [t84, [0, 12, 20, 28]]])     # 出屏：左沿贴屏边、右沿走 20 px，框被裁矮
     r_still, _ = settle(None)
-    r_bare, j_bare = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]], starts=False)
-    r_grow, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, [bx[0] - 40, bx[1], bx[2] + 20, bx[3]]]])   # 只有右沿走 60 px：形变
-    r_late, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, mv(60)]], t_end=84)        # 证据（帧 90）晚于采样级（帧 84）
-    # 收尾点是并集（最后一票在 IoU 门里、并进上一框）：轨迹上只有左沿在长，obs 里最后一次观测的真实框是平移了 20 px 的
-    r_union, _ = settle([[round(30 * us), bx], [t78, mv(40)], [t84, [bx[0] - 60, bx[1], bx[2] - 40, bx[3]]]], off_box=mv(60))
-    r_right, _ = settle([[round(30 * us), bx], [t78, [150, 10, 195, 30]], [t84, [170, 10, 200, 30]]], frame_size=(200, 100))  # 右沿贴屏边
+    r_bare, j_bare = settle([[P(30), bx], [t78, mv(40)], [t84, mv(60)]], starts=False)
+    r_grow, _ = settle([[P(30), bx], [t78, mv(40)], [t84, [bx[0] - 40, bx[1], bx[2] + 20, bx[3]]]])   # 只有右沿走 60 px：形变
+    r_late, _ = settle([[P(30), bx], [t78, mv(40)], [t84, mv(60)]], t_end=84)        # 证据（帧 90）晚于采样级（帧 84）
+    r_union, _ = settle([[P(30), bx], [t78, mv(40)], [t84, [bx[0] - 60, bx[1], bx[2] - 40, bx[3]]]], off_box=mv(60))
+    r_right, _ = settle([[P(30), bx], [t78, [150, 10, 195, 30]], [t84, [170, 10, 200, 30]]], frame_size=(200, 100))  # 右沿贴屏边
     check("**末段在动的 run 终点留采样级**（t_end_how = moving，不填完全显示结束），起点照样回抠到帧 30；出屏的（贴边那条边不动、框被裁矮）也算",
-          r_fly["t_end"] == round(96 * us) and r_fly["t_end_how"] == "moving" and r_fly["t_full_end"] is None
+          r_fly["t_end"] == P(96) and r_fly["t_end_how"] == "moving" and r_fly["t_full_end"] is None
           and abs(r_fly["t_start"] - 30 * us) < 1 and j_fly["refined"] and j_fly.get("moving_end")
-          and r_out["t_end_how"] == "moving" and r_out["t_end"] == round(96 * us), (r_fly, r_out))
+          and r_out["t_end_how"] == "moving" and r_out["t_end"] == P(96), (r_fly, r_out))
     check("末段在动的门不碰静止 / 慢移 / 早停 / 只有一条边在动（形变）的 run：终点照旧认证据（帧 90、curve）",
           all(abs(r["t_end"] - 90 * us) < 1 and r["t_end_how"] == "curve" for r in (r_still, r_slow, r_stop, r_grow)),
           [(r["t_end"], r.get("t_end_how")) for r in (r_still, r_slow, r_stop, r_grow)])
     check("末段在动的门只拒收比采样级早的终点：证据晚于采样级的照收（帧 90、curve）",
           abs(r_late["t_end"] - 90 * us) < 1 and r_late["t_end_how"] == "curve", r_late)
     check("末段在动的门：收尾点是并集时按 obs 里最后一次观测的真实框判平移；右沿贴屏边（画面尺寸来自产物）只看左沿",
-          r_union["t_end_how"] == "moving" and r_union["t_end"] == round(96 * us)
-          and r_right["t_end_how"] == "moving" and r_right["t_end"] == round(96 * us), (r_union, r_right))
+          r_union["t_end_how"] == "moving" and r_union["t_end"] == P(96)
+          and r_right["t_end_how"] == "moving" and r_right["t_end"] == P(96), (r_union, r_right))
     check("末段在动、起点也没证据的 run：时刻全不动、不算回抠成功，但 t_end_how 记 moving（数得出来）",
-          r_bare["t_end"] == round(96 * us) and r_bare["t_end_how"] == "moving" and not j_bare["refined"]
+          r_bare["t_end"] == P(96) and r_bare["t_end_how"] == "moving" and not j_bare["refined"]
           and j_bare.get("moving_end"), r_bare)
-    m_open = ER.measured_from_records(None, None, dict(off, ncc_gone=90, gone=None), run_t_end := round(90 * us), us, round(6 * us), SG6)
-    m_ncc = ER.measured_from_records(None, None, dict(off, ncc_gone=89, gone=None), run_t_end, us, round(6 * us), SG6)
-    check("**开放边界**（在线证据）：退回判据一路像到链断那个采样点（run 采样级的 t_end）= 窗里没看到消失，记 open、"
-          "t_end 照旧取下界、不填完全显示结束；早一帧就不像了的照旧是 ncc",
-          m_open[4] == "open" and m_open[1] and m_open[3] is None and abs(m_open[0] - 91 * us) < 1
-          and m_ncc[4] == "ncc" and m_ncc[3] is not None, (m_open, m_ncc))
-    # 不整除的采样（60 fps 上 2.2 / 2.1 fps）：查找终点是网格的下一格，不是"末次观测 + 名义间隔"（2026-09-26 Codex 复审反例）
-    g22, g21 = AG.TimeGrid.for_rate(60, 2.2), AG.TimeGrid.for_rate(60, 2.1)
-    k22 = [ER.measured_from_records(None, None, dict(off, last_idx=0, ncc_gone=k, gone=None), round(0 + 1e6 / 2.2), us, round(1e6 / 2.2), g22)[4]
-           for k in (g22.next(0) - 1, g22.next(0))]
-    k21 = [ER.measured_from_records(None, None, dict(off, last_idx=58, ncc_gone=k, gone=None), round(58 * us + 1e6 / 2.1), us, round(1e6 / 2.1), g21)[4]
-           for k in (g21.next(58) - 1, g21.next(58))]
-    check("**开放边界按采样网格的实际下一格判**（不整除的 2.2 / 2.1 fps 上名义间隔差一帧，两个方向都会判反）："
-          "下一格已不像 = ncc，下一格还像 = open",
-          (g22.next(0), g21.next(58)) == (28, 86) and k22 == ["ncc", "open"] and k21 == ["ncc", "open"], (g22.next(0), g21.next(58), k22, k21))
+    # **开放边界**（在线证据）：字其实还在屏上、链却在帧 90 那个采样点断了（det 切碎、读数变了）——退回判据一路像到链断的采样点
+    on_o, off_o, _ = run_synth(P, gone_at=110)
+    m_o = ER.measured_from_records(None, None, off_o, P(90), P(6), CLK)
+    check("**开放边界**：最后还像的帧到了链断那个采样点（帧 90）-> 工作线程记 ncc_open、ncc_end = 帧 91；结算记 open、t_end 只是下界、"
+          "不填完全显示结束；早一帧就不像了的（上面那份）照旧是 ncc",
+          off_o["ncc_open"] is True and off_o["ncc_end"] == P(91) and m_o[4] == "open" and m_o[1] and m_o[3] is None
+          and m_o[0] == P(91) and ER.measured_from_records(None, None, dict(off, gone=None), P(90), P(6), CLK)[4] == "ncc",
+          (off_o, m_o))
     check("没有任何证据 = None（该条原样退回，同 no_evidence）",
-          ER.measured_from_records(None, None, None, 1, us, 1, SG6) is None
-          and ER.measured_from_records({"short": True, "lo": 0, "hi": 1, "step": 1}, None, None, 1, us, 1, SG6) is None)
-    # **不整除的网格**（2026-09-24，时间网格）：60 fps 上 24 fps（p/q = 2/5）+ 采样帧嵌套。窗口两端落在网格上、
-    # 证据不 short，重建的 ts 就是网格上的帧（和实际推进环里的逐个对上），三个时刻离真值不超过网格间距
-    ong, offg, stg = run_synth(lambda i: int(round(i * us)), grid=(2, 5, 1, 6))
-    g25 = AG.AuxGrid.from_list([2, 5, 1, 6])
-    sg = ER.sig_from_records(ong, ong, us)
-    check("**不整除网格：窗口端点在网格上、证据齐全、记 grid 不记 step**",
-          stg["short_windows"] == 0 and g25.member(ong["lo"]) and g25.member(offg["lo"]) and g25.member(offg["hi"])
-          and ong.get("grid") == [2, 5, 1, 6] and "step" not in ong, (stg, ong.get("grid"), ong["lo"], offg["lo"], offg["hi"]))
-    check("不整除网格：重建的 ts 就是 [lo, hi] 里网格上的帧",
-          sg is not None and sg["ts"] == [round(i * us) for i in range(ong["lo"], ong["hi"] + 1) if g25.member(i)], sg and sg["ts"][:6])
-    check("不整除网格：首字 / 全字 / 消失离真值不超过 3 帧（网格间距 2~3 帧）",
+          ER.measured_from_records(None, None, None, 1, 1, CLK) is None
+          and ER.measured_from_records({"short": True, "lo": 0, "hi": 1}, None, None, 1, 1, CLK) is None)
+    # **辅助流不是每帧都要时**（60 fps 上辅助 24 fps + 采样 10 fps，两种桶的公共细分）：窗口按时间取真实的辅助帧、证据不 short；
+    # 阶段 2 重建的 ts 是 [lo, hi] 里辅助流的目标点（辅助桶与采样桶的 T_k），三个时刻离真值不超过辅助帧的间距
+    C24 = AuxClock(Clock(24), SampleClock(10))
+    ong, offg, stg = run_synth(P, clock=C24)
+    sg = ER.sig_from_records(ong, ong, C24)
+    check("**辅助流隔帧（24 fps）：证据齐全；重建的 ts 是目标点**（证据里不存每帧时刻）",
+          stg["short_windows"] == 0 and sg is not None and sg["ts"] == C24.targets_us(ong["lo"], ong["hi"])
+          and sg["ts"][0] >= ong["lo"] and sg["ts"][-1] <= ong["hi"], (stg, sg and sg["ts"][:6]))
+    check("辅助流隔帧：首字 / 全字 / 消失离真值不超过 3 帧（辅助帧间距 2~3 帧）",
           abs(ong["first_rise"] - 30 * us) <= 3 * us and abs(ong["full_glyph"] - 42 * us) <= 3 * us
           and offg["gone"] is not None and abs(offg["gone"] - 90 * us) <= 3 * us,
           (ong["first_rise"] / us, ong["full_glyph"] / us, offg["gone"] and offg["gone"] / us))
-    on_u, off_u, _ = run_synth(lambda i: int(round(i * us)), grid=(1, 2, 1, 6))
-    check("等距网格（隔帧）照旧只记 step（和时间网格之前逐字节相同的前提）",
-          on_u.get("step") == 2 and "grid" not in on_u and off_u.get("step") == 2, (on_u.get("step"), on_u.get("grid")))
-    # **时刻要锚在真实 pts 上**（2026-09-17 审计 P1）：辅助流只有帧号，而 run 的 t_start/t_end 是 pts；
-    # 有丢帧缺口的素材上两套时钟会差出几百毫秒（f4 20 分钟 258 ms、f3 7.2 h 9.5 s）。
-    # 同一段像素、时间轴整体挪 0.25 s：三个时刻必须跟着挪
+    # **逐帧候选也吸附到目标点**：pts 按毫秒取整的素材（yuka）上证据里的帧时刻离目标点零点几毫秒，不吸附就和吸附过的外推值 /
+    # 逐字格直线混着比——FUSE_TOL_US 正好 3 帧，first_old 早 0.33 ms 就和外推值拆成两簇、首字落到采样级起点上。
+    # 数取自 yuka-f5 15063.5 s「すでに十分お話はしましたし」的真实证据（旧臂 15063.400、修之前 15063.500，真值 15063.417）
+    from flowocr.extract import typewriter_fuse as TF
+    C60 = AuxClock(Clock(60), SampleClock(2))
+    on_y = {"lo": 15_062_950_000, "hi": 15_064_500_000, "n": 13, "text": "すでに十分お話はしましたし",
+            "first_old": 15_063_383_000, "first_rise": 15_063_517_000, "full_glyph": None,
+            "cell": [15_063_540_250.0, 15_063_711_250.0]}
+    sy = ER.sig_from_records(on_y, on_y, C60)
+    est_y = TF.combine(sy, 15_063_500_000, 15_064_000_000, 500_000,
+                       [(15_063_500_000, 5), (15_064_000_000, 13)], None, 16_577.380952467236)
+    check("**逐帧候选（first_old / first_rise / full_glyph）吸附到目标点**，和外推值按同一组点比 3 帧容差："
+          "毫秒取整的 first_old 不再被拆出外推值那一簇（yuka-f5 那条首字 15063.400，不是采样级 15063.500）",
+          sy["first_old"] == 15_063_383_333 and sy["first_rise"] == 15_063_516_667 and sy["full_glyph"] is None
+          and est_y["first"] == 15_063_400_000, (sy and {k: sy[k] for k in ("first_old", "first_rise")}, est_y))
+    # **时刻就是帧自己的 pts**：同一段像素、时间轴整体挪 0.25 s（15 帧，目标点也正好挪 15 个），三个时刻和窗口端点必须跟着挪
     SH = 250_000
-    on2, off2, _ = run_synth(lambda i: int(round(i * us)) + SH)
-    check("**证据的时刻锚在采样点的真实 pts 上**（`a_idx` / `a_us`）：时间轴整体偏 0.25 s，首字 / 全字 / 消失跟着偏",
-          on2["a_us"] - on["a_us"] == SH and on2["first_rise"] - on["first_rise"] == SH
+    on2, off2, _ = run_synth(lambda i: P(i) + SH)
+    check("**证据里的时刻都是帧自己的 t_us**：时间轴整体偏 0.25 s，窗口端点、首字 / 全字 / 消失跟着偏",
+          on2["lo"] - on["lo"] == SH and on2["hi"] - on["hi"] == SH and on2["first_rise"] - on["first_rise"] == SH
           and on2["full_glyph"] - on["full_glyph"] == SH and off2["gone"] - off["gone"] == SH
-          and off2["last_full"] - off["last_full"] == SH, (on2, off2))
-    check("重建也按锚折算（ncc_gone / 窗口网格都算）",
-          ER.measured_from_records(on2, on2, off2, 0, us, round(6 * us), SG6)[0]
-          - ER.measured_from_records(on, on, off, 0, us, round(6 * us), SG6)[0] == SH
-          and ER.sig_from_records(on2, on2, us)["ts"][0] - ER.sig_from_records(on, on, us)["ts"][0] == SH)
-    check("没有锚的旧产物退回纯帧号时钟（不炸）",
-          ER.rec_time({k: v for k, v in on.items() if k not in ("a_idx", "a_us")}, 30, us) == round(30 * us))
-    # **回补把变化点前移 -> 这一段的证据作废**（审计 P2）：帧环只留 5 个采样间隔，重新量不可能，
+          and off2["last_full"] - off["last_full"] == SH and off2["ncc_end"] - off["ncc_end"] == SH, (on2, off2))
+    check("重建也一样（ncc_end / 目标点都跟着挪）",
+          ER.measured_from_records(on2, on2, off2, 0, P(6), CLK)[0] - ER.measured_from_records(on, on, off, 0, P(6), CLK)[0] == SH
+          and ER.sig_from_records(on2, on2, CLK)["ts"][0] - ER.sig_from_records(on, on, CLK)["ts"][0] == SH)
+    # **回补把变化点前移 -> 这一段的证据作废**（审计 P2）：帧环只留几个采样间隔，重新量不可能，
     # 所以标 stale、第二遍当没量到（口径同 short），该 run 退回采样级
-    on3, off3, st3 = run_synth(lambda i: int(round(i * us)), stale_at=7)
+    on3, off3, st3 = run_synth(P, stale_at=7)
     check("回补改写历史 -> `edge` 证据标 stale、当没量到（不是拿错窗口的时刻去写产物）",
           on3.get("stale") and st3["stale_windows"] >= 1 and not ER.usable(on3)
-          and ER.measured_from_records(on3, on3, dict(off3, stale=True), 7, us, 1, SG6) is None, (on3.get("stale"), st3))
+          and ER.measured_from_records(on3, on3, dict(off3, stale=True), 7, 1, CLK) is None, (on3.get("stale"), st3))
     check("stale 的 off 不参与结尾判决，但 on 还能用时打字机那一侧照旧",
           ER.usable(off) and not ER.usable(dict(off, stale=True))
-          and ER.measured_from_records(on, on, dict(off, stale=True), 123, us, 1, SG6)[0] == 123)
+          and ER.measured_from_records(on, on, dict(off, stale=True), 123, 1, CLK)[0] == 123)
     # refine_from_obs：按 run 的首行 / 末行认领证据（同一行位置）
-    import json
     d = Path(tempfile.mkdtemp())
     obs = d / "o.jsonl"
     obs.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in [
-        {"_meta": {"stride": 6}},
-        {"frame": 30, "t_us": round(30 * us), "box": box, "text": "a", "edge": {"on": on}},
-        {"frame": 84, "t_us": round(84 * us), "box": box, "text": "abcde", "edge": {"off": off}},
-        {"frame": 84, "t_us": round(84 * us), "box": [20, 200, 120, 220], "text": "zzz", "edge": {"off": off}},
+        {"_meta": {"aux_clock": CLK.as_list(), "frame_key": "t_us"}},
+        {"t_us": P(30), "box": box, "text": "a", "edge": {"on": on}},
+        {"t_us": P(84), "box": box, "text": "abcde", "edge": {"off": off}},
+        {"t_us": P(84), "box": [20, 200, 120, 220], "text": "zzz", "edge": {"off": off}},
     ]) + "\n", encoding="utf-8")
     run2 = dict(run)
-    j2 = rb.make_job(run2, round(6 * us), us)
-    ev = rb.refine_from_obs([j2], obs, us, round(6 * us))
+    j2 = rb.make_job(run2, P(6))
+    ev = rb.refine_from_obs([j2], obs, us, P(6))
     check("refine_from_obs：首行的 on + 末行的 off 认领到这条 run，别的行位置的 off 不认（默认救回作废证据，这里没有作废的）",
           ev == {"on_rows": 1, "off_rows": 2, "jobs": 1, "jobs_with_on": 1, "jobs_with_off": 1,
                  "off_rows_salvaged": 0, "jobs_with_off_salvaged": 0} and "measured" in j2, ev)
-    # 时间网格上采样间隔不等距（2026-09-24，gi-s2 --fps 2.2）：段首证据在 run 起点前 1.03 个名义间隔那一票上，也要认领到
+    # 采样间隔不等长（VFR / 不整除）：段首证据在 run 起点前 1.03 个名义间隔那一票上，也要认领到
     run3 = dict(run, t_start=round(30 * us + 1.03 * 6 * us))
-    j3 = rb.make_job(run3, round(6 * us), us)
-    ev3 = rb.refine_from_obs([j3], obs, us, round(6 * us))
+    j3 = rb.make_job(run3, P(6))
+    ev3 = rb.refine_from_obs([j3], obs, us, P(6))
     check("refine_from_obs：「前一票」按 1.5 个名义间隔找（间隔比名义长一帧时照样认领段首证据）",
           ev3["jobs_with_on"] == 1, ev3)
+    obs_old = d / "old.jsonl"
+    obs_old.write_text(json.dumps({"_meta": {"stride": 6}}) + "\n", encoding="utf-8")
+    check("refine_from_obs：obs 没记 aux_clock（旧的帧号口径）就报错，不拿别的时间桶吸附",
+          raises(lambda: rb.refine_from_obs([rb.make_job(dict(run), P(6))], obs_old, us, P(6)), ValueError))
 
 
 def t_slot_fits_why() -> None:
@@ -984,8 +1002,10 @@ def t_slot_fits_why() -> None:
 
     def sig():
         x0 = rng.uniform(0, 1500); y0 = rng.uniform(0, 1000)
+        ch = rng.uniform(8, 60)
+        h = ch * rng.choice((1.0, rng.uniform(2, 10)))         # 列长 > 列宽的是竖排的列
         return (x0 + rng.uniform(10, 300) / 2, x0, x0 + rng.uniform(10, 400),
-                y0, y0 + rng.uniform(10, 300), rng.uniform(8, 60))
+                y0, y0 + rng.uniform(10, 300), h, ch, 1.0 if h > ch else 0.0)
 
     pairs = [(sig(), sig()) for _ in range(500)]
     same = all(bt.slot_fits(a, b, 1920, True) == bt.slot_fits_why(a, b, 1920, True)[0]
@@ -1102,6 +1122,31 @@ def t_within_regions() -> None:
     check("并带主轨和名牌轨的段都过这道闸", src.count("within_regions(cue_segments(") == 2)
 
 
+def t_column_regions() -> None:
+    """竖排列的相邻判据只有一份（`textdir.columns_adjacent`，阶段 3 拆 `col` 行也用它）：建轨并区照旧按列轨的中位数判、宽比门是 `--region-h-ratio`。"""
+    print("竖排列：建轨并区的相邻判据")
+    from flowocr.analyze import build_tracks as bt
+    from flowocr.artifacts import textdir
+
+    check("列宽比门的默认值和建轨的 REGION_H_RATIO 相等", textdir.COL_W_RATIO == bt.REGION_H_RATIO)
+    adj = textdir.columns_adjacent
+    a = (0, 100, 50, 20)
+    check("判据逐项：cx 差 ≤ 2.2 个较窄列宽且上下有重叠算相邻；远了、宽比超门、上下不重叠都不算；宽比门 0 = 不看",
+          [adj(a, (10, 110, 94, 20), 1.7), adj(a, (10, 110, 95, 20), 1.7), adj(a, (10, 110, 80, 40), 1.7),
+           adj(a, (10, 110, 80, 40), 0), adj(a, (100, 200, 70, 20), 1.7)] == [True, False, False, True, False])
+
+    def run(box, text):
+        return bt.Run(box=box, text=text, t_start=0, t_end=1_000_000, n_obs=1, conf=1.0)
+    # 片段 8 的样子：两个挨着的小标签（宽 38）和一整列大字说明（宽 118，在画面另一头），再加一列紧挨着说明、宽一倍多的列
+    runs = [run([1126, 810, 1164, 901], "応接室"), run([1070, 808, 1108, 901], "校長室"),
+            run([24, 52, 142, 1044], "各々隠れる場所が決定"), run([150, 60, 400, 1000], "とても太い列の字")]
+    tracks = [[0], [1], [2], [3]]
+    got = sorted(sorted(g) for g in bt.build_regions(runs, tracks, 1920, 1080))
+    check("建轨并区：挨着的两列并成一块，远处的列、宽比超门的列各自一块", got == [[0, 1], [2], [3]], got)
+    got = sorted(sorted(g) for g in bt.build_regions(runs, tracks, 1920, 1080, h_ratio=0))
+    check("--region-h-ratio 0 也关掉列宽比门（挨着的宽列并进来），远处的列仍然分开", got == [[0, 1], [2, 3]], got)
+
+
 def t_row_order() -> None:
     """cue 里的行序：先分行、行从上往下、行内从左往右（cue-shape 计划的 c）。"""
     print("行序：分行之后行内从左到右")
@@ -1122,10 +1167,59 @@ def t_row_order() -> None:
           [r.text for r in bt.row_order([left, top, last, right])] == got)
     tall = [400, 860, 900, 966]                          # 一个框装着两行
     check("高框不和旁边的单行框串成一行（字高比 > 1.7）",
-          not tracksio.same_row(tall, [950, 860, 1200, 905]))
+          not tracksio.same_row(tall, [950, 860, 1200, 905], "二行の\n高い框", "単行"))
+    # 竖排（vertical-text 计划）：三列竖排说明字（片段 5 的 15 s），读序是列从右往左；同一列被切成上下两截时按上沿拼成一列
+    c1 = run("紗耶の活躍", [658, 46, 802, 460])
+    c2 = run("もっとみんな", [539, 37, 632, 474])
+    c3 = run("褒めてよ！", [452, 40, 551, 436])
+    got = [r.text for r in bt.row_order([c3, c1, c2])]
+    check("竖排的列从右往左", got == ["紗耶の活躍", "もっとみんな", "褒めてよ！"], got)
+    rows = tracksio.rows_of_events([{"text": "てみます", "box": [300, 500, 360, 760]}, {"text": "してみます", "box": [200, 100, 262, 420]},
+                                    {"text": "セルフロウリュウ", "box": [300, 60, 362, 470]}])
+    check("竖排一列切成上下两截按上沿拼回一列、列从右往左", [r["text"] for r in rows] == ["セルフロウリュウてみます", "してみます"],
+          [r["text"] for r in rows])
+    check("两根竖条左右并排不算同一行（按列宽比重叠）",
+          not tracksio.same_row([300, 60, 362, 470], [200, 100, 262, 420], "セルフロウリュウ", "してみます"))
+    # 竖条框装着单个窄字（wuwa 文字墙的「Ⅱ」）照横排排：按列算会被排到所有横排行之后
+    rows = tracksio.rows_of_events([{"text": "上の行", "box": [100, 100, 400, 140]}, {"text": "Ⅱ", "box": [100, 160, 120, 200]},
+                                    {"text": "下の行", "box": [100, 220, 400, 260]}])
+    check("竖条框里的单个窄字照横排按纵向排", [r["text"] for r in rows] == ["上の行", "Ⅱ", "下の行"], [r["text"] for r in rows])
+    check("一竖一横不算同一行（同一行要按同一个轴排）",
+          not tracksio.same_row([100, 100, 130, 160], [140, 105, 300, 155], "縦列", "横の行"))
+    _r = [bt.Run(box=[1800, 200, 1840, y1], text="あいうえおかきくけこ"[:n], t_start=0, t_end=1, n_obs=1, conf=1.0) for y1, n in ((300, 3), (600, 9))]
+    check("跨窗缝合的字高：竖排的列量列宽，不量列长", [bt.char_h(r) for r in _r] == [40, 40], [bt.char_h(r) for r in _r])
+
+    def _col(y0, y1, n):            # 一个窗里同一处的竖排列：宽 20 px
+        return bt.region_geom([bt.Run(box=[1800, y0, 1820, y1], text="あいうえおかきくけこ"[:n], t_start=0, t_end=1,
+                                      n_obs=1, conf=1.0)], [0])
+    check("跨窗缝合：同一处竖排列，长句窗（200 px）和短句窗（100 px）缝得上（字高比门量列宽）",
+          bt.slot_fits(_col(200, 300, 5), _col(200, 400, 10), 1920, anchor=True) is not None)
+    check("跨窗缝合：同一处竖排列两窗错开 40 px 缝得上（共边容差按框高，不按列宽）",
+          bt.slot_fits(_col(200, 400, 10), _col(240, 440, 10), 1920, anchor=True) is not None)
+
+    def _geom(boxes, text):
+        return bt.region_geom([bt.Run(box=b, text=text, t_start=0, t_end=1, n_obs=1, conf=1.0) for b in boxes],
+                              list(range(len(boxes))))
+    # 片段 2 的读数：横排字幕带 y 788–1036、字高 156；竖排说明字的槽位 y 71–1005、列宽 96、列长 718。
+    # 共边容差、跨度比下限按列长算的话两道门都放空（跨度比 934 / (2 × 156) = 2.99 ≤ 3），字幕带缝进了竖排那块
+    _band = _geom([[80, 788, 1826, 944], [80, 880, 1826, 1036]], "何なん俺お前しか会えへんの？")
+    _cols = _geom([[700, 71, 796, 789], [600, 287, 696, 1005]], "さくちゃんは意外と力持ち")
+    check("跨窗缝合：横排字幕带不缝进同一片高度上的竖排列（有一边横排时空间尺度按字号）",
+          bt.slot_fits(_band, _cols, 1920, anchor=True) is None and bt.slot_fits(_cols, _band, 1920, anchor=True) is None,
+          bt.slot_fits_why(_band, _cols, 1920, anchor=True))
+    from flowocr.analyze import uigate
+
+    def _top(texts):                   # 每句在屏 10 s、接着排
+        f = uigate.Footprint([0, 0, 100, 30], [uigate.Item((0, 0, 100, 30), k * 10_000_000, (k + 1) * 10_000_000, t)
+                                               for k, t in enumerate(texts)])
+        return uigate.measure(f, 10_000_000 * len(texts), 500_000)["top_share"]
+    check("静态 UI 的\"同一句\"：读法在抖的标签、在变的分数还是同一句；轮着换的提问（同一句式换两个字也算）各句不是",
+          _top(["Dummy", "Duininy", "Duminy", "Dumny"]) >= 0.5 and _top(["スコア：1000", "スコア：4800", "スコア：600"]) == 1.0
+          and _top(["Q・好きな食べ物は？", "Q・休みの日は何してる？", "Q・横浜の印象は？", "Q・絵を描くのは得意？"]) <= 0.25
+          and _top(["Q・好きな映画は？", "Q・好きな音楽は？", "Q・好きな料理は？", "Q・好きな動物は？"]) <= 0.25)
     chain = [[0, 0, 100, 40], [110, 25, 210, 85], [220, 70, 320, 110]]   # 中间一个略高的框同时压着上下两行
     check("三个框链式重叠（首尾不重叠）：不做传递闭包、不把上下两行串成一行",
-          tracksio.row_index(chain)[0] != tracksio.row_index(chain)[2], tracksio.row_index(chain))
+          tracksio.row_index(chain, ["a"] * 3)[0] != tracksio.row_index(chain, ["a"] * 3)[2], tracksio.row_index(chain, ["a"] * 3))
 
 
 def t_cue_join() -> None:
@@ -1651,12 +1745,12 @@ def t_audit7() -> None:
 
     # ---- ⑤c A/B 报表：框变了也要能对账，而且**不许把"没比"印成 0**（2026-09-20）----
     import ocr_ab_report as _ab
-    A = [{"frame": 0, "box": [0, 0, 9, 9], "text": "同", "conf": 0.9},
-         {"frame": 1, "box": [0, 0, 9, 9], "text": "变前", "conf": 0.9},
-         {"frame": 2, "box": [5, 5, 9, 9], "text": "只在 A", "conf": 0.9}]
-    B = [{"frame": 0, "box": [0, 0, 9, 9], "text": "同", "conf": 0.9},
-         {"frame": 1, "box": [0, 0, 9, 9], "text": "变后", "conf": 0.9},
-         {"frame": 3, "box": [7, 7, 9, 9], "text": "只在 B", "conf": 0.9}]
+    A = [{"t_us": 0, "box": [0, 0, 9, 9], "text": "同", "conf": 0.9},
+         {"t_us": 1, "box": [0, 0, 9, 9], "text": "变前", "conf": 0.9},
+         {"t_us": 2, "box": [5, 5, 9, 9], "text": "只在 A", "conf": 0.9}]
+    B = [{"t_us": 0, "box": [0, 0, 9, 9], "text": "同", "conf": 0.9},
+         {"t_us": 1, "box": [0, 0, 9, 9], "text": "变后", "conf": 0.9},
+         {"t_us": 3, "box": [7, 7, 9, 9], "text": "只在 B", "conf": 0.9}]
     c = _ab.compare_obs(A, B)
     check("**框序列不同也照样对账**（原来直接返回 None，汇总再把它当 0）",
           c["text_diff"] == 1 and c["cmp_rows"] == 2, c)
@@ -1665,17 +1759,17 @@ def t_audit7() -> None:
     c2 = _ab.compare_obs(A, [dict(x) for x in A])
     check("逐行相同时 identical / same_boxes 都成立、文本改 0",
           c2["identical"] and c2["same_boxes"] and c2["text_diff"] == 0)
-    c3 = _ab.compare_obs(A, [{"frame": 9, "box": [1, 1, 2, 2], "text": "x", "conf": 0.9}])
+    c3 = _ab.compare_obs(A, [{"t_us": 9, "box": [1, 1, 2, 2], "text": "x", "conf": 0.9}])
     check("**一行都配不上时 cmp_rows = 0**（分母用它，报表才不会印出假的 0%）",
           c3["cmp_rows"] == 0 and c3["text_diff"] == 0, c3)
     # ⚠ **B 臂新增的行也要数**（2026-09-20 复审第 1 条）：原来汇总只报
     # `rows_a - cmp_rows`（= A 独有），B 新出现的行一条都不出现在报表里，
     # 而它们照样会改下游。实测六段：A 独有 419、**B 独有 412**。
-    c4 = _ab.compare_obs(A[:1], A[:1] + [{"frame": 7, "box": [1, 1, 2, 2], "text": "B 新增",
+    c4 = _ab.compare_obs(A[:1], A[:1] + [{"t_us": 7, "box": [1, 1, 2, 2], "text": "B 新增",
                                           "conf": 0.9}])
     check("**只有 B 新增行时也要报出来**（only_b 不许漏）",
           c4["only_b"] == 1 and c4["only_a"] == 0 and c4["cmp_rows"] == 1, c4)
-    c5 = _ab.compare_obs(A[:1] + [{"frame": 7, "box": [1, 1, 2, 2], "text": "只在 A", "conf": 0.9}],
+    c5 = _ab.compare_obs(A[:1] + [{"t_us": 7, "box": [1, 1, 2, 2], "text": "只在 A", "conf": 0.9}],
                          A[:1])
     check("交换 A/B 之后两侧的数对称地换过来",
           c5["only_a"] == 1 and c5["only_b"] == 0, c5)
@@ -2094,13 +2188,13 @@ def t_cluster_lines() -> None:
     from flowocr.analyze import refine_boundaries as RBS
     with tempfile.TemporaryDirectory() as td:
         op = Path(td) / "o.jsonl"
-        off = {"lo": 0, "hi": 60, "last_idx": 30, "stale": True, "text": "あ"}
-        rows = [{"_meta": {"stride": 30, "src_fps": 60.0}},
-                {"frame": 30, "t_us": 500_000, "box": [0, 0, 100, 30], "text": "あ", "conf": .9, "edge": {"off": off}},
-                {"frame": 60, "t_us": 1_000_000, "box": [0, 100, 100, 130], "text": "い", "conf": .9,
-                 "edge": {"off": {**off, "last_idx": 60, "short": True, "text": "い"}}},
+        off = {"lo": 0, "hi": 1_000_000, "last_us": 500_000, "stale": True, "text": "あ"}
+        rows = [{"_meta": {"aux_clock": [60, 1, 2, 1], "src_fps": 60.0, "frame_key": "t_us"}},
+                {"t_us": 500_000, "box": [0, 0, 100, 30], "text": "あ", "conf": .9, "edge": {"off": off}},
+                {"t_us": 1_000_000, "box": [0, 100, 100, 130], "text": "い", "conf": .9,
+                 "edge": {"off": {**off, "last_us": 1_000_000, "short": True, "text": "い"}}},
                 # 换句那条路：回补把挂证据的这一行也改成了新句（行上 `う`、证据量的是旧句 `え`）——模板帧上已经是新句
-                {"frame": 30, "t_us": 500_000, "box": [0, 200, 100, 230], "text": "う", "conf": .9,
+                {"t_us": 500_000, "box": [0, 200, 100, 230], "text": "う", "conf": .9,
                  "edge": {"off": {**off, "text": "え"}}}]
         op.write_text("\n".join(_json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
         jobs = lambda: [{"run": {"t_start": 0, "t_end": 1_000_000, "box": [0, 0, 100, 30]}},   # noqa: E731

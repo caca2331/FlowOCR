@@ -1,19 +1,16 @@
-"""**采样帧和辅助帧环里的同号帧，是不是同一张画面**（2026-09-20，Codex 复审 P1 的契约测试）。
+"""**采样帧和辅助帧环里的同一个键，是不是同一张画面**（2026-09-20 Codex 复审 P1 的契约测试；frame-pts 计划改成按时间戳）。
 
-病（复审第 1 条，已复现）：`--frame-select pts` 之后主路按 PTS 选帧，采样结果却仍按
-`start_idx + n*stride` 编号；辅助路按**实际交付的第几帧**编号（`AuxReader` 推 `start_idx + k*step`）。
-流完好时两者一致；**一遇到缺口就错位**——回抠拿着"第 25 帧"的号，从环里取到的是另一张画面，
-算出来的边界是错画面上的边界，而**时间锚只能改时间标签，修不了画面对应关系**。
+病（复审第 1 条，已复现）：主路按 PTS 选帧、辅助路按"实际交付的第几帧"编号，一遇到缺口就错位——回抠拿着同一个号从环里取到的是
+另一张画面。现在两路的身份都是**这一帧自己的 pts**（`t_us`，`framegrid.frame_key`），这里核"同一个 t_us 同一张画面"。
 
-量法同 `sample_grid_check.py`：合成视频每帧一块均匀灰度（灰度 = 帧号 × 4），
-像素直接说出"这是第几帧"。走生产路径 `framesource.make_source`（带辅助流），
-辅助流推进一个只记录的假帧环。
+量法：合成视频每帧一块均匀灰度（灰度 = 20 + 帧序号 × 3），10 fps、60 帧、删掉一段帧且保留原 pts（缺口），像素直接说出"这是第几帧"，
+帧序号 × 100 ms 就是它的 t_us。走生产路径 `framesource.make_source`（带辅助流），辅助流推进一个只记录的假帧环。
 
-    python dev_tools/pyrun.py dev_tools/aux_identity_check.py
+    python dev_tools/pyrun.py dev_tools/aux_identity_check.py [--hwaccel cuda]
 
-判据：①每个采样帧的**画面帧号** == 它报的 `idx`；②环里每个键 k 的画面帧号 == k；
-③所以同号必同画面；④环里的键正好是辅助流网格上的帧、采样帧正好是采样网格上的帧（缺口里的除外）。四种情形都要过：跨缺口、非零起点、
-等距隔帧、不整除的时间网格（2026-09-24，`flowocr.extract.framegrid`）。
+判据：①每个采样帧的画面 == 它的 t_us；②环里每个键的画面 == 那个 t_us；③所以同一个键必同画面；
+④环里的键 / 采样帧正好是 Python 按时间桶（`framegrid`）在源文件的 pts 上模拟出的那一批（缺口里的源里没有）。
+几种情形都要过：跨缺口、非零起点、辅助流隔帧、采样 / 辅助帧率不整除素材帧率。
 """
 from __future__ import annotations
 
@@ -29,7 +26,7 @@ CODE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CODE / "dev_tools"))
 sys.path.insert(0, str(CODE / "src"))   # 正式包（没装 flowocr 的 venv 里也能跑）
 from flowocr.extract import framesource  # noqa: E402
-from flowocr.extract.framegrid import AuxGrid, TimeGrid  # noqa: E402
+from flowocr.extract.framegrid import AuxClock, Axis, Clock, SampleClock, Window  # noqa: E402
 from flowocr import paths  # noqa: E402
 os.chdir(paths.data_root())
 
@@ -71,76 +68,79 @@ class Recorder:
         self.got: dict[int, int | None] = {}
         self.overwrites = 0
 
-    def push(self, idx: int, frame: np.ndarray) -> None:
-        self.overwrites += idx in self.got
-        self.got[idx] = who(frame)
+    def push(self, key: int, frame: np.ndarray, cells=None) -> None:
+        self.overwrites += key in self.got
+        self.got[key] = who(frame)
 
     def close(self) -> None:
         pass
 
 
-def production_rate() -> tuple[float, float, float]:
-    """**和 run_ocr2 同一个推导**（复审第三轮：原来这里写死 10 fps，而生产代码用的是容器报的帧率——
-    这份视频的平均帧率是 8.83，按它取整辅助流会撞出 6 个重复键）。返回 (生产用的, 名义, 平均)。"""
-    import cv2
-    from flowocr.extract import ocr_parallel
-    cap = cv2.VideoCapture(str(VID))
-    avg = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    nominal = ocr_parallel.probe_rates(str(VID))[0]
-    return framesource.id_rate(nominal, avg), nominal, avg
+SRC = [i for i in range(N) if not GAP[0] <= i <= GAP[1]]
+"""源文件里有的帧（帧序号；pts = 帧序号 / 10 s）。"""
 
 
-def case(name: str, start_idx: int, grid: AuxGrid) -> int:
+def simulate(clock: AuxClock, win: Window) -> tuple[list[int], list[int]]:
+    """按时间桶在源文件的 pts 上模拟两路该选的帧（帧序号）：每格（采样桶 / 辅助桶与采样桶）的第一帧，限在窗口里。"""
+    axis = Axis((1, int(FPS)))                     # 合成视频的 start_time 是 0
+    s_want, a_want, ps, pa = [], [], None, None
+    for i in SRC:
+        sc, ac = clock.cells(i, axis)
+        if win.contains(sc):
+            if sc != ps:
+                s_want.append(i)
+            if (sc, ac) != pa:
+                a_want.append(i)
+        ps, pa = sc, (sc, ac)
+    return s_want, a_want
+
+
+def case(name: str, start: float, clock: AuxClock) -> int:
     rec = Recorder()
-    fps = production_rate()[0]
-    src = framesource.make_source(
-        str(VID), backend="ffmpeg", grid=grid.sample, start_idx=start_idx, end_idx=N,
-        src_fps=fps, width=64, height=64, pix="bgr24", hwaccel=a.hwaccel or None,
-        select_by="pts", aux={"sink": rec, "grid": grid.as_list(), "scale": 0.5})
-    samples = [(idx, who(f), t) for idx, t, f in src]
+    st = framesource.probe_stream(str(VID))
+    win = Window.of(clock.sample, start, 0)
+    src = framesource.make_source(str(VID), stream=st, window=win, width=64, height=64, pix="bgr24",
+                                  hwaccel=a.hwaccel or None, aux={"sink": rec, "clock": clock.as_list(), "scale": 0.5})
+    samples = [(f.key, who(f.image)) for f in src]
     inner = getattr(src, "inner", src)
     if inner.aux is not None:
         inner.aux.th.join(timeout=10)
-    bad_s = [(i, w) for i, w, _ in samples if w != i]
-    bad_a = [(k, w) for k, w in rec.got.items() if w != k]
-    # 同号同画面：采样帧的号在环里存在时，环里那张必须是同一帧
-    shared = [i for i, _, _ in samples if i in rec.got]
-    bad_x = [(i, rec.got[i]) for i in shared if rec.got[i] != i]
-    dup_s = len(samples) - len({i for i, _, _ in samples})
-    # 环里的键 = 网格上的帧（缺口里那几帧源里没有）
-    want = {i for i in grid.frames(start_idx, N - 1) if not GAP[0] <= i <= GAP[1]}
-    bad_g = sorted(set(rec.got) ^ want)
-    # 采样帧 = 采样网格上的帧（缺口里的除外）
-    bad_g += sorted({i for i, _, _ in samples} ^ {i for i in grid.sample.frames(start_idx, N - 1) if not GAP[0] <= i <= GAP[1]})
+    idx = lambda key: round(key / 100_000)                        # noqa: E731   t_us -> 帧序号（10 fps）
+    bad_s = [(k, w) for k, w in samples if w != idx(k)]
+    bad_a = [(k, w) for k, w in rec.got.items() if w != idx(k)]
+    shared = [k for k, _ in samples if k in rec.got]
+    bad_x = [(k, rec.got[k]) for k in shared if rec.got[k] != idx(k)]
+    dup_s = len(samples) - len({k for k, _ in samples})
+    s_want, a_want = simulate(clock, win)
+    bad_g = sorted({idx(k) for k in rec.got} ^ set(a_want)) + sorted({idx(k) for k, _ in samples} ^ set(s_want))
     ok = not (bad_s or bad_a or bad_x or dup_s or bad_g or rec.overwrites or getattr(inner.aux, "misaligned", ""))
     if bad_g:
-        print(f"      环里的键 / 采样帧和网格对不上（对称差前几个）：{bad_g[:8]}")
+        print(f"      环里的键 / 采样帧和按时间桶模拟的对不上（对称差前几个）：{bad_g[:8]}")
     if dup_s or rec.overwrites or getattr(inner.aux, "misaligned", ""):
         print(f"      采样重号 {dup_s}、帧环覆盖 {rec.overwrites}、辅路报错 {getattr(inner.aux, 'misaligned', '')!r}")
-    print(f"  {name:<28} 采样 {len(samples)} 帧（号≠画面 {len(bad_s)}）｜环 {len(rec.got)} 帧（号≠画面 {len(bad_a)}）"
-          f"｜同号 {len(shared)}（不同画面 {len(bad_x)}）  {'✅' if ok else '❌'}")
-    for lst, what in ((bad_s, "采样"), (bad_a, "环"), (bad_x, "同号")):
+    print(f"  {name:<30} 采样 {len(samples)} 帧（键≠画面 {len(bad_s)}）｜环 {len(rec.got)} 帧（键≠画面 {len(bad_a)}）"
+          f"｜同键 {len(shared)}（不同画面 {len(bad_x)}）  {'✅' if ok else '❌'}")
+    for lst, what in ((bad_s, "采样"), (bad_a, "环"), (bad_x, "同键")):
         if lst:
-            print(f"      {what}前几个（号, 画面）：{lst[:5]}")
+            print(f"      {what}前几个（t_us, 画面）：{lst[:5]}")
     return 0 if ok else 1
 
 
 def main() -> int:
     if not VID.exists():
         synth()
-    use, nominal, avg = production_rate()
+    st = framesource.probe_stream(str(VID))
     print(f"{VID}：10 fps、60 帧、删掉第 {GAP[0]}–{GAP[1]} 帧（pts 2.4 s -> 3.2 s）"
-          f"{'、硬解 ' + a.hwaccel if a.hwaccel else '、软解'}；容器报 名义 {nominal} / 平均 {avg:.6f}，"
-          f"**生产代码用 {use}**")
+          f"{'、硬解 ' + a.hwaccel if a.hwaccel else '、软解'}；容器报 名义 {st.nominal} / 平均 {float(st.avg or 0):.6f}"
+          f"（只作参考帧率 {st.ref_fps:.4g}，不决定帧的身份）")
+    s2 = SampleClock(2)
     bad = 0
-    every5 = TimeGrid.every(5)
-    bad += case("跨缺口，从 0 起", 0, AuxGrid(TimeGrid(1, 1), every5))
-    bad += case("跨缺口，非零起点（第 10 帧）", 10, AuxGrid(TimeGrid(1, 1), every5))
-    bad += case("跨缺口，辅助隔 5 帧（等距）", 0, AuxGrid(every5, every5))
-    bad += case("跨缺口，辅助不整除 2/3 + 嵌套", 0, AuxGrid(TimeGrid(2, 3), every5))
-    bad += case("跨缺口，采样不整除 2/7、辅助每帧", 0, AuxGrid(TimeGrid(1, 1), TimeGrid(2, 7)))
-    bad += case("跨缺口，采样 2/7、辅助 3/5（都不整除）", 0, AuxGrid(TimeGrid(3, 5), TimeGrid(2, 7)))
+    bad += case("跨缺口，从 0 起", 0.0, AuxClock(Clock(10), s2))
+    bad += case("跨缺口，非零起点（1.0 s）", 1.0, AuxClock(Clock(10), s2))
+    bad += case("跨缺口，辅助 2 fps（隔 5 帧）", 0.0, AuxClock(Clock(2), s2))
+    bad += case("跨缺口，辅助 20/3 fps、采样嵌套", 0.0, AuxClock(Clock("20/3"), s2))
+    bad += case("跨缺口，采样 20/7 fps、辅助每帧", 0.0, AuxClock(Clock(10), SampleClock("20/7")))
+    bad += case("跨缺口，采样 20/7、辅助 6 fps", 0.0, AuxClock(Clock(6), SampleClock("20/7")))
     return 1 if bad else 0
 
 

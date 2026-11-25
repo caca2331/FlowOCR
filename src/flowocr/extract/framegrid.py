@@ -1,265 +1,350 @@
-"""取哪些帧：**时间网格**（2026-09-24，owner：三种间隔都不要求整除，"采样帧 ⊆ 高精帧环 ⊆ 辅助流"嵌套）。
+"""取哪些帧：**按时间桶取第一帧**（frame-pts 计划，2026-11-23）。帧的身份就是它自己的 pts（`t_us`，`frame_key`），
+不再猜"帧身份用的帧率"。
 
-帧号一律是 pts 帧号 `round(t × 名义帧率)`（`framesource.id_rate`），网格锚在帧号 0 上：
+* **时间轴**（`Axis`）：`t_us` = 绝对 pts − S，S 是容器的 `format.start_time`（整数 µs）——整片跑一直以来的语义，
+  也是播放器和阶段 5 烧录用的时间轴。桶号、窗口、`-ss` 都在减过 S 的时间上；ffprobe 读的包 pts 是绝对的，
+  两边的换算只在 `Axis` 里做。素材库里 S 几乎全是 0。
 
-* `TimeGrid(p, q)`：帧率比 p/q（约分、≤ 1）的网格。第 k 格是帧 `ceil(k·q/p)`；第 i 帧在格上 ⇔ `floor(i·p/q)` 在这一帧变了。
-  floor / ceil / 前后格 / 区间里的格都是整数闭式，不逐帧循环。**p = 1 时就是原来的"每 q 帧一帧"**（`uniform`），
-  公式逐项退化成原来的整除算术——所以整除的情形和改之前逐字节相同。采样用它（`--fps`）。
-* `AuxGrid(own, sample)`：辅助流 = 自己的网格（`--aux-max-fps`）∪ 采样网格（**嵌套**：采样帧一定在辅助流里）。
-  回抠的边界锚在采样帧上（融合把首字夹在 [t_start − 一个间隔, t_start]），采样帧不在辅助流里边界就落不到它上面
-  （09-16 那次：格子没对齐、首字系统性晚 1 帧、产物校验当场拒收）。两个都等距、而且采样步长是辅助步长的倍数时，
-  并集就是自己那个网格（`uniform`），证据记录照旧只写 `step`。
+* **桶**：生效帧率 f = N/D（有理数）上，第 k 个目标点 `T_k = k / f`，锚在 0 上；一帧的桶号 `floor((t + δ) · f)`，δ = `DELTA`。
+  一帧被选中 ⇔ 它的桶号和**上一个输入帧**的不同（首帧没有上一帧，算新桶）——等价于"每个非空桶取第一帧"，
+  也就是"在目标点取该时刻及之后的第一帧、取到同一帧只留一帧"。
+* **为什么要 δ**：很多容器的 pts 被取整（yuka 1/16000 时间基按毫秒取整、gi / hsr 的 1/15360 有几十 µs 的舍入），本该正好落在目标点上的帧
+  会早零点几毫秒、被算进上一个桶。δ ≈ 1 ms 在 quick 集上和旧规则逐帧相同、0.5 ms 不够；多出的半微秒让毫秒、1/16000、1/15360、
+  1/24000、1/90000 这类时间基上最近的帧也离桶边界 0.5 µs（片段 4 有一帧正好早 1 ms）。
+* **两边同一个算法**（一致性靠构造，不靠余量）：ffmpeg 的 `select` 写 `floor((t-S+0.0010005)*N/D)`，`t = pts × av_q2d(time_base)`；
+  Python **逐位复刻这串双精度运算**（`Axis.sec` + `Clock.cell_t`），运算顺序同表达式的解析顺序。精确有理数只留在守卫里当参照。
+* `SampleClock`：采样流（`--fps`）。`AuxClock`：辅助流，自己的桶 ∪ 采样桶（两种桶的公共细分里每格取第一帧），采样帧一定在辅助流里。
 
-ffmpeg 的 `select` 表达式和 Python 用同一组整数算 floor（`N·p/q` 的分子是精确整数、商离整数至少 1/q，双精度不会判错），
-两边选出来的帧一致（守卫在 6 小时帧号内抽查）。**纯函数，守卫直接测。**
+**纯函数，守卫直接测。**
 """
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from fractions import Fraction
 
+DELTA = "0.0010005"
+"""桶号里的 δ（秒）：写进 ffmpeg 表达式的字面，Python 侧 `float(DELTA)` 是同一个双精度数。"""
+DELTA_US = 1000.5
+"""同一个 δ（微秒），写进 `_meta.cell_tol_us`。"""
+_DELTA = float(DELTA)
+
 FPS_DEN = 10_000
-"""帧率换成有理数时分母的上限：59.94（60000/1001）、23.976（24000/1001）这类名义帧率都精确落得下。"""
+"""浮点帧率换成有理数时分母的上限：59.94（60000/1001）、23.976（24000/1001）这类都精确落得下。"""
 CAP_TOL = 1e-3
-"""辅助流上限落到整数步长的容差（相对）：60.0000x 这类名义帧率不算超（同时间网格之前的步长判据）。"""
+"""辅助流上限落到"名义帧率 / k"的容差（相对）：60.0000x 这类名义帧率不算超。"""
 SNAP_DEN = 100
 SNAP_REL = 1e-5
-"""两个帧率之比离一个**分母 ≤ `SNAP_DEN` 的简单分数**不到 `SNAP_REL`（相对）就吸附上去（2026-09-24 审计）。
-为什么：用户敲的是 `29.97` / `59.94`，素材的名义帧率是 30000/1001 / 60000/1001——两边各自有理数化之后比值是 999999/2000000，
-离 1/2 只差 1e-6，却被当成真不整除（不等距网格、`--fps 59.94` 直接报错、辅助流每 4.6 h 静默少一帧）。
-1e-5 的相对误差 6 小时累计 0.2 s；真不整除的（59.94 上 2 fps 是 1001/30000，离 1/30 差 1e-3）不受影响。"""
+"""`--fps` 和名义帧率之比离一个**分母 ≤ `SNAP_DEN` 的简单分数**不到 `SNAP_REL`（相对）就吸附成"名义帧率 × 那个分数"（2026-09-24 审计）。
+为什么：用户敲的是 `29.97` / `59.94`，素材的名义帧率是 30000/1001 / 60000/1001——比值 999999/1000000 离 1 只差 1e-6，
+不吸附的话目标点每 4.6 h 和帧错开一帧。真不整除的（59.94 上 2 fps，比值离 1/30 差 1e-3）不受影响。"""
 
 
-class TimeGrid:
-    __slots__ = ("p", "q")
+def rate_of(x) -> Fraction | None:
+    """帧率 -> 有理数：ffprobe 的 `60000/1001` 串原样精确取；浮点数按 `FPS_DEN` 取最近的分数；0 / 空 / `0/0` 给 None。"""
+    if x is None or x == "":
+        return None
+    if isinstance(x, Fraction):
+        return x if x > 0 else None
+    if isinstance(x, str):
+        try:
+            num, den = (x.split("/") + ["1"])[:2]
+            f = Fraction(int(num), int(den))
+        except (ValueError, ZeroDivisionError):
+            return None
+        return f if f > 0 else None
+    f = Fraction(float(x)).limit_denominator(FPS_DEN)
+    return f if f > 0 else None
 
-    def __init__(self, p: int, q: int) -> None:
-        if p < 1 or q < 1:
-            raise ValueError(f"网格的帧率比要为正：{p}/{q}")
-        f = min(Fraction(p, q), Fraction(1))
-        self.p, self.q = f.numerator, f.denominator
 
-    @classmethod
-    def for_rate(cls, src_fps: float, fps: float) -> "TimeGrid":
-        """素材 `src_fps` 上取 `fps` 帧 / 秒（比素材还高就是每帧都要）。"""
-        if src_fps <= 0 or fps <= 0:
-            raise ValueError(f"帧率要为正：素材 {src_fps} / 要的 {fps}")
-        r = Fraction(fps).limit_denominator(FPS_DEN) / Fraction(src_fps).limit_denominator(FPS_DEN)
-        s = r.limit_denominator(SNAP_DEN)
-        if abs(s - r) <= SNAP_REL * r:
-            r = s
-        return cls(r.numerator, r.denominator)
+def tb_of(x) -> tuple[int, int]:
+    """时间基 -> `(num, den)`：`1/15360` 串或二元组。"""
+    if isinstance(x, str):
+        a, b = x.split("/")
+        return int(a), int(b)
+    return int(x[0]), int(x[1])
 
-    @classmethod
-    def every(cls, step: int) -> "TimeGrid":
-        """每 `step` 帧一帧（探针 / 旧产物的整数步长）。"""
-        return cls(1, max(1, int(step)))
+
+def frame_key(pts_time, origin_us: int = 0) -> int:
+    """帧身份：`round(pts_time × 1e6) − origin_us`（整数微秒）。**唯一换算处**：帧环的键、证据里的时刻、obs 行都用它。
+    showinfo 打的是绝对时刻，取帧层经 `Axis.key` 减 S；已经是相对时刻的（`PtsClock` 收的 `Frame.t`）不用给 `origin_us`。"""
+    return int(round(float(pts_time) * 1_000_000)) - origin_us
+
+
+@dataclass(frozen=True)
+class Axis:
+    """一路视频流的时间轴：时间基 `tb` + 原点 S（`origin_us`，容器的 `format.start_time`，整数 µs）。
+    **绝对 pts 和相对时刻（`t_us`、桶、窗口用的那把尺）之间的换算只在这里做**：
+    ffprobe 读的包 pts、showinfo 的 `pts:` / `pts_time` 都是绝对的（取帧层一律 `-copyts`），`sec` / `key` 减 S，`abs_sec` 加回去。"""
+    tb: tuple[int, int]
+    origin_us: int = 0
 
     @property
-    def uniform(self) -> bool:
-        return self.p == 1
+    def origin_sec(self) -> float:
+        return self.origin_us / 1_000_000
+
+    def pts_abs(self, pts: int) -> float:
+        """整数 pts -> 绝对秒，逐位同 ffmpeg 的 `t`：`(double)pts × av_q2d(tb)`，`av_q2d = num / (double)den`。"""
+        return float(pts) * (self.tb[0] / self.tb[1])
+
+    def sec(self, pts: int) -> float:
+        """整数 pts -> 相对秒，**逐位同 ffmpeg 表达式里的 `t-S`**（`t_expr`）：S 写成 `整数/1000000`，两边是同一个双精度数；
+        `t-S` 在 ffmpeg 里解析成 `t + (−S)`，和这里的减法逐位相同。"""
+        return self.pts_abs(pts) - self.origin_sec
+
+    def abs_sec(self, rel: float) -> float:
+        """相对秒 -> 绝对秒（给 ffprobe 的 `-read_intervals`：它不按 `start_time` 平移）。"""
+        return rel + self.origin_sec
+
+    def key(self, pts_time) -> int:
+        """showinfo 的绝对 `pts_time` -> 帧身份 `t_us`（减 S）。"""
+        return frame_key(pts_time, self.origin_us)
+
+    def t_expr(self, var: str = "t") -> str:
+        """ffmpeg 表达式里的相对时刻：S = 0 时就是 `var`，否则 `(var-S)`（S 写成整数 µs / 1000000）。"""
+        o = self.origin_us
+        if o == 0:
+            return var
+        return f"({var}{'-' if o > 0 else '+'}{abs(o)}/1000000)"
+
+
+class Clock:
+    """一种桶：生效帧率 `N/D`。"""
+    __slots__ = ("n", "d")
+
+    def __init__(self, rate) -> None:
+        f = rate_of(rate)
+        if f is None:
+            raise ValueError(f"桶的帧率要为正：{rate!r}")
+        self.n, self.d = f.numerator, f.denominator
 
     @property
-    def step(self) -> int | None:
-        """等距时的步长；不等距是 None。"""
-        return self.q if self.p == 1 else None
+    def rate(self) -> Fraction:
+        return Fraction(self.n, self.d)
 
     @property
-    def max_gap(self) -> int:
-        """相邻两格最多隔几帧（等距就是步长）。"""
-        return -(-self.q // self.p)
+    def fps(self) -> float:
+        return self.n / self.d
 
-    def fps(self, src_fps: float) -> float:
-        return src_fps * self.p / self.q
-
-    def interval_us(self, src_fps: float) -> float:
-        """名义间隔（微秒）。不等距时实际间隔在它上下差不到一帧。"""
-        return 1e6 * self.q / (self.p * src_fps)
+    @property
+    def interval_us(self) -> float:
+        """名义间隔（微秒）。"""
+        return 1e6 * self.d / self.n
 
     def as_list(self) -> list[int]:
-        return [self.p, self.q]
+        return [self.n, self.d]
 
-    # ---------- 选帧（整数闭式）----------
-    def at(self, k: int) -> int:
-        """第 k 格的帧号 `ceil(k·q/p)`。"""
-        return -(-k * self.q // self.p)
+    # ---------- 桶号（Python 逐位复刻 ffmpeg）----------
+    def cell_t(self, t: float) -> int:
+        """相对秒 -> 桶号：`floor(((t + δ) * N) / D)`，和 ffmpeg 表达式 `floor((t-S+0.0010005)*N/D)` 同一串双精度运算（`t` 已减过 S）。"""
+        return math.floor(((t + _DELTA) * self.n) / self.d)
 
-    def index(self, i: int) -> int:
-        """不大于 i 的最近一格是第几格（`floor(i·p/q)`）。"""
-        return i * self.p // self.q
+    def cell(self, pts: int, axis: Axis) -> int:
+        """整数 pts（绝对，`axis` 的时间基）-> 桶号。"""
+        return self.cell_t(axis.sec(pts))
 
-    def member(self, i: int) -> bool:
-        return self.at(self.index(i)) == i
+    def cell_exact(self, pts: int, axis: Axis) -> int:
+        """同一个桶号的**精确有理数**版本（守卫里当参照；不在生产路径上用）。"""
+        t = Fraction(pts * axis.tb[0], axis.tb[1]) - Fraction(axis.origin_us, 1_000_000)
+        return math.floor((t + Fraction(DELTA)) * self.rate)
 
-    def floor(self, i: int) -> int:
-        return self.at(self.index(i))
+    def expr(self, t: str = "t") -> str:
+        """ffmpeg 表达式：相对时刻 `t`（`Axis.t_expr` 给的）的桶号（逗号不用转义：里面没有）。"""
+        return f"floor(({t}+{DELTA})*{self.n}/{self.d})"
 
-    def ceil(self, i: int) -> int:
-        return self.at(self.index(i - 1) + 1)
+    def changed(self, axis: Axis) -> str:
+        """ffmpeg 表达式：这一帧的桶号和上一个输入帧（`prev_t`）的不同。首帧 `prev_t` 是 NaN、`eq` 为假，按新桶选中。"""
+        return rf"not(eq({self.expr(axis.t_expr('t'))}\,{self.expr(axis.t_expr('prev_t'))}))"
 
-    def prev(self, i: int) -> int:
-        """严格小于 i 的最近一格。"""
-        return self.floor(i - 1)
+    # ---------- 目标点 ----------
+    def start_sec(self, k: int) -> Fraction:
+        """第 k 个目标点 `T_k = k / f`（精确秒）。桶 k 是 `[T_k − δ, T_{k+1} − δ)`。"""
+        return Fraction(k * self.d, self.n)
 
-    def next(self, i: int) -> int:
-        """严格大于 i 的最近一格。"""
-        return self.at(self.index(i) + 1)
+    def cell_start(self, k: int) -> float:
+        """桶 k 的起点（秒）：`T_k − δ`。"""
+        return float(self.start_sec(k)) - _DELTA
 
-    def nearest(self, x: float) -> int:
-        """离帧号 x（可以是小数）最近的一格（按**帧距**；一样近取前一格）——窗口起点对齐用。
-        等距时就是原来的 `round(x / q) * q`（逐位保留，含 Python 的银行家舍入）。
-        不等距时不能按格号四舍五入：60 fps 上 2.2 fps 的前两格是 0 / 28，x = 13.7 的格号 0.502 会舍到 28，而 0 更近（2026-09-24 Codex 审计）。"""
-        if self.p == 1:
-            return self.at(round(x / self.q))
-        lo = self.floor(int(x // 1))
-        hi = self.next(lo)
-        return lo if x - lo <= hi - x else hi
+    def start_us(self, k: int) -> int:
+        """第 k 个目标点（整数微秒，四舍五入）。"""
+        return round(self.start_sec(k) * 1_000_000)
 
-    def frames(self, lo: int, hi: int) -> list[int]:
-        """[lo, hi] 里的格（升序）。"""
-        if hi < lo:
-            return []
-        if self.p == 1:
-            q = self.q
-            return list(range(lo + (-lo) % q, hi + 1, q))
-        return [self.at(k) for k in range(self.index(lo - 1) + 1, self.index(hi) + 1)]
-
-    def n_frames(self, lo: int, hi_excl: int) -> int:
-        """[lo, hi_excl) 里最多交付几格（ffmpeg 的 `-frames:v`）。等距的照旧是 `ceil((hi − lo) / q)`（起点对齐时就是精确数）。"""
-        if self.p == 1:
-            return max(1, -(-(hi_excl - lo) // self.q))
-        return max(1, self.index(hi_excl - 1) - self.index(lo - 1))
-
-    def cond(self, n: str) -> str:
-        """ffmpeg 表达式：帧号表达式 `n` 在格上（逗号已转义）。"""
-        if self.p == 1:
-            return rf"not(mod({n}\,{self.q}))"
-        return rf"not(eq(floor({n}*{self.p}/{self.q})\,floor(({n}-1)*{self.p}/{self.q})))"
-
-    def select(self, n: str) -> str:
-        """`select` 的条件；空串 = 每帧都要。等距时和加时间网格之前逐字相同。"""
-        return "" if self.p == 1 and self.q == 1 else self.cond(n)
-
-    def describe(self, src_fps: float) -> str:
-        if self.p == 1:
-            return "每帧一帧" if self.q == 1 else f"每 {self.q} 帧一帧"
-        return f"按时间网格 {self.fps(src_fps):.3f} fps（{self.p}/{self.q}）"
+    def nearest(self, sec: float) -> int:
+        """离 `sec` 秒最近的目标点的桶号（窗口起止吸附用）。"""
+        return round(Fraction(sec) * self.rate)
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, TimeGrid) and (self.p, self.q) == (other.p, other.q)
+        return isinstance(other, Clock) and type(other) is type(self) and (self.n, self.d) == (other.n, other.d)
 
     def __hash__(self) -> int:
-        return hash((self.p, self.q))
+        return hash((type(self).__name__, self.n, self.d))
 
     def __repr__(self) -> str:
-        return f"TimeGrid({self.p}/{self.q})"
+        return f"{type(self).__name__}({self.n}/{self.d})"
 
 
-def meta_stride(meta: dict) -> int:
-    """obs `_meta` 里的**等距**采样步长。只认等距采样的探针（按"每 stride 帧一帧"数帧号的那几个）用它：
-    时间网格上不等距的产物没有 `stride`，直接 `meta["stride"]` 是一个看不出原因的 KeyError（2026-09-24 审计）。"""
-    s = meta.get("stride")
-    if not s:
-        raise ValueError(f"这份 obs 的采样不等距（`_meta.sample_grid` = {meta.get('sample_grid')}），这个探针只认等距采样"
-                         f"（每 stride 帧一帧）；用整除素材帧率的 --fps 重跑一份")
-    return int(s)
+class SampleClock(Clock):
+    """采样流的桶（`--fps`）。"""
+    __slots__ = ()
+
+    @classmethod
+    def for_rate(cls, nominal, fps: float) -> "SampleClock":
+        """生效采样帧率：就是 `--fps`；它和名义帧率之比离一个简单分数不到 `SNAP_REL` 时吸附成"名义帧率 × 那个分数"。
+        名义帧率在这里只决定目标点的间距，报错了也不会撞号。"""
+        want = rate_of(fps)
+        if want is None:
+            raise ValueError(f"采样帧率要为正：{fps!r}")
+        nom = rate_of(nominal)
+        if nom is not None:
+            r = want / nom
+            s = r.limit_denominator(SNAP_DEN)
+            if abs(s - r) <= SNAP_REL * r:
+                want = nom * s
+        return cls(want)
+
+    def describe(self) -> str:
+        return f"按时间桶 {self.fps:.4g} fps（{self.n}/{self.d}）"
 
 
-class AuxGrid:
-    """辅助流：自己的网格 ∪ 采样网格（嵌套）。"""
+class AuxClock:
+    """辅助流：自己的桶 ∪ 采样桶。一帧入选 ⇔ 辅助桶换了**或**采样桶换了（两种桶的公共细分里每格取第一帧），采样帧一定在里面。"""
     __slots__ = ("own", "sample")
 
-    def __init__(self, own: TimeGrid, sample: TimeGrid) -> None:
-        self.own, self.sample = own, sample
+    def __init__(self, own: Clock, sample: SampleClock) -> None:
+        self.own = own if isinstance(own, Clock) else Clock(own)
+        self.sample = sample
 
     @classmethod
-    def for_video(cls, src_fps: float, aux_max_fps: float, sample: TimeGrid) -> "AuxGrid":
-        """辅助流帧率 = min(上限, 素材帧率)。上限**不超过它 `CAP_TOL`** 就落得到某个整数步长（素材帧率 / k）时取那个步长：
-        它是上限、不是目标值——119.88 fps 的素材给 60 就该隔帧（59.94 fps），不该为多出的 0.1% 走不等距网格（2026-09-24 Fable 复审）。"""
-        k = max(1, round(src_fps / aux_max_fps))
-        if src_fps / k <= aux_max_fps * (1 + CAP_TOL):
-            return cls(TimeGrid.every(k), sample)
-        return cls(TimeGrid.for_rate(src_fps, aux_max_fps), sample)
+    def for_video(cls, nominal, cap: float, sample: SampleClock) -> "AuxClock":
+        """辅助帧率 = 名义帧率 / k（k = max(1, round(名义 / 上限))），结果不超过上限的 `CAP_TOL` 时；否则就是上限本身。
+        名义帧率 ≤ 上限时 k = 1：CFR 素材上每帧都要；119.88 fps 给 60 就是隔帧。名义帧率不可信的素材也一样按名义 / k
+        （owner 2026-11-23 暂按建议：时间基推出来的 `1000/1` 这类会丢约 2% 辅助帧，素材库里没有这种文件）。"""
+        nom = rate_of(nominal)
+        top = rate_of(cap)
+        if top is None:
+            raise ValueError(f"辅助流的帧率上限要为正：{cap!r}")
+        if nom is not None:
+            k = max(1, round(nom / top))
+            if nom / k <= top * (1 + Fraction(CAP_TOL)):
+                return cls(Clock(nom / k), sample)
+        return cls(Clock(top), sample)
 
     @classmethod
-    def from_list(cls, g: list[int]) -> "AuxGrid":
-        """`as_list()` 的逆：`[p, q, 采样 p, 采样 q]`（跨进程 / 进 `_meta` / 证据记录的写法）。"""
-        return cls(TimeGrid(g[0], g[1]), TimeGrid(g[2], g[3]))
-
-    @classmethod
-    def from_spec(cls, rec: dict) -> "AuxGrid":
-        """证据记录里的写法 -> 网格：`grid` 或等距的 `step`（等距时并集就是自己的网格，采样网格取它自己）。"""
-        if rec.get("grid"):
-            return cls.from_list(rec["grid"])
-        g = TimeGrid.every(rec.get("step") or 1)
-        return cls(g, g)
+    def from_list(cls, g: list[int]) -> "AuxClock":
+        """`as_list()` 的逆：`[N, D, 采样 N, 采样 D]`（跨进程 / 进 `_meta` 的写法）。"""
+        return cls(Clock(Fraction(g[0], g[1])), SampleClock(Fraction(g[2], g[3])))
 
     def as_list(self) -> list[int]:
         return self.own.as_list() + self.sample.as_list()
 
     @property
-    def uniform(self) -> bool:
-        """并集退化成自己那个等距网格：自己每帧都要（什么都盖得住），或两个都等距、采样步长是辅助步长的倍数。"""
-        return self.own.p == 1 and (self.own.q == 1 or (self.sample.p == 1 and self.sample.q % self.own.q == 0))
+    def fps(self) -> float:
+        return self.own.fps
 
-    @property
-    def step(self) -> int | None:
-        return self.own.q if self.uniform else None
+    def cells(self, pts: int, axis: Axis) -> tuple[int, int]:
+        """`(采样桶号, 辅助桶号)`，Python 逐位复刻 ffmpeg。"""
+        t = axis.sec(pts)
+        return self.sample.cell_t(t), self.own.cell_t(t)
 
-    def key(self) -> tuple:
-        """复用判据比的规范形。等距的并集按步长比；不等距的按两个网格比——**帧集合相同、写法不同的偶尔会不相等**
-        （如 2/3 ∪ 1/3 和 2/3 ∪ 2/3），后果只是多重建一次，不会把不同的帧集合判成相同（2026-09-24 审计把原来"帧集合相同就相等"改准）。"""
-        return ("step", self.own.q) if self.uniform else tuple(self.as_list())
+    def changed(self, axis: Axis) -> str:
+        """ffmpeg 表达式：辅助桶或采样桶和上一个输入帧的不同。"""
+        o, s, t, p = self.own, self.sample, axis.t_expr("t"), axis.t_expr("prev_t")
+        return rf"not(eq({o.expr(t)}\,{o.expr(p)})*eq({s.expr(t)}\,{s.expr(p)}))"
 
-    def spec(self) -> dict:
-        """写进证据记录的样子：等距的照旧只写 `step`（和旧产物逐字节相同），不等距的写 `grid`。"""
-        return {"step": self.own.q} if self.uniform else {"grid": self.as_list()}
+    def targets_us(self, lo: int, hi: int) -> list[int]:
+        """`[lo, hi]`（微秒）里辅助流的**目标点**（辅助桶与采样桶的 `T_k`，整数微秒、升序去重）。
+        阶段 2 结算首字 / 全字时把候选时刻吸附到这上面（证据里不存每帧的真实时刻，见 `edge_refine.sig_from_records`）。"""
+        out: set[int] = set()
+        for c in (self.own, self.sample):
+            k = max(0, math.floor(Fraction(lo, 1_000_000) * c.rate) - 1)     # 往前多退一格，下面按 [lo, hi] 筛
+            while True:
+                t = c.start_us(k)
+                if t > hi:
+                    break
+                if t >= lo:
+                    out.add(t)
+                k += 1
+        return sorted(out)
 
-    def member(self, i: int) -> bool:
-        return self.own.member(i) or self.sample.member(i)
-
-    def floor(self, i: int) -> int:
-        return self.own.floor(i) if self.uniform else max(self.own.floor(i), self.sample.floor(i))
-
-    def ceil(self, i: int) -> int:
-        return self.own.ceil(i) if self.uniform else min(self.own.ceil(i), self.sample.ceil(i))
-
-    def prev(self, i: int) -> int:
-        return self.floor(i - 1)
-
-    def frames(self, lo: int, hi: int) -> list[int]:
-        if self.uniform:
-            return self.own.frames(lo, hi)
-        return sorted(set(self.own.frames(lo, hi)) | set(self.sample.frames(lo, hi)))
-
-    def n_frames(self, lo: int, hi_excl: int) -> int:
-        """[lo, hi_excl) 里辅路最多交付几帧（`-frames:v`、`AuxReader` 读几帧）。"""
-        if self.uniform:
-            return self.own.n_frames(lo, hi_excl)
-        return max(1, len(self.frames(lo, hi_excl - 1)))
-
-    def cover_floor(self, last_idx: int) -> int:
-        """辅助流交付到的最后一帧至少要到这里，才算盖住了采样流的最后一帧（判"辅助流半路断了"）。
-        等距的照旧留 `q − 1` 帧余量；不等距的：采样帧一定在辅助流里（嵌套），要盖到不大于它的最近一个入选帧。"""
-        if self.uniform:
-            return last_idx - (self.own.q - 1)
-        return self.floor(last_idx)
-
-    def select(self, n: str) -> str:
-        """ffmpeg `select` 的条件；空串 = 每帧都要。等距时和加时间网格之前逐字相同。"""
-        if self.uniform:
-            return self.own.select(n)
-        return f"({self.sample.cond(n)}+{self.own.cond(n)})"
-
-    def describe(self, src_fps: float) -> str:
-        if self.uniform:
-            return self.own.describe(src_fps)
-        return f"按时间网格 {self.own.fps(src_fps):.3f} fps（{self.own.p}/{self.own.q}，含采样帧）"
+    def describe(self) -> str:
+        return f"按时间桶 {self.own.fps:.4g} fps（{self.own.n}/{self.own.d}，含采样帧）"
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, AuxGrid) and self.key() == other.key()
+        return isinstance(other, AuxClock) and (self.own.n, self.own.d, self.sample) == (other.own.n, other.own.d, other.sample)
 
     def __hash__(self) -> int:
-        return hash(self.key())
+        return hash((self.own.n, self.own.d, self.sample))
 
     def __repr__(self) -> str:
-        return f"AuxGrid({self.own} ∪ 采样 {self.sample})"
+        return f"AuxClock({self.own.n}/{self.own.d} ∪ 采样 {self.sample.n}/{self.sample.d})"
+
+
+class Window:
+    """窗口 = 整桶的并集 `[a, b)`（采样桶号）；`b = None` 不设上限、读到文件尾。`--start` / `--end` 吸附到最近的目标点。"""
+    __slots__ = ("clock", "a", "b")
+
+    def __init__(self, clock: SampleClock, a: int, b: int | None) -> None:
+        if a < 0 or (b is not None and b <= a):
+            raise ValueError(f"窗口是空的：桶 [{a}, {b})")
+        self.clock, self.a, self.b = clock, a, b
+
+    # 按值比：广播解码的 hub 拿各组经连接 pickle 过来的取帧参数（含 Window）互相比，按身份比会让 2 组以上必然判"不一致"
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Window) and (self.clock, self.a, self.b) == (other.clock, other.a, other.b)
+
+    def __hash__(self) -> int:
+        return hash((self.clock, self.a, self.b))
+
+    @classmethod
+    def of(cls, clock: SampleClock, start: float, end: float) -> "Window":
+        a = clock.nearest(max(0.0, start))
+        b = clock.nearest(end) if end > 0 else None
+        if b is not None and b <= a:
+            raise ValueError(f"--start {start:g} / --end {end:g} 吸附到目标点之后是空窗口（桶 [{a}, {b})）")
+        return cls(clock, a, b)
+
+    @property
+    def start_sec(self) -> float:
+        return float(self.clock.start_sec(self.a))
+
+    @property
+    def end_sec(self) -> float | None:
+        return None if self.b is None else float(self.clock.start_sec(self.b))
+
+    @property
+    def start_us(self) -> int:
+        return self.clock.start_us(self.a)
+
+    def seek_sec(self) -> float:
+        """精确 seek 落在 `T_a − δ − 1 ms`（起点之前；≤ 0 时从文件头读）。起点就是桶边界，窗口里第一个落进范围的帧一定是它那个桶的第一帧：
+        它的上一帧早于边界，要么被精确 seek 剪掉（select 把这一帧当首帧、算新桶），要么在多退的那 1 ms 里、进了 select 但被范围挡掉。"""
+        s = float(self.clock.start_sec(self.a)) - _DELTA - 0.001
+        return s if s > 0 else 0.0
+
+    def read_sec(self, seek: float, pad: float = 1.0) -> float | None:
+        """输入端 `-t`：从 seek 点读到 `T_b − δ` 所需的时长 + `pad` 秒；不设上限时 None。"""
+        if self.b is None:
+            return None
+        return max(0.0, float(self.clock.start_sec(self.b)) - _DELTA - seek) + pad
+
+    def contains(self, cell: int) -> bool:
+        return cell >= self.a and (self.b is None or cell < self.b)
+
+    def span_us(self, k: int) -> int:
+        """从窗口起点到桶 k 起点的时长（微秒）。"""
+        return self.clock.start_us(k) - self.clock.start_us(self.a)
+
+    def split(self, n: int, b_est: int) -> list[int]:
+        """`--workers N` 的切点：`[a, b)` 按桶号等分成 n 段，返回 n−1 个内部切点桶号（严格递增）。`b = None` 时按 `b_est`（容器时长）切。
+        段太短切不开时抛。"""
+        if n < 2:
+            return []
+        b = self.b if self.b is not None else b_est
+        cuts = [self.a + round((b - self.a) * k / n) for k in range(1, n)]
+        pts = [self.a, *cuts, b]
+        if any(y <= x for x, y in zip(pts, pts[1:])):
+            raise ValueError(f"窗口太短，切不成 {n} 段：桶 {pts}")
+        return cuts
+
+    def __repr__(self) -> str:
+        return f"Window({self.clock!r}, [{self.a}, {self.b}))"

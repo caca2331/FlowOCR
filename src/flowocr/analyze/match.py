@@ -63,11 +63,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--opt", action="append", default=[], metavar="K=V", help="给匹配器的选项，可多次")
     a = ap.parse_args(argv)
 
+    ctx, opts = kv(a.ctx, "--ctx"), kv(a.opt, "--opt")
+    matcher = extensions.load(a.matcher, "matcher")
+    extensions.warn_unknown_keys(matcher, a.matcher, "--ctx", ctx)
+    extensions.warn_unknown_keys(matcher, a.matcher, "--opt", opts)
     src = Path(a.tracks)
     doc = tracksio.load(src)
-    context = context_of(doc, src, list(sys.argv[1:] if argv is None else argv), kv(a.ctx, "--ctx"), a.matcher)
-    matcher = extensions.load(a.matcher, "matcher")
-    out_doc = matcher.match(doc, context, kv(a.opt, "--opt"))
+    context = context_of(doc, src, list(sys.argv[1:] if argv is None else argv), ctx, a.matcher)
+    out_doc = matcher.match(doc, context, opts)
     if not isinstance(out_doc, dict):
         raise SystemExit(f"匹配器 `{a.matcher}` 的 match() 要返回 dict，给的是 {type(out_doc).__name__}")
     rec = extensions.recommendation(matcher, a.matcher)

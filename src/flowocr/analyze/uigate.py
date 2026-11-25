@@ -12,11 +12,14 @@ obs 的一行是一个 Item（t0 = t1 = t_us），`tracks.json` 的一条 run �
 """
 from __future__ import annotations
 
+import re
 import statistics as st
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 
-from flowocr.artifacts import evalkit
+from flowocr.artifacts import evalkit, textdir
 
 NP_DY = (-6.0, -1.0)
 """名牌相对**它那条正文带**的位置窗（单位：带的字高，负数 = 在带上方）。
@@ -146,6 +149,52 @@ def occupancy(items: list[Item], step_us: int) -> int:
                merge_intervals([(it.t0, it.t1 if it.t1 > it.t0 else it.t0 + step_us) for it in items]))
 
 
+TOP_SHARE = 0.3
+"""静态 UI 的框位里"同一句"（`top_line_items`）至少占框位在屏时长的多少（`measure` 的 `top_share`，`build_tracks --ui-fp-top`）。
+2026-11-23 量（evidence 12 段 + 竖排 8 段，判成框位 UI 的 49 个框位，竖排计划的计数脚本关掉这道门重建后量）：
+竖排素材的提问框 0.072，其次是竖排素材左上的段落标题 0.39（照旧判成 UI），横排素材的静态 UI 最低是 yuka 的 `Dummy` 0.54、其次 zzz 的 `>>` 0.66。"""
+
+TOP_SIM = 0.8
+"""两句算"同一句"的相似度下限（数字折成 0 之后的 difflib ratio）。同一个标签 OCR 读出好几种写法（yuka `Dummy` / `Duininy` / `Duminy`…，
+只按原文算最常见那句只占 0.21）、分数在变（wuwa `スコア：1000` / `スコア：4800`，0.25），都还是同一句；轮着换的提问框各句互相不像。
+取 0.8 不取更低：同一个句式换两个字的提问（`Q・好きな映画は？` / `Q・好きな音楽は？`，0.78）要算不同的句；0.8 时 `Dummy` 那个框位 0.54，仍远过 `TOP_SHARE`。
+⚠ 句子更长、只换一两个字的轮换提问（12 字换 2 字约 0.83）仍会被当成同一句、整个框位判成静态 UI。"""
+
+
+def _fold(text: str) -> str:
+    """比"同一句"用：NFKC、去空白、数字折成 0。"""
+    return re.sub(r"\d", "0", "".join(unicodedata.normalize("NFKC", text).split()))
+
+
+TOP_ANCHORS = 5
+"""拿在屏最久的前几句各当一次"那一句"，取罩住最多的：OCR 读法在抖时最常见的那种写法未必和别的写法都像
+（yuka `Dummy` 对 `Duininy` 只有 0.5，`Duminy` 和两边都过 0.6）。"""
+
+
+def top_line_items(items: list[Item], step_us: int) -> list[Item]:
+    """框位里"同一句"的全部条目：数字折成 0 后按句分组，在屏最久的前 `TOP_ANCHORS` 句各当一次那一句，
+    连同和它相似度 ≥ `TOP_SIM` 的句子，取在屏时长（区间并集）最长的一组。"""
+    by: dict[str, list[Item]] = {}
+    for it in items:
+        by.setdefault(_fold(it.text), []).append(it)
+    occ = {t: occupancy(v, step_us) for t, v in by.items()}
+    best: list[Item] = []
+    best_us = -1
+    sm = SequenceMatcher(None)
+    for a in sorted(by, key=lambda t: -occ[t])[:TOP_ANCHORS]:
+        sm.set_seq2(a)                 # difflib 给 seq2 建索引，锚句放这边只建一次；先过两道便宜的上界（台词带上几千句）
+
+        def similar(t: str) -> bool:
+            sm.set_seq1(t)
+            return sm.real_quick_ratio() >= TOP_SIM and sm.quick_ratio() >= TOP_SIM and sm.ratio() >= TOP_SIM
+
+        group = [it for t, v in by.items() if t == a or similar(t) for it in v]
+        us = occupancy(group, step_us)
+        if us > best_us:
+            best, best_us = group, us
+    return best
+
+
 def measure(f: Footprint, span_us: int, step_us: int) -> dict:
     """一个框位的物理量。**分母是时间，不是 cue**——读法变了它也不动。
 
@@ -155,7 +204,9 @@ def measure(f: Footprint, span_us: int, step_us: int) -> dict:
     texts = [it.text for it in f.items]
     dur = occupancy(f.items, step_us)
     digs = [sum(c.isdigit() for c in t) / max(1, len(t.strip())) for t in texts if t.strip()]
-    ws = [it.box[2] - it.box[0] for it in f.items]
+    # "框宽" 是顺着行的长度（随文本变）：竖排的一列（`textdir.vertical`）量高，按宽量的话列宽恒定、换了台词也像常驻 UI
+    # （2026-11-23 竖排素材片段 4：右侧竖排提问框每题十秒、整片同一处，被当成静态 UI 剔掉）
+    ws = [(it.box[3] - it.box[1]) if textdir.vertical(it.box, it.text) else (it.box[2] - it.box[0]) for it in f.items]
     return {
         "share": dur / max(1, span_us),
         "wvar": (st.pstdev(ws) / max(1, st.median(ws))) if len(ws) > 1 else 0.0,
@@ -164,6 +215,9 @@ def measure(f: Footprint, span_us: int, step_us: int) -> dict:
         "clen": st.median([evalkit.content_len(t) for t in texts]) if texts else 0.0,
         "dig": st.median(digs) if digs else 0.0,
         "top": max(set(texts), key=texts.count) if texts else "",
+        # **"同一句"占框位在屏时长的比例**（区间并集比区间并集；数字折成 0、近似的算同一句，`top_line_items`）：静态 UI 是同一句一直在（`Auto`、`UID: …`、读法在抖的标签、在变的分数）；
+        # 同一处轮着换的说明字（竖排素材的提问框每题停十秒，翻动 0.05 混过了 `churn`）这里很低。见 `TOP_SHARE`
+        "top_share": (occupancy(top_line_items(f.items, step_us), step_us) / max(1, dur)) if texts else 0.0,
         # **覆盖率**：属于"重复出现过的文本"的条目占比。名牌就十来个名字轮着出（高），
         # 弹幕 / OCR 噪声一次一个样（低）。⚠ 别写成"重复种数 / 条数"——那是**反的**
         # （台词几乎不重复、分子≈0，会把台词全放行；ui-gate 计划那次已经栽过）。

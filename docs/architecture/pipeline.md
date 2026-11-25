@@ -20,15 +20,15 @@ obs 没有证据就用默认设置重跑 (1)。
 | 环节 | 做法 |
 | --- | --- |
 | 进程 | 监督者起一个 worker（`--workers 1`）；worker 里是管线进程 + 只解码进程（分片）+ 回抠进程 + 一个 ORT 推理服务（det 和 rec 同一个服务）。硬解中途交付错时整棵树收尾、退回软解重跑那一趟（[帧身份与解码](README.md#帧身份与解码)） |
-| 解码 | ffmpeg（默认尝试 NVDEC，失败回退软解；`--device cpu` 只选推理设备，强制软解另给 `--hwaccel=`）按**时间网格**出采样帧和 540p 灰度辅助流（`flowocr.extract.framegrid`：第 k 格是帧 `ceil(k × 素材帧率 / fps)`，不整除也不累积误差，采样帧 ⊆ 辅助流）；帧身份是 pts 帧号，`t_us` 是真实 pts。解码分片、预取按字节封顶 |
+| 解码 | ffmpeg（默认尝试 NVDEC，失败回退软解；`--device cpu` 只选推理设备，强制软解另给 `--hwaccel=`）按**时间桶**出采样帧和 540p 灰度辅助流（`flowocr.extract.framegrid`：每 1/fps 秒一个目标点，取该时刻及之后的第一帧，不要求整除也不累积误差，采样帧 ⊆ 辅助流）；帧身份就是帧自己的 pts `t_us`。解码分片、预取按字节封顶 |
 | 检测 | 每个采样帧全屏 det（`PP-OCRv6_medium_det` 的官方 ONNX，ORT；长边压到 960）。前处理自己写（`fast_det`，去掉 Paddle 之前和 PaddleX 对拍过逐字节相同）、后处理是照抄的一份（`detpost`），攒批、下一批的前处理与推理和这一批的后处理重叠 |
 | 框级复用 | 第二版判据（`reuse_v2`）：按手里文本的类别分门、框宽门、链首跨空档；框内灰度相关过门就沿用上一帧文本、不送 rec，到期强制重识别；沿用错了的由回补改写 |
 | 识别 | 只对新框 / 变了的框 / 到期刷新的框裁剪送 rec（`PP-OCRv6_medium_rec` 官方 ONNX，ORT）；按目标宽分桶组批（宽度收到 320 的倍数，每个形状一个 session、共用显存），异步在途 |
 | 在线回抠证据 | 辅助流上，链首 / 文本变 / 链断时量回抠的像素信号（首字 / 全字 / 消失的证据窗），写进 obs 行的 `edge`；被回补改写的那一段作废 |
-| 写出 | 每个框一行 JSON 流式追加；跑完改写首行 `_meta`（生效参数 `config`、采样 / 辅助流网格、代码指纹、设备回退原因…） |
-| 完成契约 | `_meta.complete = 推进帧数 ≥ 请求帧数 × 0.98`，且辅助流（回抠证据）没断——pts 对不上、或没盖到采样流的最后一帧时 `ocr_complete.aux_shortfall` 一票否决（不用 `aux_stopped_early`：有丢帧缺口的素材上单路恒为真）；没跑完退出码 3，pts 不合法退出码 4，驱动按它决定跳过还是重跑 |
+| 写出 | 每个框一行 JSON 流式追加；跑完改写首行 `_meta`（生效参数 `config`、帧身份标记 `frame_key`、采样 / 辅助流的生效桶、代码指纹、设备回退原因…） |
+| 完成契约 | `_meta.complete = 推进到的时长 ≥ 要求的时长 × 0.98`（µs：`advanced_us` 是最后一个采样帧所在桶的结束 − 窗口起点，`requested_us` 是窗口长、`--end 0` 时到容器时长），且辅助流（回抠证据）没断——pts 对不上、或没盖到采样流的最后一帧时 `ocr_complete.aux_shortfall` 一票否决（不用 `aux_stopped_early`：有丢帧缺口的素材上单路恒为真）；没跑完退出码 3，pts 不合法退出码 4，驱动按它决定跳过还是重跑 |
 
-每行：`frame, t_us, box, poly, text, conf(=rec_score), reused, edge?`。依据与各旋钮的值：[defaults.md](defaults.md) 1.1–1.28。
+每行：`t_us, box, poly, text, conf(=rec_score), reused?, edge?`（`t_us` 就是帧身份，没有帧号字段）。依据与各旋钮的值：[defaults.md](defaults.md) 1.1–1.28。
 
 ## 2. 轨：`flowocr.analyze.build_tracks`
 
@@ -54,12 +54,12 @@ obs 没有证据就用默认设置重跑 (1)。
 不开视频：拿 obs 行的 `edge` 证据配到各区域的 run 上（全部区域；整段的文字效果和打字速度只从 subtitle、dialogue-or-caption 两类统计，[defaults.md 1.65](defaults.md#165-回抠覆盖全部区域文字效果只从正文区域统计2026-10-24)），按 `flowocr.extract.typewriter_fuse` 多信号融合出**首字出现 / 全字出现**
 （OCR 中途读数外推、首字格开始出现、逐字格定稿的稳健直线、尾字格定稿；每条记 `t_full_how`），结尾窗逐字格量字形对比度出**完全显示结束 / 完全消失**
 （`t_full_end` + `t_end`，`t_end_how` = curve / ncc；测量窗里一直没看到消失的记开放边界 `open`；末段还在平移的 run 不收早于采样级的终点、留采样级，记 `moving`）。量不到的时刻留采样级。结算完 SRT 重出，最后才写 `tracks.json`。
-开视频的离线测量只留在开发探针 `dev_tools/refine_offline_probe.py` 里核对在线证据。依据：[defaults.md 1.29](defaults.md#129-建轨顺带结算回抠build_tracks---refine-auto2026-09-25-owner-定)。
+没有开视频的离线测量，在线证据的质量由打字机真值把关。依据：[defaults.md 1.29](defaults.md#129-建轨顺带结算回抠build_tracks---refine-auto2026-09-25-owner-定)。
 
 ## 4. 哪些判据以采样间隔为单位
 
 `frame_us = round(1e6 / sample_fps)` 不只是精度，它是下面这些判据的**单位**。换 fps 前要逐条决定"保持帧数"还是"保持时间"，否则换 fps 等于同时改十个默认。
-（采样网格不等距时相邻间隔差一帧；下游的容差都按 1.5 个名义间隔留了余量，见 [defaults.md 1.23](defaults.md#123-采样和辅助流都按时间网格取帧--fps----aux-max-fps-602026-09-24-owner-要的功能)。）
+（按时间桶取帧时相邻采样帧的间隔由素材定：不整除的素材上差一个源帧，缺口和 VFR 的稀处会隔空桶；下游的容差都按 1.5 个名义间隔留了余量，见 [defaults.md 1.79](defaults.md#179-帧身份是帧自己的时间戳按时间桶取帧2026-11-23-owner-定帧身份计划)。）
 
 | 处 | 现在 | 4 fps 下的含义 |
 | --- | --- | --- |
@@ -80,10 +80,8 @@ obs 没有证据就用默认设置重跑 (1)。
 
 `t_us` 是解码器给的真实 pts，`_meta.timebase = "pts"`。判据在 `src/flowocr/extract/ptsclock.py`，三道门：非有限 / 为负 / 不严格递增，任何一道不过就把产物判为未完成、退出码 4。
 此前（2026-09-09 以前）是 `idx / src_fps`，而 `src_fps` 是**容器的平均帧率**，有丢帧缺口的素材上整条时间轴被拉长（[已知的坑](../dev-guide/pitfalls.md#容器平均帧率不是时间轴)）。
-`--decoder cv2`（旧默认、离线探针还在用）的两条解码器语义是实测的：
-`read()` 之后 `CAP_PROP_POS_MSEC` 给的是刚读到那一帧的 pts（逐帧对齐 ffprobe 的 `pts_time`）；
-`cap.set(CAP_PROP_POS_FRAMES, i)` 其实按 `i / src_fps` 做时间 seek、不是按帧号——所以"帧号 → 时刻 → seek"的两次换算互相抵消。
-`--start / --end` 开窗时起点对齐到采样网格上帧距最近的一格，窗口跑和整片跑采样的是同一批帧；产物里 `start_sec` / `end_sec` 记**请求**的窗口（复用判据拿它对账），
+`t_us` 减去了容器的 `format.start_time`（素材库普查的 46 个视频全是 0），和播放器、阶段 5 烧录用的是同一条时间轴；取帧层带 `-copyts`，`-ss` 也按这条时间轴给。
+`--start / --end` 开窗时吸附到最近的采样目标点，窗口跑和整片跑采样的是同一批帧（[帧身份与解码](README.md#帧身份与解码)）；产物里 `start_sec` / `end_sec` 记**请求**的窗口（复用判据拿它对账），
 实际覆盖到的区间另记 `pts_first_sec` / `pts_last_sec`。
 那次 1 µs 的坑（`frame_us` 是 `round()` 出来的，实测间隔抖 1 µs，38% 的间隔超容差，run 全断）就是这种绑定的代价（[已知的坑](../dev-guide/pitfalls.md#时间戳比较留半个间隔的余量)）。
 

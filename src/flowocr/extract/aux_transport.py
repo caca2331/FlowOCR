@@ -193,7 +193,8 @@ class TcpAux:
                 self.remote.abort()
                 raise
 
-    def send(self, frame, n, t):
+    def send(self, frame, n, info):
+        """一帧像素 + 它的 pts 项 `(n, t_us, 采样桶号, 辅助桶号)`（`info` 是后三个，桶号随帧走，见 `framesource.AuxReader`）。"""
         with self.io:
             try:
                 self.owner.check()
@@ -201,7 +202,7 @@ class TcpAux:
                     raise OSError('aux pixel writer is not open')
                 self.owner.sock.sendall(memoryview(frame).cast('B'))
                 self.owner.check()
-                self.remote.pts_put((n, t))
+                self.remote.pts_put((n, *info))
             except BaseException:
                 self.owner.dispose()
                 self.remote.abort()
@@ -281,8 +282,8 @@ class AuxFanout:
         finally:
             writer.abort()  # normal close already disposed; failure cannot block.
 
-    def send(self, frame, n, t):
-        item = (bytes(memoryview(frame).cast('B')), n, t)
+    def send(self, frame, n, info):
+        item = (bytes(memoryview(frame).cast('B')), n, info)
         with self.send_io:
             with self.cv:
                 if not self.started or self.closing or self.cancelled:

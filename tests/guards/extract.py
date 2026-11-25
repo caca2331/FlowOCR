@@ -86,24 +86,24 @@ def t_edge_work_messages() -> None:
     import numpy as np
     from types import SimpleNamespace
     from flowocr.extract import edge_proc as EP, edge_refine as ER
-    from flowocr.extract.framegrid import AuxGrid, TimeGrid
+    from flowocr.extract.framegrid import AuxClock, Clock, SampleClock
 
     messages = []
-    grid = AuxGrid(TimeGrid.every(1), TimeGrid.every(2))
-    edge = ER.EdgeRefiner(src_fps=60, start_idx=0, width=16, height=16,
-                          scale=1, grid=grid, thr=.98, ring_cap=32)
+    edge = ER.EdgeRefiner(start_us=0, width=16, height=16, scale=1, clock=AuxClock(Clock(60), SampleClock(30)),
+                          ref_fps=60, thr=.98, ring_cap=32)
     edge.on_progress = lambda: messages.append(("progress",))
     edge.on_done = lambda seq: messages.append(("done", seq))
     ref = EP.RowRef(1, messages.append)
+    us = lambda i: round(i * 1e6 / 60)
     try:
         for i in range(24):
-            edge.ring.push(i, np.zeros((16, 16), np.uint8))
+            edge.ring.push(us(i), np.zeros((16, 16), np.uint8))
         edge.ring.close()
-        edge.sample(0, 0, 0, [(1, ref, [2, 2, 14, 14], "文字", "new")], [])
-        edge.sample(1, 2, 33333, [(1, ref, [2, 2, 14, 14], "文字", "same")], [])
-        edge.sample(2, 4, 66667, [], [(1, ref, [2, 2, 14, 14], "文字", 2)])
+        edge.sample(0, us(0), [(1, ref, [2, 2, 14, 14], "文字", "new")], [])
+        edge.sample(1, us(2), [(1, ref, [2, 2, 14, 14], "文字", "same")], [])
+        edge.sample(2, us(4), [], [(1, ref, [2, 2, 14, 14], "文字", us(2))])
         # Bounded join: a regression must fail the guard instead of hanging it.
-        edge.q.put(("f", 4))
+        edge.q.put(("f", us(4)))
         edge.th.join(5)
         check("窗内工作线程完成且无异常", not edge.th.is_alive() and edge.error is None)
     finally:
@@ -164,7 +164,7 @@ def t_reuse_v2() -> None:
         dec, todo, assign = v.decide(seq, np.zeros((40, 200), np.uint8), boxes)
         dec = list(dec) + [(i, texts[i], 0.99, 0) for i in todo]
         polys = [[[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]] for b in boxes]
-        v.commit(seq, seq * 30, seq * 500_000, boxes, polys, dec, set(todo), assign,
+        v.commit(seq, seq * 500_000, boxes, polys, dec, set(todo), assign,
                  lambda i: np.zeros((crop_hw[0], crop_hw[1], 3), np.uint8), {}, False, io.StringIO())
         return todo
 
@@ -211,7 +211,7 @@ def t_reuse_v2() -> None:
         def __init__(self):
             self.seen = []
 
-        def sample(self, seq, idx, t_us, items, ended, stale=()):
+        def sample(self, seq, t_us, items, ended, stale=()):
             self.seen.append((seq, [(it[3], it[4]) for it in items], set(stale)))
 
         def settled_by(self, seq):
@@ -248,11 +248,11 @@ def t_reuse_v2() -> None:
     one = [[0, 0, 10, 10]]
     fh = io.StringIO()
     dec, todo, assign = v.decide(0, np.zeros((40, 200), np.uint8), one)
-    v.commit(0, 0, 0, one, [[[0, 0], [10, 0], [10, 10], [0, 10]]],
+    v.commit(0, 0, one, [[[0, 0], [10, 0], [10, 10], [0, 10]]],
              list(dec) + [(i, "AAA", 0.99, 0) for i in todo], set(todo), assign,
              lambda i: np.zeros((10, 10, 3), np.uint8), dict(v.last_corr), True, fh)
     dec, todo, assign = v.decide(1, np.zeros((40, 200), np.uint8), one)
-    v.commit(1, 30, 500_000, one, [[[0, 0], [10, 0], [10, 10], [0, 10]]],
+    v.commit(1, 500_000, one, [[[0, 0], [10, 0], [10, 10], [0, 10]]],
              list(dec) + [(i, "AAA", 0.99, 0) for i in todo], set(todo), assign,
              lambda i: np.zeros((10, 10, 3), np.uint8), dict(v.last_corr), True, fh)
     check("`--record-corr` 在 reuse_v2 路径上真的写出 `corr`（v2 的相关系数在 decide 里算，要取 last_corr）",
@@ -264,23 +264,15 @@ def t_ocr_complete() -> None:
     print("ocr_complete.is_complete")
     from flowocr.extract import ocr_complete as oc
 
-    from flowocr.extract.framegrid import AuxGrid, TimeGrid
-
-    def sf(e, last, step):
-        return oc.aux_shortfall(e, last, AuxGrid(TimeGrid.every(step), TimeGrid.every(30)))
-    check("aux_shortfall：辅助流 pts 对不上 -> 判未完成；没盖到采样流最后一帧 -> 判未完成；"
-          "**有缺口素材上的 aux_stopped_early 不算**（单路每一臂都是 True）；没用辅助流 / 旧产物没 last_key 不判",
-          sf({"aux_sent": 5, "aux_misaligned": "第 3 帧…"}, 100, 1) is not None
-          and sf({"aux_sent": 5, "aux_last_key": 80}, 100, 1) is not None
-          and sf({"aux_sent": 5, "aux_last_key": None}, 100, 1) is not None
-          and sf({"aux_sent": 5, "aux_last_key": 100, "aux_stopped_early": True}, 100, 1) is None
-          and sf({"aux_sent": 5, "aux_last_key": 98}, 100, 3) is None
-          and sf({"aux_sent": 5, "aux_last_key": 97}, 100, 3) is not None
-          and sf({"on": 3}, 100, 1) is None and sf({"aux_sent": 5}, 100, 1) is None and sf(None, 100, 1) is None)
-    _ng = AuxGrid(TimeGrid(5, 12), TimeGrid.every(30))   # 60 fps 给 25：采样帧嵌套，最后一个辅助帧至少要到采样流的最后一帧
-    check("aux_shortfall：不等距网格要盖到采样流最后一帧（嵌套，采样帧一定在辅助流里）",
-          oc.aux_shortfall({"aux_sent": 5, "aux_last_key": 90}, 90, _ng) is None
-          and oc.aux_shortfall({"aux_sent": 5, "aux_last_key": _ng.prev(90)}, 90, _ng) is not None)
+    sf = oc.aux_shortfall
+    check("aux_shortfall：辅助流 pts 对不上 -> 判未完成；最后一个辅助帧早于最后一个采样帧（采样帧一定在辅助流里）-> 判未完成；"
+          "aux_stopped_early 不算；没用辅助流 / 没有采样帧不判",
+          sf({"aux_sent": 5, "aux_misaligned": "第 3 帧…"}, 100) is not None
+          and sf({"aux_sent": 5, "aux_last_key": 99_999}, 100_000) is not None
+          and sf({"aux_sent": 5, "aux_last_key": None}, 100_000) is not None
+          and sf({"aux_sent": 5, "aux_last_key": 100_000, "aux_stopped_early": True}, 100_000) is None
+          and sf({"aux_sent": 5, "aux_last_key": 116_667}, 100_000) is None
+          and sf({"on": 3}, 100) is None and sf({"aux_sent": 5, "aux_last_key": 5}, None) is None and sf(None, 100) is None)
     _ro2 = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
     check("run_ocr2：辅助流没交够一票否决 complete（接线）",
           "and loop.bad_pts is None and aux_bad is None" in _ro2 and "ocr_complete.aux_shortfall(" in _ro2)
@@ -317,14 +309,12 @@ def t_ocr_complete() -> None:
 
     with tempfile.TemporaryDirectory() as d:
         dd = Path(d)
-        from flowocr.extract import framesource as _fs
-        DEC = _fs.DEFAULT_DECODER
-        ok_meta = {"complete": True, "timebase": "pts", "decoder": DEC, "src_fps": 60.0, "stride": 30,
-                   "start_sec": 100.0, "end_sec": 400.0}
+        ok_meta = {"complete": True, "timebase": "pts", "frame_key": "t_us", "src_fps": 60.0, "nominal_fps": 60.0,
+                   "sample_clock": [2, 1], "aux_clock": [60, 1, 2, 1], "start_sec": 100.0, "end_sec": 400.0}
         done = obs(dd, "done.jsonl", ok_meta)
-        half = obs(dd, "half.jsonl", {"complete": False, "timebase": "pts", "decoder": DEC,
+        half = obs(dd, "half.jsonl", {"complete": False, "timebase": "pts", "frame_key": "t_us",
                                       "start_sec": 100.0, "end_sec": 400.0},
-                   '{"frame": 1}\n' * 50)
+                   '{"t_us": 1}\n' * 50)
         # 旧口径的产物：`t_us = idx / src_fps`，`_meta` 里根本没有 timebase 这个键。
         # 它的 `complete` 也是 true——**这正是它危险的地方**。
         old = obs(dd, "old.jsonl", {"complete": True,
@@ -336,19 +326,15 @@ def t_ocr_complete() -> None:
         check("拦下来时要说得出是时间轴的事", "pts" in oc.obs_reusable(old)[1])
         check("将来换了别的时间轴口径同样拦",
               not oc.obs_reusable(obs(dd, "idx.jsonl",
-                                      {"complete": True, "timebase": "index",
-                                       "decoder": DEC}))[0])
-        # **两种解码器的产物不混用**（owner 2026-09-10）：默认一改，磁盘上旧默认产的
-        # 那批 `complete` 仍是 true、`timebase` 也是 pts——不拦就会被驱动脚本跳过，
-        # 于是同一批产物里两种解码器混着，而且不报错。
-        other = "cv2" if DEC != "cv2" else "ffmpeg"
-        mixed = obs(dd, "mixed.jsonl", {**ok_meta, "decoder": other})
-        check("**不是当前默认解码器产的观测不能复用**（不混用）",
-              not oc.obs_reusable(mixed)[0])
-        check("拦下来时要说得出是解码器的事", "解码器" in oc.obs_reusable(mixed)[1])
-        check("没记 decoder 的旧产物也拦（它们本来也没有 timebase）",
-              not oc.obs_reusable(obs(dd, "nodec.jsonl",
-                                      {"complete": True, "timebase": "pts"}))[0])
+                                      {"complete": True, "timebase": "index", "frame_key": "t_us"}))[0])
+        # **帧身份是旧的帧号的产物整份重跑**（frame-pts 计划，owner 2026-11-23：之后整体重转素材库）：
+        # 它们 `complete` 是 true、`timebase` 也是 pts——不拦就会被驱动脚本跳过、和新产物混着，而且不报错
+        mixed = obs(dd, "mixed.jsonl", {k: v for k, v in ok_meta.items() if k != "frame_key"})
+        check("**没有 `frame_key` 的旧 obs 不能复用**（帧身份是旧的帧号）",
+              not oc.obs_reusable(mixed)[0] and not oc.obs_reusable(obs(dd, "fk.jsonl", {**ok_meta, "frame_key": "idx"}))[0])
+        check("拦下来时要说得出是帧身份的事、该重跑阶段 1", "帧身份是旧的帧号，重跑阶段 1" == oc.obs_reusable(mixed)[1])
+        check("seek_dropped_first 那道局部作废删了（它要认的旧产物全在 frame_key 那道门里）",
+              not hasattr(oc, "seek_dropped_first"))
         check("**半截产物不能复用**（非空，`[ -s ]` 会放过它）", not oc.obs_reusable(half)[0])
         check("不能复用时要说得出原因", "complete" in oc.obs_reusable(half)[1])
         check("文件不在也不抛，只是不能复用",
@@ -359,7 +345,7 @@ def t_ocr_complete() -> None:
         # 读的一侧（gametext_eval）只问写完没有：整场 OCR 跑着的时候观测已经非空
         check("**半截产物不算写完**（整场 OCR 跑着时 eval 不能读它）",
               not oc.obs_finished(half)[0] and oc._main(["--finished", str(half)]) == 1)
-        check("旧时间轴 / 旧解码器的产物照读（文本检索不看时间）",
+        check("旧时间轴 / 旧帧身份的产物照读（文本检索不看时间）",
               oc.obs_finished(old)[0] and oc.obs_finished(mixed)[0]
               and oc._main(["--finished", str(old)]) == 0)
         check("--finished 不抛：文件不在、空文件",
@@ -408,7 +394,7 @@ def t_ocr_complete() -> None:
         # record_corr 是有意的唯一例外（2026-09-14，综合清单 X3）：只多写 obs 行上的 `corr` 字段、不改判决 / 文本 / 框，
         # 算进配置的代价是全部现成 obs 重跑；"开和不开去掉 corr 后逐行相同"在 quick 六段上核过（try-list-results 报告 X3）
         # refine_ring 只管帧环装多少帧（什么时候解码）：容量有下限 max(5, strides)，只能更大，不会少量出证据
-        # ⚠ `refine_aux` **2026-09-17 挪出这个集合**（审计）：noop 根本不产 edge、nvdec/cuvid 产的 edge 不一样，
+        # ⚠ `refine_aux` **2026-09-17 挪出这个集合**（审计）：noop 根本不产 edge，
         #    config 相等就会让空臂的 obs 被当默认产物复用（见 ocr_args.OPT_IN_FUSED 那段）
         # `trace` 同 `record_corr` 的理由（2026-09-18）：只把复用判据的因果**另写一个文件**，
         # 不改判决 / 文本 / 框——进配置就是全部现成 obs 重跑，而它连 obs 都不碰
@@ -462,7 +448,7 @@ def t_ocr_complete() -> None:
                                               "--end", "400.0"])[0])
         check("**timebase 那道门独立于参数**（旧时间轴的产物参数对上了也不行）",
               not oc.obs_reusable(obs(dd, "oldcfg.jsonl",
-                                      {"complete": True, "config": ocr_args.config_of(win)}),
+                                      {"complete": True, "frame_key": "t_us", "config": ocr_args.config_of(win)}),
                                   argv=win)[0])
         src = (ROOT / "src" / "flowocr" / "extract" / "run_ocr2.py").read_text(encoding="utf-8")
         check("run_ocr2 用的是共享层那一个解析器、而且过 resolve（默认值跟着别的参数走的那几个，两边解析出同一组生效值）",
@@ -479,7 +465,7 @@ def t_ocr_ab_report() -> None:
     from ocr_ab_report import compare_obs
 
     def row(f, box, text, conf):
-        return {"frame": f, "box": box, "text": text, "conf": conf}
+        return {"t_us": f, "box": box, "text": text, "conf": conf}
 
     a = [row(0, [0, 0, 9, 9], "あいう", 0.99), row(0, [5, 5, 9, 9], "X", 0.501),
          row(30, [0, 0, 9, 9], "あいう", 0.99)]
@@ -540,7 +526,7 @@ def t_reuse_confirm() -> None:
         state["corr"] = corr
         dec, todo, assign = v.decide(seq, np.zeros((40, 200), np.uint8), box)
         dec = list(dec) + [(i, read_text, 0.99, 0) for i in todo]
-        v.commit(seq, seq * 30, seq * 500_000, box, poly, dec, set(todo), assign,
+        v.commit(seq, seq * 500_000, box, poly, dec, set(todo), assign,
                  lambda i: np.zeros((18, 60, 3), np.uint8), {}, False, io.StringIO())
         return bool(todo), v.buf[seq][0]["text"]
 
@@ -579,7 +565,7 @@ def t_reuse_confirm() -> None:
         state["corr"] = 1.0
         dec, todo, assign = v.decide(seq, np.zeros((40, 200), np.uint8), bx)
         dec = list(dec) + [(i, read_text, 0.99, 0) for i in todo]
-        v.commit(seq, seq * 30, seq * 500_000, bx, px, dec, set(todo), assign,
+        v.commit(seq, seq * 500_000, bx, px, dec, set(todo), assign,
                  lambda i: np.zeros((18, w, 3), np.uint8), {}, False, io.StringIO())
         return bool(todo), v.buf[seq][0]["text"]
 
@@ -822,7 +808,7 @@ def t_audit_perf0925() -> None:
             return _np.zeros((x.shape[0], x.shape[-1] // 8), _np.int64), _np.zeros((x.shape[0], x.shape[-1] // 8), _np.float32)
     _orec = _rc.OrtRec.__new__(_rc.OrtRec)
     _orec.max_batch, _orec.grid, _orec.cli, _orec.pre_on_server, _orec.ladder = 16, 320, _FakeCli(), False, ()
-    _orec.t, _orec.labels = {"pre": 0.0, "decode": 0.0}, ["_"]
+    _orec.t, _orec.labels, _orec.vertical = {"pre": 0.0, "decode": 0.0}, ["_"], True
     import numpy as _np
     _orec.predict([_np.zeros((48, 2560, 3), _np.uint8)] * 16 + [_np.zeros((48, 320, 3), _np.uint8)] * 16)
     check("OrtRec.predict 按 batch_cap 拆批：16 张宽 2560 拆成两批各 8 张，16 张宽 320 照旧一批 16",
@@ -926,7 +912,7 @@ def t_audit_perf0925() -> None:
           _sos.count("subprocess.Popen(") == 1 and '"--admit", admit' in _sos and 'for m, _ in want]' in _sos
           and ":img,rec={recort.BATCH_AREA}:bw" in _sos and "env[SHARED_ENV] = \"1\"" in _sos)
     from flowocr.extract import ocr_args as _oa
-    check_args = lift("check_args", {"ocr_args": _oa, "resolve_aux_grid": lambda *a, **k: None})
+    check_args = lift("check_args", {"ocr_args": _oa})
     _ok = True
     try:
         check_args(_oa.parse_args(["v.mp4", "--out", "x"]))
@@ -952,7 +938,7 @@ def t_audit_perf0925() -> None:
             return self.post_batch(self.infer_batch(imgs))
 
     def seq(n, batch, look, fail_at=None, take=None):
-        g = det_stream(iter([(i, i / 2, i) for i in range(n)]), FakeDet(fail_at), batch, False, look)
+        g = det_stream(iter([fake_frame(i, i, image=i) for i in range(n)]), FakeDet(fail_at), batch, False, look)
         out = []
         try:
             for item in g:
@@ -987,7 +973,8 @@ def t_audit_perf0925() -> None:
     passed = []
     for batch, look in [(b, l) for b in (1, 2, 4) for l in (0, 1)]:
         frames = [np.full((4, 4, 3), i, np.uint8) for i in range(len(times))]
-        source = RG.MaskedSource(zip(range(len(times)), times, frames), group)
+        from flowocr.extract.framesource import Frame as _Fr
+        source = RG.MaskedSource([_Fr(i, t, f, i, i) for i, (t, f) in enumerate(zip(times, frames))], group)
         calls = []
         class ClosedDet:
             def infer_batch(self, images):
@@ -1019,9 +1006,9 @@ def t_audit_perf0925() -> None:
 
     # ④ 字节预算的等待里主流交到块尾：辅助帧要放行（原来 main_eof 只在进等待前算一次，Codex P1）
     from flowocr.extract import decode_shards as dsh
-    s = dsh.ShardedSource("v", lanes=["hw"], blocks=[(0, 60, None)], start_idx=0, end_idx=60, grid=_every(30), src_fps=60.0,
+    s = dsh.ShardedSource("v", lanes=["hw"], blocks=[(None, None)], stream=fake_stream(), window=window2(0, 2),
                           width=4, height=4, hwaccel="cuda", aux_remote=None, budget_mb=0.00001)
-    b = NS(k=0, last_main=None, hi=60, waiting=0, throttled=False, nbytes=0, err=None, aux_done=False)
+    b = NS(k=0, last_main=None, max_cell=1, waiting=0, throttled=False, nbytes=0, err=None, aux_done=False)
     s._buffered = 10_000
     done = []
 
@@ -1035,7 +1022,7 @@ def t_audit_perf0925() -> None:
     _time.sleep(0.3)
     blocked = not done
     with s._cv:
-        b.last_main = 30                                          # 30 是块里最后一个采样格（下一格 60 = 块尾）
+        b.last_main = fake_frame(30, 1)                           # 桶 1 是块里最后可能的那个桶
         s._cv.notify_all()
     th.join(3)
     check("ShardedSource：辅助帧被预算挡着时主流交到块尾，等待当场放行（不等到收摊）", blocked and done == [True], (blocked, done))
@@ -1348,15 +1335,15 @@ def t_edge_proc() -> None:
           and not oa.same_arm(["v.mp4", "--out", "a"], ["v.mp4", "--out", "b", "--no-edge-proc"]))
     d = oa.parse_args(["v.mp4", "--out", "a"])
     check("拆进程：回抠那刀默认开", d.edge_proc)
-    # 不支持的组合：关掉那一刀、说原因，不报错；config 记请求的值（resolve_split 不并进 resolve）
     import contextlib
     import io as _io
-    with contextlib.redirect_stdout(_io.StringIO()):
-        a2 = oa.parse_args(["v.mp4", "--out", "a", "--refine-aux", "nvdec"])
-        w2 = oa.resolve_split(a2)
-    check("--refine-aux nvdec：edge 关、说原因", not a2.edge_proc and len(w2) == 1, w2)
-    check("关掉之后 config 仍记请求的值（同 --workers 的规矩；实际的在 _meta.proc_split）",
-          oa.config_of(["v.mp4", "--out", "a", "--refine-aux", "nvdec"])["edge_proc"] is True)
+    with contextlib.redirect_stderr(_io.StringIO()):
+        _gone_aux = all(raises(lambda v=v: oa.parse_args(["v.mp4", "--out", "a", "--refine-aux", v]), SystemExit)
+                        for v in ("nvdec", "cuvid"))
+        _gone_fs = all(raises(lambda f=f: oa.parse_args(["v.mp4", "--out", "a", *f]), SystemExit)
+                       for f in (["--decoder", "cv2"], ["--frame-select", "pts"]))
+    check("--refine-aux nvdec / cuvid、--decoder、--frame-select 已删（frame-pts 计划）：解析器不认；config 里没有 decoder / frame_select / frame_id",
+          _gone_aux and _gone_fs and not ({"decoder", "frame_select", "frame_id"} & set(oa.config_of(["v.mp4", "--out", "a"]))))
     # 2026-09-24 owner 定删掉的三个旋钮：解析器不认了；旧产物里记着的值不触发重建
     # （front_proc / det_proc 取任何值都不改产物、键留在 SCHEDULING；decode_cpu_lanes 只有 0 是空操作、进 REMOVED_NOOP）
     with contextlib.redirect_stderr(_io.StringIO()):
@@ -1376,66 +1363,66 @@ def t_edge_proc() -> None:
     # 解码分片（decode-buffer §8.24）：块的规划、块的命令、拆进程规则
     from flowocr.extract import decode_shards as dsh
     from flowocr.extract import framesource as fsx
-    bl = dsh.plan_blocks("v", 0, 3000, 60.0, 10.0, kfs=[0.0, 4.0, 11.0, 12.0, 25.0, 49.9])
-    check("plan_blocks：第一块走普通路径（None）、之后从 ≥ 起点 + 块长的关键帧起（+0.5 ms）、首尾相接、最后到窗口尾；"
-          "切完剩不到半块就不切（49.9 s 那个关键帧后面只剩 6 帧，并进上一块）",
-          bl == [(0, 660, None), (660, 1500, 11.0005), (1500, 3000, 25.0005)], bl)
-    bl2 = dsh.plan_blocks("v", 600, 1200, 60.0, 10.0, kfs=[5.0, 30.0])
-    check("plan_blocks：窗口外 / 离起点不够一块的关键帧不切", bl2 == [(600, 1200, None)], bl2)
-    bl3 = list(dsh.iter_blocks(iter([0.0, 150.0]), 0, 18000, 60.0, 20.0))
+    from flowocr.extract.framegrid import Axis
+    TB = Axis((1, 60))                             # 假视频的时间基 1/60：整数 pts 就是帧序号（start_time 0）
+    bl = dsh.plan_blocks("v", window2(0, 100), TB, 10.0, kfs=[0, 240, 660, 720, 1500, 2994])
+    check("plan_blocks：第一块从窗口起点（lo = None）、之后在 ≥ 起点 + 块长的关键帧处切（整数 pts）、首尾相接、最后一块到窗口尾（hi = None）；"
+          "切完剩不到半块就不切（49.9 s 那个关键帧后面只剩 0.1 s，并进上一块）",
+          bl == [(None, 660), (660, 1500), (1500, None)], bl)
+    bl2 = dsh.plan_blocks("v", window2(20, 40), TB, 10.0, kfs=[300, 1800])
+    check("plan_blocks：离起点不够一块 / 切完剩不到半块的关键帧不切", bl2 == [(None, None)], bl2)
+    bl3 = list(dsh.iter_blocks(iter([0, 9000]), 0.0, 300.0, TB, 20.0))
     check("iter_blocks：关键帧来一个判一个（边探边切）；长 GOP 切出的就是长块（内存靠字节预算，不靠块长）",
-          bl3 == [(0, 9000, None), (9000, 18000, 150.0005)], bl3)
-    _kf2 = [2.0 * i for i in range(200)]
-    tb2 = dsh.plan_blocks("v", 0, 18000, 60.0, 60.0, kfs=_kf2, lanes=2)
-    tb90 = dsh.plan_blocks("v", 0, 5400, 60.0, 60.0, kfs=_kf2, lanes=2)
+          bl3 == [(None, 9000), (9000, None)], bl3)
+    _kf2 = [120 * i for i in range(200)]
+    tb2 = dsh.plan_blocks("v", window2(0, 600), TB, 60.0, kfs=_kf2, lanes=2)
+    tb90 = dsh.plan_blocks("v", window2(0, 180), TB, 60.0, kfs=_kf2, lanes=2)
     check("plan_blocks 尾部按路数均分（rec-workload 计划 2026-10-16）：剩下不到 路数 × 块长 时每块取 剩下的 / 路数、逐块重算、不短于 10 s；"
-          "90 s 窗口两路也切开；一路时和不均分一样",
-          tb2 == [(0, 3600, None), (3600, 7200, 60.0005), (7200, 10800, 120.0005), (10800, 14400, 180.0005),
-                  (14400, 16200, 240.0005), (16200, 17160, 270.0005), (17160, 18000, 286.0005)]
-          and tb90 == [(0, 2760, None), (2760, 4080, 46.0005), (4080, 4800, 68.0005), (4800, 5400, 80.0005)]
-          and dsh.plan_blocks("v", 0, 18000, 60.0, 60.0, kfs=_kf2, lanes=1)
-          == [(k * 3600, (k + 1) * 3600, None if k == 0 else k * 60 + 0.0005) for k in range(5)],
+          "90 s 窗口两路也切开；一路时和不均分一样；--end 0 时按容器时长均分",
+          tb2 == [(None, 3600), (3600, 7200), (7200, 10800), (10800, 14400), (14400, 16200), (16200, 17160), (17160, None)]
+          and tb90 == [(None, 2760), (2760, 4080), (4080, 4800), (4800, None)]
+          and dsh.plan_blocks("v", window2(0, 600), TB, 60.0, kfs=_kf2, lanes=1)
+          == [(None, 3600), (3600, 7200), (7200, 10800), (10800, 14400), (14400, None)]
+          and dsh.plan_blocks("v", window2(0, None), TB, 60.0, kfs=_kf2, lanes=2, t1=300.0) == tb2,
           (tb2, tb90))
     check("解码分片同时在途的块默认 = 路数 + 1（尾部均分后先解完的那一路不用干等名额）",
-          dsh.ShardedSource("v", lanes=["hw", "hw"], blocks=[(0, 60, None)], start_idx=0, end_idx=60, grid=_every(30),
-                            src_fps=60.0, width=4, height=4, hwaccel="cuda").ahead == 3)
+          dsh.ShardedSource("v", lanes=["hw", "hw"], blocks=[(None, None)], stream=fake_stream(), window=window2(0, 2),
+                            width=4, height=4, hwaccel="cuda").ahead == 3)
     _shard_behaviour_checks(dsh, fsx)
-    cmd = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=0.0, n_out=10, select_by="pts", src_fps=60.0,
-                               block=(660, 1500, 11.0005),
-                               aux={"grid": [1, 1, 1, 30], "scale": 0.35, "n_frames": 840, "url": "tcp://x:1", "w": 672, "h": 378})
+    _aux = {"clock": [60, 1, 2, 1], "scale": 0.35, "url": "tcp://x:1", "w": 672, "h": 378}
+    cmd = fsx.build_ffmpeg_cmd("v.mp4", window=window2(0, 100), axis=TB, block=(660, 1500), aux=_aux)
     js = " ".join(cmd)
-    check("build_ffmpeg_cmd 的块：从关键帧 -noaccurate_seek、输入端 -t 到块尾、两路都按帧号区间取",
-          "-noaccurate_seek" in cmd and cmd[cmd.index("-ss") + 1] == "11.000500" and "-t" in cmd
-          and js.count(r"between(round(t*60.000000000)\,660\,1499)") == 2, js[:300])
-    cmd0 = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=11.0, n_out=10, select_by="pts", src_fps=60.0,
-                                block=(660, 1500, None),
-                                aux={"grid": [1, 1, 1, 30], "scale": 0.35, "n_frames": 840, "url": "tcp://x:1", "w": 672, "h": 378})
+    check("build_ffmpeg_cmd 的块：精确 seek 到关键帧前半毫秒（不用 -noaccurate_seek：那时 -t 从解出的第一帧算，带 B 帧时块尾被截掉）、"
+          "输入端 -t 从 seek 点读到块终点后 0.1 s、两路都按**整数 pts** 区间取",
+          "-noaccurate_seek" not in cmd and cmd[cmd.index("-ss") + 1] == "10.999500"
+          and abs(float(cmd[cmd.index("-t") + 1]) - (25.0 - 10.9995 + fsx.BLOCK_PAD_SEC)) < 1e-6
+          and js.count(r"gte(t\,0)*gte(pts\,660)*lt(pts\,1500)*") == 2 and "-frames:v" not in cmd, js[:300])
+    cmd0 = fsx.build_ffmpeg_cmd("v.mp4", window=window2(22, 100), axis=TB, block=(None, 1500), aux=_aux)
     js0 = " ".join(cmd0)
-    check("build_ffmpeg_cmd 的**第一块**（kf=None）：照普通路径精确 seek，但同样带输入端 -t 和帧号区间（2026-09-24 自检：缺口落在第一块时辅助流越界、帧号倒退）",
-          "-noaccurate_seek" not in cmd0 and cmd0[cmd0.index("-ss") + 1] == "10.991667" and "-t" in cmd0
-          and js0.count(r"between(round(t*60.000000000)\,660\,1499)") == 2, js0[:300])
-    cmdp = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=0.0, n_out=10, select_by="pts", src_fps=60.0,
-                                block=(0, 1200, None), preroll_ticks=512)
-    check("build_ffmpeg_cmd 的第一块在文件头：前摇平移照做，-t 多留 10 s 余量",
-          "-ignore_editlist" in cmdp and float(cmdp[cmdp.index("-t") + 1]) > 1199.5 / 60 + 9)
-    check("build_ffmpeg_cmd 的块不配 index 选帧 / 前摇平移",
-          raises(lambda: fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=0.0, n_out=1, select_by="index",
-                                              src_fps=60.0, block=(0, 60, 0.0)), ValueError))
-    check("ShardedSource：路只认 hw / sw；有 hw 路要给 hwaccel；只配按 pts 选帧",
-          raises(lambda: dsh.ShardedSource("v", lanes=["gpu"], blocks=bl, start_idx=0, end_idx=3000, grid=_every(30), src_fps=60, width=4, height=4), ValueError)
-          and raises(lambda: dsh.ShardedSource("v", lanes=["hw", "hw"], blocks=bl, start_idx=0, end_idx=3000, grid=_every(30), src_fps=60, width=4, height=4), ValueError)
-          and raises(lambda: dsh.ShardedSource("v", lanes=["sw", "sw"], blocks=bl, start_idx=0, end_idx=3000, grid=_every(30), src_fps=60, width=4, height=4,
-                                               select_by="index"), ValueError))
+    check("build_ffmpeg_cmd 的**第一块**（lo = None）：照窗口精确 seek 到 T_a − δ − 1 ms，下界是窗口的桶号条件、上界是块终点的 pts",
+          "-noaccurate_seek" not in cmd0 and abs(float(cmd0[cmd0.index("-ss") + 1]) - (11.0 - 0.0020005)) < 1e-6
+          and "-t" in cmd0 and js0.count(r"gte(floor((t+0.0010005)*2/1)\,22)*lt(pts\,1500)*") == 2, js0[:300])
+    cmdp = fsx.build_ffmpeg_cmd("v.mp4", window=window2(0, 100), axis=TB, block=(None, 1200), preroll_ticks=512)
+    check("build_ffmpeg_cmd 的第一块在文件头：前摇平移照做，-t 加上前摇的秒数",
+          "-ignore_editlist" in cmdp and float(cmdp[cmdp.index("-t") + 1]) > 20.0 + 512 / 60)
+    check("build_ffmpeg_cmd：从关键帧起解的块不带前摇平移",
+          raises(lambda: fsx.build_ffmpeg_cmd("v.mp4", window=window2(0, 100), axis=TB, block=(60, 1200), preroll_ticks=512),
+                 ValueError))
+    check("ShardedSource：路只认 hw / sw；有 hw 路要给 hwaccel；转发辅助流要给辅助桶",
+          raises(lambda: dsh.ShardedSource("v", lanes=["gpu"], blocks=bl, stream=fake_stream(), window=window2(0, 100), width=4, height=4), ValueError)
+          and raises(lambda: dsh.ShardedSource("v", lanes=["hw", "hw"], blocks=bl, stream=fake_stream(), window=window2(0, 100), width=4, height=4), ValueError)
+          and raises(lambda: dsh.ShardedSource("v", lanes=["sw", "sw"], blocks=bl, stream=fake_stream(), window=window2(0, 100), width=4, height=4,
+                                               aux_remote=object()), ValueError))
     with contextlib.redirect_stdout(_io.StringIO()):
         c1 = oa.parse_args(["v.mp4", "--out", "a", "--decode-shards", "3"])
         u1 = oa.resolve_split(c1)
         c2 = oa.parse_args(["v.mp4", "--out", "a", "--decode-shards", "3", "--workers", "2"])
         u2 = oa.resolve_split(c2)
-        c3 = oa.parse_args(["v.mp4", "--out", "a", "--decode-shards", "2", "--decoder", "cv2"])
+        c3 = oa.parse_args(["v.mp4", "--out", "a", "--decode-shards", "2", "--no-edge-proc"])
         u3 = oa.resolve_split(c3)
-    check("--decode-shards：默认组合按请求生效；撞上 --workers > 1 / cv2 解码器**安静让路**（不进 why、原因记 decode_shards_off）",
+    check("--decode-shards：默认组合按请求生效；撞上 --workers > 1 / 回抠开着却没 --edge-proc **安静让路**（不进 why、原因记 decode_shards_off）",
           c1.decode_shards == 3 and u1 == [] and c2.decode_shards == 0 and u2 == [] and c3.decode_shards == 0
-          and "--workers" in c2.decode_shards_off and "cv2" in c3.decode_shards_off, (u1, u2, u3))
+          and "--workers" in c2.decode_shards_off and "edge-proc" in c3.decode_shards_off, (u1, u2, u3))
     check("--decode-shards 默认 2（2026-09-24：先 3，字节预算之后复测 2 路同读数、少一个上下文，defaults.md §1.18）",
           oa.parse_args(["v.mp4", "--out", "a"]).decode_shards == 2)
     _hw = [oa.config_of(["v.mp4", "--out", "a", "--decode-shards", n, "--decode-block", b]) for n, b in (("2", "10"), ("3", "20"))]
@@ -1479,8 +1466,8 @@ def t_edge_proc() -> None:
     err = None
     try:
         dp.start({"video": "no-such-video.mp4", "lanes": ["hw", "hw"], "block_sec": 20.0, "H": 4, "W": 4, "slots": 2,
-                  "aux": None, "source_kw": {"grid": _every(30), "src_fps": 60.0, "width": 4, "height": 4, "pix": "nv12",
-                                             "select_by": "pts", "hwaccel": None, "start_idx": 0, "end_idx": 600}})
+                  "aux": None, "source_kw": {"stream": fake_stream(duration=10.0), "window": window2(0, 20), "width": 4, "height": 4,
+                                             "pix": "nv12", "hwaccel": None}})
         for _ in dp:
             pass
     except RuntimeError as exc:
@@ -1597,7 +1584,7 @@ def t_audit_0923() -> None:
     def stage1(v, st, seq, corr):
         st["corr"] = corr
         dec, todo, assign = v.decide(seq, gray.copy(), box)
-        s = v.commit_stage1(seq, seq * 30, seq * 500_000, box, poly, list(dec) + [(i, "", 0.0, 0) for i in todo],
+        s = v.commit_stage1(seq, seq * 500_000, box, poly, list(dec) + [(i, "", 0.0, 0) for i in todo],
                             set(todo), assign, lambda i: np.zeros((18, 60, 3), np.uint8), {}, False)
         return s, todo
 
@@ -1622,7 +1609,7 @@ def t_audit_0923() -> None:
         def __init__(self):
             self.ended = []
 
-        def sample(self, seq, idx, t_us, items, ended, stale):
+        def sample(self, seq, t_us, items, ended, stale):
             self.ended += [(seq, e[3]) for e in ended]
 
     v, st = fresh()
@@ -1632,7 +1619,7 @@ def t_audit_0923() -> None:
         bx = box if seq < 3 else []
         st["corr"] = 0.5                                   # 每帧都真读
         dec, todo, assign = v.decide(seq, gray.copy(), bx)
-        s = v.commit_stage1(seq, seq * 30, seq * 500_000, bx, poly if bx else [],
+        s = v.commit_stage1(seq, seq * 500_000, bx, poly if bx else [],
                             list(dec) + [(i, "", 0.0, 0) for i in todo], set(todo), assign,
                             lambda i: np.zeros((18, 60, 3), np.uint8), {}, False)
         win.append((s, {i: (["A", "AB", "ABC"][seq], 0.99) for i in todo}))
@@ -1892,9 +1879,9 @@ def t_regions_cuts() -> None:
     with contextlib.redirect_stdout(_io.StringIO()):
         _hw_default = RGp.hub_wanted(_oa.parse_args(["v.mp4", "--out", "a"]))
         _hw_off = RGp.hub_wanted(_oa.parse_args(["v.mp4", "--out", "a", "--decode-shards", "0"]))
-        _hw_cv2 = RGp.hub_wanted(_oa.parse_args(["v.mp4", "--out", "a", "--decoder", "cv2"]))
-    check("run_groups.hub_wanted：看 resolve_split 之后的值——不分片 / cv2 解码时不起广播解码（各组根本不会去接，它会等满订阅数挂到超时）",
-          _hw_default == "" and _hw_off and "cv2" in _hw_cv2, (_hw_default, _hw_off, _hw_cv2))
+        _hw_noep = RGp.hub_wanted(_oa.parse_args(["v.mp4", "--out", "a", "--no-edge-proc"]))
+    check("run_groups.hub_wanted：看 resolve_split 之后的值——不分片 / 分片被别的组合关掉时不起广播解码（各组根本不会去接，它会等满订阅数挂到超时）",
+          _hw_default == "" and _hw_off and "edge-proc" in _hw_noep, (_hw_default, _hw_off, _hw_noep))
     check("run_groups.check_rest：拒掉 --workers（组数 × 段数个进程）/ --out / --regions / --region-group",
           all(raises(lambda a=a: RGp.check_rest(a), SystemExit)
               for a in (["--workers", "3"], ["--workers=2"], ["--out", "x"], ["--region-group", "g"]))
@@ -2035,11 +2022,11 @@ def t_rec_window() -> None:
             texts = {i: read() for i in todo}
             if window <= 1:
                 dec2 = list(dec) + [(i, t, s_, 0) for i, (t, s_) in texts.items()]
-                v.commit(seq, seq * 30, seq * 500_000, BOXES, polys, dec2, set(todo), assign,
+                v.commit(seq, seq * 500_000, BOXES, polys, dec2, set(todo), assign,
                          crop, {}, False, fh)
                 continue
             dec2 = list(dec) + [(i, "", 0.0, 0) for i in todo]
-            st = v.commit_stage1(seq, seq * 30, seq * 500_000, BOXES, polys, dec2, set(todo),
+            st = v.commit_stage1(seq, seq * 500_000, BOXES, polys, dec2, set(todo),
                                  assign, crop, {}, False)
             win.append((st, texts))
             if len(win) >= window:                        # 窗口满了：整窗结算（同步那条路）
@@ -2070,7 +2057,7 @@ def t_rec_window() -> None:
         dl = [rng.randint(0, 3) for _ in CORR]
         rr, readr, pendr, _vr, bad_r, sat_r = run(8, 3, dl)
         ready_ok.append((all(sat_r[k] <= sat_lag[k] for k in sat_lag), readr <= reada, pendr <= penda, bad_r == 0,
-                         [(r["frame"], tuple(r["box"])) for r in rr] == [(r["frame"], tuple(r["box"])) for r in ra]))
+                         [(r["t_us"], tuple(r["box"])) for r in rr] == [(r["t_us"], tuple(r["box"])) for r in ra]))
     _rz, readz, _pz, _vz, _cz, _sz = run(8, 3, [99] * len(CORR))     # 结果一直不回来：只剩领先上限的阻塞结算
 
     reused8 = [r for r in r8 if r.get("reused")]
@@ -2082,7 +2069,7 @@ def t_rec_window() -> None:
           all(r["text"] in tokens and len(r["text"]) == 3 for r in reused8),
           [r["text"] for r in reused8 if len(r["text"]) != 3][:3])
     check("窗口和逐帧**产出的行数、框、时刻一致**（只有文本可能因为多读而不同）",
-          [(r["frame"], tuple(r["box"])) for r in r0] == [(r["frame"], tuple(r["box"])) for r in r8],
+          [(r["t_us"], tuple(r["box"])) for r in r0] == [(r["t_us"], tuple(r["box"])) for r in r8],
           (len(r0), len(r8)))
     check("同一条路跑两遍**逐行相同**（状态机本身是确定的；产物的抖动只来自后端）", r8 == r8b,
           next(((a, b) for a, b in zip(r8, r8b) if a != b), None))
@@ -2207,7 +2194,7 @@ def t_reads_existing_gaps() -> None:
         st["corr"] = corr
         bx = box if present else []
         dec, todo, assign = v.decide(seq, gray.copy(), bx)
-        s = v.commit_stage1(seq, seq * 30, seq * 500_000, bx, poly if present else [],
+        s = v.commit_stage1(seq, seq * 500_000, bx, poly if present else [],
                             list(dec) + [(i, "", 0.0, 0) for i in todo], set(todo), assign,
                             lambda i: np.full((18, 60, 3), seq, np.uint8), {}, False)
         return s, todo
@@ -2235,7 +2222,7 @@ def t_reads_existing_gaps() -> None:
     check("读完就断链：读数还在途时链结束，缓存先留着（held 1 条、账对得上），读回来文本变了照常回补前面的沿用行",
           [t0 == [0], [len(t) for _, t in win]] == [True, [0, 0, 1, 0]] and held_mid == 1 and ok_mid
           and v.stats["recover_reads"] > 0 and [r["text"] for r in rows] == ["AAA", "AAA", "BBB", "BBB"],
-          (held_mid, ok_mid, v.stats["recover_reads"], [(r["frame"], r["text"]) for r in rows]))
+          (held_mid, ok_mid, v.stats["recover_reads"], [(r["t_us"], r["text"]) for r in rows]))
     check("读完就断链：最后一次读结算完，结束链的缓存整条丢掉，计数归零", v.held == [] and v.cache == 0 and books_ok(v),
           (v.held, v.cache))
 
@@ -2273,16 +2260,15 @@ def t_reads_existing_gaps() -> None:
           (held_gap, relinked, ch and [p[0] for p in ch.pending], v.cache))
 
     # 3. 换句时旧段还开着：`_settle` 之前作废标记已经并进旧段
-    er = ER.EdgeRefiner(src_fps=60, start_idx=0, width=64, height=32, scale=1.0, grid=[1, 2, 1, 6], thr=.8)
+    er = ER.EdgeRefiner(start_us=0, width=64, height=32, scale=1.0, clock=[60, 1, 10, 1], ref_fps=60, thr=.8)
     er.abort()
-    er.anchor = (0, 0)
     seen = []
     er._capture = lambda seg, lo, hi: None
     er._end = lambda *a, **k: None
     er._settle = lambda seg, hi, b: seen.append(seg.stale)
     b = [4, 4, 40, 20]
-    er._batch(0, 12, [(7, {}, b, "AAA", "new")], [], set())
-    er._batch(1, 18, [(7, {}, b, "XYZ", "changed")], [], {7})
+    er._batch(0, 200_000, None, [(7, {}, b, "AAA", "new")], [], set())
+    er._batch(1, 300_000, 200_000, [(7, {}, b, "XYZ", "changed")], [], {7})
     check("换句时旧段还开着：停变时旧段已经带上作废标记（不然回补改过的旧句照样写出 on 证据）",
           seen == [True], seen)
 
@@ -2532,22 +2518,13 @@ def t_ocr_parallel() -> None:
     print("ocr_parallel")
     from flowocr.extract import ocr_parallel as op
 
-    cuts = op.split_frames(890580, 908580, _every(30), 3)
-    check("切点在采样网格上（等距：30 的整数倍）", all(c % 30 == 0 for c in cuts))
-    from flowocr.extract.framegrid import TimeGrid as _TG
-    _g8 = _TG(2, 15)                                      # 60 fps 上 8 fps（不等距）
-    _c8 = op.split_frames(0, 36000, _g8, 3)
-    check("不等距网格的切点也在网格上、大致三等分", all(_g8.member(c) for c in _c8) and abs(_c8[0] - 12000) <= 8, _c8)
-    check("切点严格递增、落在窗口内部",
-          890580 < cuts[0] < cuts[1] < 908580 and len(cuts) == 2)
-    check("等分：每段 6000 帧", cuts == [896580, 902580])
-    check("workers=1 不切", op.split_frames(0, 18000, _every(30), 1) == [])
-    try:
-        op.split_frames(0, 60, _every(30), 3)
-        raised = False
-    except ValueError:
-        raised = True
-    check("窗口太短切不开时抛，不静默给出空段", raised)
+    _w = window2(29686, 30286)                           # 14843 s – 15143 s，2 fps
+    cuts = _w.split(3, 0)
+    check("切点按桶号等分（切点就是目标点）、严格递增、落在窗口内部", cuts == [29886, 30086], cuts)
+    check("workers=1 不切", _w.split(1, 0) == [])
+    check("窗口太短切不开时抛，不静默给出空段", raises(lambda: window2(0, 2).split(3, 0), ValueError))
+    check("漂移门删了（切点不经帧号换算，没有漂移可言；frame-pts 计划）",
+          not hasattr(op, "seam_drift_sec") and not hasattr(op, "DRIFT_MAX_FRAMES") and not hasattr(op, "split_frames"))
 
     argv = ["v.mp4", "--out", "o.jsonl", "--start=10", "--end", "20", "--rec-bucket", "16",
             "--workers", "3", "--det-batch", "4"]
@@ -2557,68 +2534,76 @@ def t_ocr_parallel() -> None:
 
     def part(first, last, **kw):
         return {"complete": True, "bad_pts": None, "stopped_early": False,
-                "frames_advanced": 100, "frames_requested": 100, "sampled_frames": 10,
+                "advanced_us": 5_000_000, "requested_us": 5_000_000, "sampled_frames": 10,
                 "boxes": 50, "rec_calls": 20, "reused_boxes": 30, "dropped_dense": 0,
                 "dropped_tiny": 1, "lost_rec": 0, "wall_sec": 5.0, "start_sec": first,
-                "end_sec": last, "pts_first_sec": first, "pts_last_sec": last, **kw}
+                "end_sec": last, "pts_first_sec": first, "pts_last_sec": last,
+                "cell_first": round(first * 2), "cell_last": round(last * 2), **kw}
 
     base = {"config": {"workers": 2}, "video": "v"}
-    m = op.merge_metas([part(0.0, 4.5), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+    m = op.merge_metas([part(0.0, 4.5), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0])
     check("计数相加", m["boxes"] == 100 and m["rec_calls"] == 40 and m["sampled_frames"] == 20)
     check("复用率按合计重算", m["reuse_rate"] == round(60 / 100, 4))
-    check("时间轴取首段起点、末段终点", m["pts_first_sec"] == 0.0 and m["pts_last_sec"] == 9.5)
+    check("时间轴取首段起点、末段终点；首末采样帧的桶号同理", m["pts_first_sec"] == 0.0 and m["pts_last_sec"] == 9.5
+          and (m["cell_first"], m["cell_last"]) == (0, 19))
     check("墙钟是外层的，不是各段相加", m["wall_sec"] == 6.0 and m["part_wall_sec"] == [5.0, 5.0])
     check("配置来自父进程（workers=2 进 config）", m["config"] == {"workers": 2} and m["complete"])
     m_db = op.merge_metas([part(0.0, 4.5, det_batch=1), part(5.0, 9.5, det_batch=1)], {**base, "det_batch": "auto"},
-                          wall=6.0, cuts_sec=[5.0], interval=0.5)
+                          wall=6.0, cuts_sec=[5.0])
     check("合并后的 _meta.det_batch 是各段解析出的生效值，不是父进程的 auto", m_db["det_batch"] == 1, m_db.get("det_batch"))
     _be = {"requested": "auto", "models": {"det": {"backend": "trt"}, "rec": {"backend": "trt"}}}
-    m_be = op.merge_metas([part(0.0, 4.5, backend=_be), part(5.0, 9.5, backend=_be)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+    m_be = op.merge_metas([part(0.0, 4.5, backend=_be), part(5.0, 9.5, backend=_be)], base, wall=6.0, cuts_sec=[5.0])
     check("--workers 合并后 _meta.backend 还在（父进程不建模型，从各段 meta 抄）", m_be.get("backend") == _be, m_be.get("backend"))
     m_oop = op.merge_metas([part(0.0, 4.5, ort={"det": {"trt_oop": 3, "built": 2, "server": "127.0.0.1:9"}, "rec_side": [{"x": 1}]}),
                             part(5.0, 9.5, ort={"det": {"trt_oop": 5, "trt_err": 1, "trt_err_first": "boom", "server": "127.0.0.1:9"}})],
-                           base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+                           base, wall=6.0, cuts_sec=[5.0])
     m_sep = op.merge_metas([part(0.0, 4.5, ort={"det": {"trt_oop": 3, "server": "pid:11"}}),
                             part(5.0, 9.5, ort={"det": {"trt_oop": 5, "server": "pid:12"}}),
                             part(10.0, 14.5, ort={"det": {"trt_oop": 6, "server": "pid:12"}})],
-                           base, wall=6.0, cuts_sec=[5.0, 10.0], interval=0.5)
-    m_none = op.merge_metas([part(0.0, 4.5, ort={"det": {"built": 2}}), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
+                           base, wall=6.0, cuts_sec=[5.0, 10.0])
+    m_none = op.merge_metas([part(0.0, 4.5, ort={"det": {"built": 2}}), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0])
     check("--workers 合并保留 TRT 按次退回的计数：按各段实际连的服务分组，同一服务取最大（回信是累计数）、不同服务相加；没有退回时不写",
           m_oop.get("ort") == {"det": {"trt_oop": 5, "trt_err": 1, "trt_err_first": "boom"}} and "ort" not in m_none
           and m_sep["ort"]["det"]["trt_oop"] == 9, (m_oop.get("ort"), m_sep.get("ort")))
-    bad = op.merge_metas([part(0.0, 5.0), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], interval=0.5)
-    check("**段间 PTS 不递增 → 不算完成**（每段内部的门管不到接缝）",
-          not bad["complete"] and "段间" in bad["bad_pts"])
-    check("**中间段**没跑完 → 整体没跑完",
-          not op.merge_metas([part(0.0, 4.5, complete=False), part(5.0, 9.5)], base,
-                             wall=6.0, cuts_sec=[5.0], interval=0.5)["complete"])
-    # 审查 2026-09-10：`end=0` 时容器虚报的 1% 帧数全压在末段上，3 个 worker 时末段只有 97%
-    tail = part(10.0, 14.5, complete=False, frames_requested=12361, frames_advanced=12001)
-    three = [part(0.0, 4.5, frames_requested=12000, frames_advanced=12000),
-             part(5.0, 9.5, frames_requested=12000, frames_advanced=12000), tail]
-    check("**末段自己没过覆盖率、整窗口过了 → 算完成**（和单进程同一把尺：36001/36361 = 99%）",
-          op.merge_metas(three, base, wall=6.0, cuts_sec=[5.0, 10.0], interval=0.5)["complete"])
-    short = [*three[:2], part(10.0, 14.5, complete=False, frames_requested=12361,
-                              frames_advanced=6000)]
+    bad = op.merge_metas([part(0.0, 5.0), part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0])
+    check("**下一段首帧的桶号不大于上一段末帧的 → 重叠，不算完成**（每段内部的门管不到接缝）",
+          not bad["complete"] and "段间" in bad["bad_pts"] and "重叠" in bad["seam_problems"][0])
+    # 中间段不逐段要求覆盖（验收 review 2026-11-23）：末尾紧跟素材缺口时它自己不到 98%，单进程跑同一窗口却算完成；
+    # 真断了靠切点核对问源文件拦
+    _mid = part(0.0, 2.0, complete=False, advanced_us=2_500_000)        # 段 [0, 5 s)，2.0 s 之后到切点是缺口
+    check("**中间段末尾紧跟素材缺口**（自己没过覆盖率、切点处源里没帧）→ 整窗口算完成，推进到的 = 切点之前整段 + 末段",
+          (lambda mm: mm["complete"] and mm["advanced_us"] == 10_000_000)(
+              op.merge_metas([_mid, part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], gap_has_frames=lambda a, b: False)))
+    check("**中间段真断了**（末尾之后到切点源里有帧）→ 漏帧，不算完成",
+          not op.merge_metas([_mid, part(5.0, 9.5)], base, wall=6.0, cuts_sec=[5.0], gap_has_frames=lambda a, b: True)["complete"])
+    check("任一段辅助流没交够（含末段）→ 整体没跑完、原因带上来",
+          (lambda mm: not mm["complete"] and mm["aux_incomplete"] == "x")(
+              op.merge_metas([part(0.0, 4.5), part(5.0, 9.5, complete=False, aux_incomplete="x")], base, wall=6.0, cuts_sec=[5.0])))
+    # 审查 2026-09-10：`end=0` 时容器虚报的那一截全压在末段上
+    tail = part(10.0, 14.5, complete=False, requested_us=5_180_500, advanced_us=5_000_000)
+    three = [part(0.0, 4.5), part(5.0, 9.5), tail]
+    check("**末段自己没过覆盖率、整窗口过了 → 算完成**（和单进程同一把尺）",
+          op.merge_metas(three, base, wall=6.0, cuts_sec=[5.0, 10.0])["complete"])
+    short = [*three[:2], part(10.0, 14.5, complete=False, requested_us=5_180_500, advanced_us=2_500_000)]
     check("末段真的断了（整窗口 < 98%）→ 不算完成",
-          not op.merge_metas(short, base, wall=6.0, cuts_sec=[5.0, 10.0], interval=0.5)["complete"])
-    hole = op.merge_metas([part(0.0, 4.5), part(8.0, 12.5)], base, wall=6.0, cuts_sec=[5.0],
-                          interval=0.5)
-    check("**切点处漏了一截（PTS 仍递增）→ 不算完成**——段间递增判据拦不住的那种",
-          not hole["complete"] and hole["bad_pts"] is None and "漏帧" in hole["seam_problems"][0])
-    check("正常切点（间隔恰好一个采样间隔）没有报警", m["seam_problems"] == [])
-    check("名义 / 平均帧率解析", op.parse_rate("60/1") == 60.0
-          and abs(op.parse_rate("60000/1001") - 59.94) < 0.01
-          and op.parse_rate("0/0") is None and op.parse_rate("N/A") is None)
-    f3 = op.seam_drift_sec(1997062, 998531000 / 16648233, 60.0)
-    f5 = op.seam_drift_sec(1332360, 1332360000 / 22205999, 60.0)
-    gate = op.DRIFT_MAX_FRAMES / 60.0
-    check("**f3（有缺口）整片漂移远超半帧门限，f5（没缺口）远低于**——拒绝开多 worker 的判据分得开",
-          f3 > gate * 100 and f5 < gate / 5)
-    f3_5min = op.seam_drift_sec(18000, 998531000 / 16648233, 60.0)
-    check("**按整个文件估，不按窗口**：f3 上 5 分钟窗口按窗口估只有 0.11 s（会被放行），"
-          "按整片估是 12 s（拒）——复审 2026-09-10",
-          f3_5min < 0.125 and f3 > gate)
+          not op.merge_metas(short, base, wall=6.0, cuts_sec=[5.0, 10.0])["complete"])
+    _asked = []
+
+    def gap(has):
+        def f(a, b):
+            _asked.append((a, b))
+            return has
+        return f
+    hole = op.merge_metas([part(0.0, 4.5), part(8.0, 12.5)], base, wall=6.0, cuts_sec=[5.0], gap_has_frames=gap(True))
+    check("**切点处隔了空桶、源里有帧（PTS 仍递增）→ 漏帧，不算完成**——段间递增判据拦不住的那种；问的是两段首末桶之间",
+          not hole["complete"] and hole["bad_pts"] is None and "漏帧" in hole["seam_problems"][0] and _asked == [(9, 16)])
+    gapok = op.merge_metas([part(0.0, 4.5), part(8.0, 12.5)], base, wall=6.0, cuts_sec=[5.0], gap_has_frames=gap(False))
+    check("切点处隔了空桶、源里也没有帧（素材缺口 / VFR 的稀处）→ 放行（原来「间隔恰好一个采样间隔」的判法在 VFR 上会误报）",
+          gapok["complete"] and gapok["seam_problems"] == [])
+    check("空桶探不出来 / 没给探测函数 → 照样报",
+          op.merge_metas([part(0.0, 4.5), part(8.0, 12.5)], base, wall=6.0, cuts_sec=[5.0], gap_has_frames=gap(None))["seam_problems"]
+          and op.merge_metas([part(0.0, 4.5), part(8.0, 12.5)], base, wall=6.0, cuts_sec=[5.0])["seam_problems"])
+    check("正常切点（首末桶相邻）没有报警", m["seam_problems"] == [])
     from flowocr.extract import ocr_args
     check("workers / det-batch 进 config（workers 复用判据会比；det_batch owner 10-04 定为噪音级，NOISE_EQUIV 不比）",
           {"workers", "det_batch"} <= set(ocr_args.config_of(["v.mp4", "--out", "x"]))
@@ -2673,60 +2658,17 @@ def t_ptsclock() -> None:
             return str(exc)
         return ""                                     # 没抛 = 下面两条必然不过
 
-    check("没给 where 就不编一个帧号出来", bad_msg() and "帧" not in bad_msg())
-    check("给了 where 就要带上", "帧 12345" in bad_msg(where="帧 12345"))
+    check("没给 where 就不编一个位置出来", bad_msg() and "：" not in bad_msg().split("PTS")[0])
+    check("给了 where 就要带上", "12.345000 s" in bad_msg(where="12.345000 s"))
 
     empty = pc.PtsClock()
     check("一帧都没有时跨度是 0，不抛也不除零", empty.span_sec == 0.0)
     check("一帧都没有时首末是 None",
           empty.meta()["pts_first_sec"] is None
           and empty.meta()["pts_last_sec"] is None)
-    # ---- IndexClock：帧号 <-> 真实时间（回抠这一级，2026-09-17，reuse-budget 计划 §8 第 1 条）----
-    us = 1_000_000 / 59.987
-    const = pc.IndexClock(us)
-    check("**不给锚点就是原来的常量换算**（CFR 素材上产物因此不变）",
-          const.t_of(1234) == 1234 * us and const.idx_of(1234 * us) == 1234 and len(const) == 0)
-    # 合成一段有丢帧缺口的时间轴：采样点每 30 帧一个，第 60 帧之后少交付了 12 帧
-    pairs = [(0, 0), (30, 500_000), (60, 1_000_000), (90, 1_700_000), (120, 2_200_000)]
-    ck = pc.IndexClock(us, pairs)
-    check("锚点上取值精确、两个锚点之间线性插值（缺口那一段用的是那一段自己的帧率）",
-          ck.t_of(60) == 1_000_000 and ck.t_of(75) == 1_350_000 and ck.t_of(45) == 750_000)
-    check("t_of / idx_of 严格互逆（含缺口那一段）",
-          all(abs(ck.idx_of(ck.t_of(i)) - i) < 1e-6 for i in (0, 17, 45, 60, 75, 101, 120)))
-    check("锚点之外退回名义帧率（窗口首尾会探出去几十帧）",
-          ck.t_of(-10) == -10 * us and abs(ck.t_of(130) - (2_200_000 + 10 * us)) < 1e-6)
-    check("**缺口之后帧号时钟和 pts 差出 12 帧**（这就是回抠窗口原来错开的量）",
-          round((ck.t_of(120) - 120 * us) / us) == 12)
-    d = Path(tempfile.mkdtemp())
-    obs = d / "o.jsonl"
-    obs.write_text("\n".join([
-        json.dumps({"_meta": {"timebase": "pts", "src_fps": 59.987}}),
-        json.dumps({"frame": 0, "t_us": 0, "text": "a"}),
-        json.dumps({"frame": 0, "t_us": 0, "text": "b"}),          # 同一帧的第二个框：不重复记锚点
-        json.dumps({"frame": 30, "t_us": 500_100, "text": "c"}),
-    ]) + "\n", encoding="utf-8")
-    ck2 = pc.index_clock_from_obs(obs, us)
-    check("从 obs 建时钟：逐采样点取 (帧号, pts)、同一帧只记一次", len(ck2) == 2 and ck2.t_of(30) == 500_100)
-    old = d / "old.jsonl"
-    old.write_text("\n".join([
-        json.dumps({"_meta": {"src_fps": 59.987}}),
-        json.dumps({"frame": 30, "t_us": 500_100, "text": "c"}),
-    ]) + "\n", encoding="utf-8")
-    check("**旧产物（时间轴不是 pts）一律退回常量换算**——那种时间轴本身不可信，不能拿来当锚点",
-          len(pc.index_clock_from_obs(old, us)) == 0)
-    # make_job 两头都走时钟：缺口之后的 run，窗口整体挪过去
-    sys.modules.setdefault("cv2", types.ModuleType("cv2"))
-    from flowocr.analyze import refine_boundaries as rb
-    run = {"t_start": 2_200_000, "t_end": 2_700_000, "box": [0, 0, 10, 10], "text": "ab", "n_obs": 2}
-    ja = rb.make_job(dict(run), 500_000, us, ck)
-    jb = rb.make_job(dict(run), 500_000, us, const)
-    # 方向两种都真实：**缺口**让 pts 落在帧号时钟之后（常量换算把时刻算到 12 帧之后，这里就是这种），
-    # 而**平均帧率偏低**让 pts 跑在前面（f4 的 20 分钟窗口里没有缺口，光这一项就 15 帧 / 250 ms）
-    check("**窗口按真实 pts 开**：缺口之后同一条 run 的窗整体挪 12 帧（原来就是错开这么多开的）",
-          jb["s"] - ja["s"] == 12 and jb["e"] - ja["e"] == 12 and jb["tw_lo"] - ja["tw_lo"] == 12,
-          (ja["s"], jb["s"]))
-    check("不给时钟的 make_job 和改之前逐值相同（守卫里别的用例就是这么调的）",
-          rb.make_job(dict(run), 500_000, us)["s"] == jb["s"])
+    check("PtsClock 的 t_us 和取帧层的帧身份是同一个换算（framegrid.frame_key）；IndexClock 删了（离线回抠那一支，frame-pts 计划）",
+          pc.PtsClock().push(0.123456789) == __import__("flowocr.extract.framegrid", fromlist=["x"]).frame_key(0.123456789)
+          and not hasattr(pc, "IndexClock") and not hasattr(pc, "index_clock_from_obs"))
 
 
 def t_framesource() -> None:
@@ -2738,137 +2680,94 @@ def t_framesource() -> None:
     print("framesource")
     from flowocr.extract import framesource as fs
 
-    cmd = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0.0, n_out=120)
+    from flowocr.extract.framegrid import Axis, frame_key
+    TB = Axis((1, 60))
+    cmd = fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 120), axis=TB)
     s = " ".join(cmd)
     check("**用 select 不用 fps**（fps 是补帧滤镜，pts 缺口处会复制帧填上）",
           "select=" in s and "-vf fps" not in s and ",fps=" not in s)
     check("**给了 -fps_mode passthrough**（否则 muxer 那层还会再补一次帧）",
           "-fps_mode" in cmd and cmd[cmd.index("-fps_mode") + 1] == "passthrough")
     check("挂了 showinfo（管道里是裸像素，pts 只能从 stderr 读）", "showinfo" in s)
-    check("默认 nv12（带宽减半 + 转换与 cv2 同源）",
-          cmd[cmd.index("-pix_fmt") + 1] == "nv12")
-    check("送出的帧数写死，不靠对面自己停",
-          cmd[cmd.index("-frames:v") + 1] == "120")
-    check("start=0 时不加 -ss", "-ss" not in cmd)
-    seek = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=12.5, n_out=4)
-    check("start>0 时 -ss 在 -i **前面**（快速且精确 seek）",
-          "-ss" in seek and seek.index("-ss") < seek.index("-i"))
-    check("**seek 时必须给 -copyts**（`-ss` 默认把时间戳归零，"
-          "窗口产物的时间轴会整体平移几个小时，而没有任何一层会报错）",
-          "-copyts" in seek and seek.index("-copyts") < seek.index("-i"))
-    # 精确 seek 修之前丢了首格的产物要作废，别的旧产物照旧复用（2026-09-26 审计：tmp/tg/yuka-f5-f22.jsonl 那一份；
-    # 当时磁盘上 3,461 份 obs 里只有它中这个形状）
-    from flowocr.extract import ocr_complete as OCC
-    bad = {"start_sec": 14843.0, "sample_fps": 2.2, "pts_first_sec": 14843.65, "grid_skipped": 1}
-    check("复用·精确 seek 修之前丢了窗口首格的产物作废；带 seek_rev 的、从文件头起的、没记缺格的、首格没晚的都不作废",
-          OCC.seek_dropped_first(bad) != ""
-          and OCC.seek_dropped_first({**bad, "seek_rev": fs.SEEK_REV}) == ""
-          and OCC.seek_dropped_first({**bad, "start_sec": 0.0}) == ""
-          and OCC.seek_dropped_first({**bad, "grid_skipped": 0}) == ""
-          and OCC.seek_dropped_first({**bad, "pts_first_sec": 14843.183}) == "")
+    check("默认 nv12（带宽减半）", cmd[cmd.index("-pix_fmt") + 1] == "nv12")
+    check("**选帧 = 负 pts 挡掉 × 窗口的桶号范围 × 采样桶换了（比上一个输入帧）**；读到 EOF、不写死帧数（VFR 上预计不了）",
+          r"select='gte(t\,0)*gte(floor((t+0.0010005)*2/1)\,0)*lt(floor((t+0.0010005)*2/1)\,120)"
+          r"*not(eq(floor((t+0.0010005)*2/1)\,floor((prev_t+0.0010005)*2/1)))'" in s and "-frames:v" not in cmd, s)
+    check("窗口尾靠输入端 -t 收口：读到 T_b − δ 再多 1 s；起点是 0 时不加 -ss；--end 0 不加 -t",
+          abs(float(cmd[cmd.index("-t") + 1]) - (60.0 - 0.0010005 + 1.0)) < 1e-6 and "-ss" not in cmd
+          and "-t" not in fs.build_ffmpeg_cmd("a.mp4", window=window2(0, None), axis=TB))
+    seek = fs.build_ffmpeg_cmd("a.mp4", window=window2(25, 120), axis=TB)
+    check("窗口起点 > 0 时 -ss 在 -i **前面**（快速且精确 seek），落在 T_a − δ − 1 ms（起点之前）",
+          "-ss" in seek and seek.index("-ss") < seek.index("-i")
+          and abs(float(seek[seek.index("-ss") + 1]) - (12.5 - 0.0020005)) < 1e-6)
+    check("**一律 -copyts**（`-ss` 默认把时间戳归零，窗口产物的时间轴会整体平移几个小时，而没有任何一层会报错；"
+          "不 seek 时也会减去容器的 start_time，和 ffprobe 读的包 pts 对不上）",
+          "-copyts" in seek and seek.index("-copyts") < seek.index("-i") and "-copyts" in cmd)
+    _org = fs.build_ffmpeg_cmd("a.mp4", window=window2(25, 120), axis=Axis((1, 60), 2_000_000))
+    _os = " ".join(_org)
+    check("**容器 start_time = S ≠ 0**：桶号、负时刻的门都在 t − S 上（S 写成整数 µs / 1e6）；-ss 给相对秒（ffmpeg 自己加上 S），和 S = 0 时同一个值",
+          abs(float(_org[_org.index("-ss") + 1]) - (12.5 - 0.0020005)) < 1e-6
+          and r"select='gte((t-2000000/1000000)\,0)*gte(floor(((t-2000000/1000000)+0.0010005)*2/1)\,25)" in _os
+          and r"floor(((prev_t-2000000/1000000)+0.0010005)*2/1)" in _os, _os)
     check("bgr24 时要挂一层 format=bgr24",
-          "format=bgr24" in " ".join(
-              fs.build_ffmpeg_cmd("a.mp4", grid=_every(2), start_sec=0, n_out=2, pix="bgr24")))
-    check("守卫会响：网格的帧率比不为正",
-          raises(lambda: fs.TimeGrid(0, 30), ValueError) and raises(lambda: fs.TimeGrid.for_rate(60, 0), ValueError))
-    check("守卫会响：要送 0 帧",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(1), start_sec=0, n_out=0),
-                 ValueError))
-    # 回抠的窗口解码（2026-09-16，reuse-budget 计划 §7）：帧号集合并区间、select 只送区间里的帧
-    check("merge_intervals：排序去重、相邻并起来、gap 内也并",
-          fs.merge_intervals([5, 3, 4, 9, 10, 20, 20]) == [(3, 5), (9, 10), (20, 20)]
-          and fs.merge_intervals([1, 4, 8], gap=2) == [(1, 4), (8, 8)])
-    wcmd, base, n_out = fs.build_ffmpeg_window_cmd("a.mp4", [(120, 130), (300, 302)], src_fps=60.0)
-    check("窗口命令：-ss 到第一个区间起点并 -copyts，select 的 n 按起点重编，帧数 = 区间长度之和",
-          base == 120 and n_out == 14 and "-copyts" in wcmd and wcmd[wcmd.index("-ss") + 1] == "2.000000"
-          and any("between(n\\,0\\,10)+between(n\\,180\\,182)" in x for x in wcmd)
-          and wcmd[wcmd.index("-frames:v") + 1] == "14", wcmd)
-    check("窗口 step / scale：隔帧按绝对帧号对齐、模板帧照取；scale 进滤镜链；坏值会响",
-          fs.window_frames([(120, 125)], step=2, keep=[123]) == [120, 122, 123, 124]
-          and fs.build_ffmpeg_window_cmd("a.mp4", [(120, 125)], src_fps=60.0, step=2, keep=[123])[2] == 4
-          and any("*not(mod(n+120\\,2))" in x and "eq(n\\,3)" in x
-                  for x in fs.build_ffmpeg_window_cmd("a.mp4", [(120, 125)], src_fps=60.0, step=2, keep=[123])[0])
-          and any("scale=trunc(iw*0.5/2)*2" in x for x in fs.build_ffmpeg_window_cmd("a.mp4", [(0, 3)], src_fps=30.0, scale=0.5)[0])
-          and raises(lambda: fs.build_ffmpeg_window_cmd("a.mp4", [(0, 3)], src_fps=30.0, step=0), ValueError)
-          and raises(lambda: fs.build_ffmpeg_window_cmd("a.mp4", [(0, 3)], src_fps=30.0, scale=1.5), ValueError))
-    # **窗口 seek 必须按真实 pts**（2026-09-18 审计的 P1）：`select` 里的 `n` 数的是 seek 之后交付的第几帧，
-    # 所以"n + base = 绝对帧号"只在 seek 恰好落在帧 base 上时成立。按 `base/src_fps`（容器平均帧率）算，
-    # 有缺口的素材上会落错位置——**交付的是别的帧，却仍被标成我们要的帧号**。
-    # 最小反例和修好之后的对照在 a1-mask-reuse 实验里的 `gap_window_check.py`（合成一段带缺口的视频，
-    # 灰度值 = 帧号 × 10，所以"取到的是哪一帧"是看得见的）：旧行为取到 69/80，要的是 50/60。
-    # 实测这份偏差在真素材上有多大：e-yuka-f4 的 20 分钟窗口末端 **−257.7 ms = 15.5 帧**（60.0 vs 59.9870）。
-    def ss_of(**kw):
-        c = fs.build_ffmpeg_window_cmd("a.mp4", [(120, 130)], src_fps=60.0, **kw)[0]
-        return c[c.index("-ss") + 1]
-
-    check("**窗口 seek 用真实 pts（base_ts）**，不给才退回 base/src_fps",
-          ss_of(base_ts=2.257) == "2.257000" and ss_of() == "2.000000",
-          (ss_of(base_ts=2.257), ss_of()))
-    # 窗口解码那半 2026-09-22 拆进了 extract/refine_video（tools/refine_boundaries.py 只剩 shim）
-    src_rb = (ROOT / "src" / "flowocr" / "extract" / "refine_video.py").read_text(encoding="utf-8")
-    check("回抠把同一份时钟传给窗口解码（ts_of=），不然窗口按 pts 算、seek 按平均帧率走",
-          "framesource.FfmpegWindows(" in src_rb and "ts_of=" in src_rb)
-    check("窗口命令：从 0 起就不 -ss；空区间 / 坏像素格式会响",
-          "-ss" not in fs.build_ffmpeg_window_cmd("a.mp4", [(0, 3)], src_fps=30.0)[0]
-          and raises(lambda: fs.build_ffmpeg_window_cmd("a.mp4", [], src_fps=30.0), ValueError)
-          and raises(lambda: fs.build_ffmpeg_window_cmd("a.mp4", [(0, 1)], src_fps=30.0, pix="rgb"), ValueError))
+          "format=bgr24" in " ".join(fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 2), axis=TB, pix="bgr24")))
     check("守卫会响：不认识的像素格式",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(1), start_sec=0,
-                                             n_out=1, pix="rgb48"), ValueError))
-    check("守卫会响：不认识的解码后端",
-          raises(lambda: fs.make_source("a.mp4", backend="vlc", grid=_every(1), start_idx=0,
-                                        end_idx=2, src_fps=60, width=8, height=8),
-                 ValueError))
+          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 2), axis=TB, pix="rgb48"), ValueError))
+    check("cv2 解码、--frame-select、单独一路的硬解辅助流删了（frame-pts 计划）",
+          not any(hasattr(fs, n) for n in ("Cv2Source", "DEFAULT_DECODER", "FfmpegFullRate", "FfmpegWindows",
+                                            "build_ffmpeg_window_cmd", "id_rate", "pts_frame", "grid_skew_of", "SEEK_REV")))
 
-    hw = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda")
+    hw = fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 2), axis=TB, hwaccel="cuda")
     hs = " ".join(hw)
     check("**hwaccel 要带 -hwaccel_output_format**（不带的话每帧解完都下载回内存，"
           "『跳过的帧不过 PCIe』就不成立）", "-hwaccel_output_format" in hw)
     check("**hwdownload 在 select 之后**（丢弃发生在下载之前才省得下 PCIe）",
           hs.index("select=") < hs.index("hwdownload"))
-    check("不给 hwaccel 就一个字都不提（生产路径永远走这条）",
-          "hwaccel" not in " ".join(fs.build_ffmpeg_cmd("a.mp4", grid=_every(2),
-                                                        start_sec=0, n_out=2)))
+    check("不给 hwaccel 就一个字都不提", "hwaccel" not in " ".join(fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 2), axis=TB)))
     # 有前摇的 av1 的平移修法（decode-buffer §8.6）：两路都要平移，而且平移必须在 select / split 之前
-    pr = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda",
-                             select_by="pts", src_fps=60.0, preroll_ticks=82944)
+    pr = fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=TB, hwaccel="cuda", preroll_ticks=82944)
     ps = " ".join(pr)
-    check("前摇平移：-ignore_editlist 在 -i 之前、setpts 在 select 之前（按整数刻度）",
-          pr.index("-ignore_editlist") < pr.index("-i") and ps.index("setpts=PTS-82944") < ps.index("select="))
-    pd = fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda", select_by="pts",
-                             src_fps=60.0, preroll_ticks=82944,
-                             aux={"grid": [1, 1, 1, 30], "scale": 0.35, "n_frames": 120, "url": "tcp://x", "w": 672, "h": 378})
+    check("前摇平移：-ignore_editlist 在 -i 之前、setpts 在 select 之前（按整数刻度）；-t 加上前摇的秒数",
+          pr.index("-ignore_editlist") < pr.index("-i") and ps.index("setpts=PTS-82944") < ps.index("select=")
+          and abs(float(pr[pr.index("-t") + 1]) - (4.0 - 0.0010005 + 1.0 + 82944 / 60)) < 1e-6)
+    pd = fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=TB, hwaccel="cuda", preroll_ticks=82944,
+                             aux={"clock": [60, 1, 2, 1], "scale": 0.35, "url": "tcp://x", "w": 672, "h": 378})
+    pds = " ".join(pd)
     check("前摇平移：双路时平移在 split 之前（辅路和采样路看同一条时间轴）",
-          "[0:v]setpts=PTS-82944,split=2" in " ".join(pd))
+          "[0:v]setpts=PTS-82944,split=2" in pds)
+    check("辅路：同一个范围、辅助桶或采样桶换了就选（采样帧一定在辅助流里）、自己挂 showinfo@aux",
+          r"select='gte(t\,0)*gte(floor((t+0.0010005)*2/1)\,0)*lt(floor((t+0.0010005)*2/1)\,8)"
+          r"*not(eq(floor((t+0.0010005)*60/1)\,floor((prev_t+0.0010005)*60/1))*eq(floor((t+0.0010005)*2/1)\,floor((prev_t+0.0010005)*2/1)))'" in pds
+          and "showinfo@aux" in pds and "-frames:v" not in pd)
+    check("守卫会响：辅助桶的采样那一半和窗口的不同",
+          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=TB,
+                                             aux={"clock": [60, 1, 1, 1], "scale": 0.35, "url": "tcp://x"}), ValueError))
     check("前摇平移不给就一个字都不提", "ignore_editlist" not in hs and "setpts" not in hs)
-    check("守卫会响：前摇平移配 index 选帧（前摇帧会被数进格子）",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda",
-                                             select_by="index", preroll_ticks=10), ValueError))
     check("守卫会响：前摇平移配非零起点（seek 本来就不少交付，平移反而错）",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=5.0, n_out=4, hwaccel="cuda",
-                                             select_by="pts", src_fps=60.0, preroll_ticks=10), ValueError))
-    # **探针不许自己拼命令**：它原来那份 `build_cmd` 没有 `-copyts`，
-    # 加 `--start` 会原样复活「窗口时间轴平移几小时、没人报错」那个坑。
-    probe_src = (ROOT / "dev_tools/probe_ffmpeg_decode.py").read_text(encoding="utf-8")
-    check("**probe_ffmpeg_decode 用共享的那份命令**，不自带一份",
-          "framesource.build_ffmpeg_cmd" in probe_src
-          and "def build_cmd" not in probe_src)
-    check("**两个解码探针都有 --start**（不然量的一律是文件头，"
-          "而同一个文件里不同段落的解码成本差 2.5×）",
-          '"--start"' in probe_src
-          and '"--start"' in (ROOT / "dev_tools/probe_hwdecode.py").read_text(encoding="utf-8"))
+          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", window=window2(25, 120), axis=TB, hwaccel="cuda", preroll_ticks=10),
+                 ValueError))
 
-    check("解析 showinfo 的 pts_time",
-          fs.parse_pts_line("[Parsed_showinfo_1 @ 0x1] n:3 pts:600 pts_time:10.5 x") == 10.5)
-    check("整数 pts_time 也认", fs.parse_pts_line("pts_time:7 foo") == 7.0)
+    check("解析 showinfo：哪一路、n、**整数 pts**、pts_time（ffmpeg 8 的格式，pts 右对齐、pts_time 左对齐）",
+          fs.parse_showinfo("[showinfo@main @ 0000016] n:   3 pts:    600 pts_time:10      duration:    256 x")
+          == ("main", 3, 600, 10.0)
+          and fs.parse_showinfo("[showinfo@aux @ 0x1] n:  12 pts: -82944 pts_time:-5.4 duration:1") == ("aux", 12, -82944, -5.4)
+          and fs.parse_showinfo("frame=  60 fps=45 [showinfo@main @ 0x1] n:   0 pts:      0 pts_time:0       d") == ("main", 0, 0, 0.0))
     check("**不是那种行就返回 None**（别把普通日志当时间戳）",
-          fs.parse_pts_line("frame= 60 fps=45 speed=22.1x") is None)
+          fs.parse_showinfo("frame= 60 fps=45 speed=22.1x") is None
+          and fs.parse_showinfo("[Parsed_showinfo_1 @ 0x1] n:3 pts:600 pts_time:10.5 x") is None)
+    check("开流核对：pts × 时间基与 pts_time 到 µs 一致就过；链路里换了时间基（差出整帧）就报",
+          fs.check_tb(512, 1.0, Axis((1, 512))) is None and fs.check_tb(1001, 0.016683, Axis((1, 60000))) is None
+          and fs.check_tb(600, 10.0, Axis((1, 60))) is None and fs.check_tb(600, 10.0, Axis((1, 90000))) is not None
+          and fs.check_tb(600, 10.0, Axis((1, 60), 2_000_000)) is None)
+    check("帧身份 = round(pts_time × 1e6) − S（唯一换算处；取帧层经 Axis.key 减容器的 start_time）",
+          frame_key("3.525") == 3_525_000 and frame_key(0.0166667) == 16_667 and frame_key("0") == 0
+          and Axis((1, 60), 2_000_000).key("3.525") == 1_525_000 and Axis((1, 60), -21_333).key("0") == 21_333)
 
     # 预取：保序 + 生产者的异常必须冒出来
     class Fake:
         def __init__(self, items, boom=False):
             self.items, self.boom = items, boom
-            self.stopped_early, self.advanced, self.closed = False, len(items), False
+            self.stopped_early, self.advanced_us, self.closed = False, len(items), False
             self.produced = 0            # 真正被生产者取走了几个
 
         def describe(self):
@@ -2899,8 +2798,8 @@ def t_framesource() -> None:
           raises(lambda: fs.PrefetchSource(Fake([]), 0), ValueError))
     inner = Fake(list(want))
     p = fs.PrefetchSource(inner, 2)
-    check("stopped_early / advanced 透传到里层", (p.stopped_early, p.advanced) ==
-          (inner.stopped_early, inner.advanced))
+    check("stopped_early / advanced_us 透传到里层", (p.stopped_early, p.advanced_us) ==
+          (inner.stopped_early, inner.advanced_us))
     p.close()
     check("close 传到里层（子进程不能漏）", inner.closed)
 
@@ -2914,10 +2813,8 @@ def t_framesource() -> None:
     p2.close()
     check("**中途 break 之后 close 不挂起**（生产者卡在满队列上也要能收掉）",
           inner2.closed)
-    # 2026-09-10：close 以前只排空队列、**不 join**。生产者线程还活着的时候
-    # `inner.close()` 就下去了——`Cv2Source` 那条是主线程 `cap.release()` 撞上
-    # 生产者 `cap.grab()`，OpenCV 上是未定义行为，可能直接把进程带走，
-    # 于是 `bad_pts` 承诺的「退出码 4 + 留产物排查」反而拿不到。
+    # 2026-09-10：close 以前只排空队列、**不 join**。生产者线程还活着的时候 `inner.close()` 就下去了
+    # （当时的 cv2 解码那条是主线程 `cap.release()` 撞上生产者 `cap.grab()`，可能直接把进程带走）。
     check("**close 之后生产者线程必须已经退干净**（不能和 inner.close 抢同一个解码器）",
           p2._th is not None and not p2._th.is_alive())
     big = [(i, i / 60, i) for i in range(5000)]
@@ -2973,72 +2870,6 @@ def t_obs_diff_grid() -> None:
           "退回" in "\n".join(lines) and "也可能只是空帧不同" in "\n".join(lines))
 
 
-def t_decoder_default() -> None:
-    """默认解码器只有一份常量（owner 2026-09-10：全局统一用 ffmpeg，不按素材分叉）。
-
-    `run_ocr2 --decoder` 的默认值和 `ocr_complete` 的复用判据都要读
-    `framesource.DEFAULT_DECODER`。**任何一处写死字面量**，默认一改两边就分家——
-    一边产 ffmpeg、一边还拿 cv2 当"已跑完"，正是 owner 说的"不想有的用 cv2 有的用 ffmpeg"。
-    静态查，不 import run_ocr2（它顶层拉 cv2 和整个提取包）。
-    """
-    print("默认解码器只有一份")
-    import ast
-    from flowocr.extract import framesource as fs
-
-    check("**默认解码器是 ffmpeg**（改它要连 docs/architecture/defaults.md §1.2 一起改）",
-          fs.DEFAULT_DECODER == "ffmpeg")
-    # 参数定义 2026-09-10 挪进了 tools/ocr_args.py（复用判据要用同一个解析器）
-    src = (ROOT / "src/flowocr/extract/ocr_args.py").read_text(encoding="utf-8")
-    default = None
-    for node in ast.walk(ast.parse(src)):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "add_argument" and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "--decoder"):
-            for kw in node.keywords:
-                if kw.arg == "default":
-                    default = ast.unparse(kw.value)
-    check("**run_ocr2 的 --decoder 默认值读共享常量**，不写死字面量",
-          default == "framesource.DEFAULT_DECODER", f"实际写的是 {default!r}")
-    from flowocr.extract import ocr_args
-    check("解析出来的默认解码器就是那个常量",
-          ocr_args.config_of(["v.mp4", "--out", "x"])["decoder"] == fs.DEFAULT_DECODER)
-    oc_src = (ROOT / "src/flowocr/extract/ocr_complete.py").read_text(encoding="utf-8")
-    check("复用判据也读同一个常量", "framesource.DEFAULT_DECODER" in oc_src)
-
-
-def t_backfill_complete() -> None:
-    """旧产物的 `_meta.complete` 重判（audit-5 §7）：**值由计数器算，不手填**。"""
-    print("backfill_complete")
-    import json
-
-    import backfill_complete as bf
-
-    check("容器多报 1%（36001/36361）重判为跑完",
-          bf.verdict({"frames_advanced": 36001, "frames_requested": 36361}) is True)
-    check("**真中断的照样判没跑完**（14000/36361）",
-          bf.verdict({"frames_advanced": 14000, "frames_requested": 36361}) is False)
-    check("缺计数器时返回 None——**不猜**",
-          bf.verdict({"complete": False}) is None)
-
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "x.jsonl"
-        body = ['{"t_us": 0, "text": "a"}', '{"t_us": 1, "text": "b"}']
-        p.write_text(json.dumps({"_meta": {"complete": False, "frames_advanced": 36001,
-                                           "frames_requested": 36361, "wall_sec": 1.5}}) + "\n"
-                     + "\n".join(body) + "\n", encoding="utf-8")
-        before = p.read_text(encoding="utf-8").splitlines()[1:]
-        check("**默认只看不写**", bf.main([str(p)]) == 0
-              and json.loads(p.open(encoding="utf-8").readline())["_meta"]["complete"] is False)
-        bf.main([str(p), "--write"])
-        meta = json.loads(p.open(encoding="utf-8").readline())["_meta"]
-        check("--write 才落盘，且留痕", meta["complete"] is True
-              and "backfilled" in "".join(meta))
-        check("**正文一行都不动**（只换首行）",
-              p.read_text(encoding="utf-8").splitlines()[1:] == before)
-        check("别的字段不丢", meta["wall_sec"] == 1.5)
-
-
 def t_predet_stable() -> None:
     """predet 的提前停止：**区域集合缩水不算稳定**（methodology-audit-4 报告 C8）。"""
     print("predet.stable")
@@ -3081,79 +2912,81 @@ def t_same_frame_dedup() -> None:
 
 
 def t_frame_grid() -> None:
-    """采样格：**按什么数**，以及数错了谁来喊（2026-09-20，hw-decode-results §9）。
+    """帧身份与选帧（frame-pts 计划，2026-11-23）：身份 = 这一帧自己的 pts（`t_us`），按时间桶取第一帧；数错了谁来喊。
 
-    病是这样的：`select='not(mod(n,stride))'` 数的是**进到 select 的第几帧**，
-    而 NVDEC 在有前摇（首包 pts 为负）的 av1 上会少交付 1~3 帧——于是**整条采样格平移**，
-    `frame` 字段和 `t_us` 从此错配，**下游没有任何一层看得出来**。
-    真值不是"另一条解码路"，是**容器的 pts**：第 k 格要的就是 `(start_idx + k*stride)/src_fps`。
-
-    两件事钉在这里：`--frame-select pts` 换成按时刻数；`FfmpegSource` 逐帧对一次账。
+    来历：帧身份曾是 `round(t × 某个帧率)`——按交付顺序数（NVDEC 少交付就整条平移）、按平均帧率（缺口处撞号）、按名义帧率
+    （VFR 上帧号稀疏、2 fps 只取到 1 帧）依次被击穿。只要身份还依赖一个帧率，总有素材让它错。
     """
-    print("采样格")
+    print("帧身份 / 时间桶")
+    import inspect as _insp
+
     from flowocr.extract import framesource as fs
+    from flowocr.extract.framegrid import AuxClock, Axis, Clock, SampleClock
 
-    idx = " ".join(fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4))
-    pts = " ".join(fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4,
-                                       select_by="pts", src_fps=60.0))
-    check("默认仍按交付顺序数（index）", "mod(n\\,30)" in idx and "round(t*" not in idx)
-    check("pts 那条按 round(t*src_fps) 数", "round(t*60.000000000)" in pts and "mod(n\\," not in pts)
-    check("pts 那条挡掉负 pts 的前摇", "gte(t\\,0)" in pts)
-    check("pts 选帧没有 src_fps 就报错（不许默默按 0 算）",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4,
-                                             select_by="pts")))
-    check("不认识的选帧方式报错",
-          raises(lambda: fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4,
-                                             select_by="nearest")))
-    # cv2 是自己按 idx 数的，选帧根本不经过 ffmpeg——静默忽略会让 A/B 两条臂塌成一条
-    check("cv2 后端拒绝 --frame-select pts（不静默忽略）",
-          raises(lambda: fs.make_source("a.mp4", backend="cv2", grid=_every(30), start_idx=0,
-                                        end_idx=60, src_fps=60.0, width=8, height=8,
-                                        select_by="pts")))
-
-    # 核对那一半（2026-09-20 复审 P1 后重写）：**偏离格子**和**没交付的格**是两件事
-    check("grid_step：在格上、没跳格", fs.grid_step(0, 30, 0, _every(30)) == (0, []))
-    check("grid_step：素材缺口跳过两格", fs.grid_step(20, 35, 0, _every(5)) == (0, [25, 30]))
-    check("grid_step：第一帧就晚一格（gi-s2 硬解的形状）", fs.grid_step(None, 30, 0, _every(30)) == (0, [0]))
-    check("grid_step：偏离格子（index 选帧 + 少交付）", fs.grid_step(0, 31, 0, _every(30)) == (1, [30]))
-    check("grid_step：非零起点", fs.grid_step(None, 90, 60, _every(30)) == (0, [60]))
-    _g8 = fs.TimeGrid(2, 15)                      # 60 fps 上 8 fps：格子 0 8 15 23 30 38 45 …
-    check("grid_step：不等距网格——在格上 / 缺口跳格 / 偏离格子",
-          fs.grid_step(15, 23, 0, _g8) == (0, []) and fs.grid_step(8, 38, 0, _g8) == (0, [15, 23, 30])
-          and fs.grid_step(15, 24, 0, _g8) == (1, [23]))
-    check("parse_showinfo 按命名实例分流，带上 showinfo 自己的帧计数 n",
-          fs.parse_showinfo("[showinfo@aux @ 0000] n:   3 pts:  3 pts_time:0.3 dur") == ("aux", 3, 0.3)
-          and fs.parse_showinfo("[showinfo@main @ 0000] n: 0 pts: 0 pts_time:14843.5 x") == ("main", 0, 14843.5)
+    check("parse_showinfo 按命名实例分流，带上 showinfo 自己的帧计数 n 和整数 pts",
+          fs.parse_showinfo("[showinfo@aux @ 0000] n:   3 pts:  3 pts_time:0.3 dur") == ("aux", 3, 3, 0.3)
+          and fs.parse_showinfo("[showinfo@main @ 0000] n: 0 pts: 0 pts_time:14843.5 x") == ("main", 0, 0, 14843.5)
           and fs.parse_showinfo("[Parsed_scale_1 @ 0000] w:960") is None)
     # 2026-09-20 晚实测的病：进度行 `frame=… \r` 不换行，下一行 showinfo 粘在它后面
     check("被进度行粘住的 showinfo 行照样认得出（第一版锚行首，丢行 -> 之后整体错开一格）",
           fs.parse_showinfo("frame=   15 fps=0.0 q=-0.0 elapsed=0:00:00.51    \r"
-                            "[showinfo@aux @ 0000012e] n: 478 pts: 7 pts_time:7.9667 x") == ("aux", 478, 7.9667))
+                            "[showinfo@aux @ 0000012e] n: 478 pts: 7 pts_time:7.9667 x") == ("aux", 478, 7, 7.9667))
     check("ffmpeg 命令带 -nostats（从源头关掉进度行）",
-          "-nostats" in fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4))
-    import inspect as _insp
+          "-nostats" in fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60))))
     check("采样流和辅路都拿 showinfo 的 n 逐帧核对（丢行当场报，不静默错位）",
           "if sn != n:" in _insp.getsource(fs.FfmpegSource) and "if sn != k:" in _insp.getsource(fs.AuxReader))
-    _cmd = " ".join(fs.build_ffmpeg_cmd("a.mp4", grid=_every(30), start_sec=0, n_out=4, select_by="pts", src_fps=60.0,
-                                        aux={"grid": [1, 2, 1, 30], "scale": 0.5, "n_frames": 60, "url": "tcp://x"}))
+    _cmd = " ".join(fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60)),
+                                        aux={"clock": [60, 1, 2, 1], "scale": 0.5, "url": "tcp://x"}))
     check("两路各挂一个命名 showinfo（校验和关掉）",
           "showinfo@main=checksum=0" in _cmd and "showinfo@aux=checksum=0" in _cmd)
-    check("pts 选帧时辅路也按 pts 数、也挡负 pts（两路同一套帧身份）",
-          "gte(t\\,0)*not(mod(round(t*60.000000000)\\,2))" in _cmd)
-    # 复审第三轮 P1：帧身份的帧率
-    check("id_rate：名义帧率合理就用它（f3：60 vs 平均 59.978）", fs.id_rate(60.0, 59.978) == 60.0)
-    check("id_rate：合成缺口视频（名义 10 / 平均 8.83）", fs.id_rate(10.0, 53 / 6) == 10.0)
-    check("id_rate：名义帧率比平均高出一倍以上（把时间基当帧率报）就不信", fs.id_rate(90000.0, 59.94) == 59.94)
-    check("id_rate：探不到名义帧率时退回平均", fs.id_rate(None, 29.97) == 29.97)
-    _dup = [round(k / 60 * 59.978) for k in range(0, 6000)]
-    check("反例：按平均帧率取整，6000 帧里真的会撞号（这正是复审复现的病）", len(set(_dup)) < len(_dup))
-    check("按名义帧率取整：6000 帧一个不撞", len({round(k / 60 * 60.0) for k in range(6000)}) == 6000)
-    import inspect as _i3
-    check("两路都有碰撞守卫（帧号必须严格递增）",
-          "idx <= prev_idx" in _i3.getsource(fs.FfmpegSource) and "key <= prev_key" in _i3.getsource(fs.AuxReader))
+    check("碰撞守卫：采样流、辅路、帧环、分片合流都要求键严格递增（同一 pts 出现两次的坏文件当场报）",
+          "key <= prev_key" in _insp.getsource(fs.FfmpegSource) and "key <= prev_key" in _insp.getsource(fs.AuxReader)
+          and "f.key <= last.key" in (ROOT / "src/flowocr/extract/decode_shards.py").read_text(encoding="utf-8")
+          and "key <= self.highest" in (ROOT / "src/flowocr/extract/edge_refine.py").read_text(encoding="utf-8"))
+    check("采样流和辅路都核桶号前进（ffmpeg 每格只交第一帧：不前进 = Python 复刻和 ffmpeg 的选帧不一致）",
+          "cell <= prev[1]" in _insp.getsource(fs.FfmpegSource) and "(sc, ac) == prev_cells" in _insp.getsource(fs.AuxReader))
+    check("开流时核对前几帧 pts × 时间基 = pts_time（不一致报错）",
+          "check_tb(pts, t, axis)" in _insp.getsource(fs.FfmpegSource) and fs.TB_CHECK_FRAMES >= 1)
+    # 参考帧率：只作"一个源帧多长"的容差，不决定任何帧的身份（取值规则同原来的 id_rate）
+    check("ref_rate：名义帧率合理就用它（f3：60 vs 平均 59.978）", fs.ref_rate(60.0, 59.978) == 60.0)
+    check("ref_rate：合成缺口视频（名义 10 / 平均 8.83）", fs.ref_rate(10.0, 53 / 6) == 10.0)
+    check("ref_rate：名义帧率比平均高出一倍以上（片段 4：47.952 对 23.907；把时间基当帧率报的）就用平均",
+          fs.ref_rate(47.952, 23.907) == 23.907 and fs.ref_rate(90000.0, 59.94) == 59.94)
+    check("ref_rate：探不到名义帧率时退回平均；探不到平均时用名义",
+          fs.ref_rate(None, 29.97) == 29.97 and fs.ref_rate(60.0, None) == 60.0)
+    from flowocr.artifacts import textdir as _td
+    check("竖排读法：转过去读出两个字以上、有假名汉字、分数更高才取（「行って！」对「行」）",
+          _td.prefer_rotated(("行", 0.984), ("行って！", 0.939)) and not _td.prefer_rotated(("8", 0.9), ("do", 0.95)))
+    check("竖排读法：中点、长音不算中日韩字（竖装饰线转过去读成「ーー」「・ー」不取）",
+          not _td.prefer_rotated(("", 0.0), ("ーー", 0.9)) and not _td.prefer_rotated(("", 0.0), ("・ー", 0.9))
+          and _td.prefer_rotated(("", 0.0), ("ラー", 0.9)))
     _ro3 = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
-    check("run_ocr2：ffmpeg 路径帧率走 id_rate（名义帧率）", "framesource.id_rate(" in _ro3)
-    check("run_ocr2：--end 0 的窗口尾按时长算，不按帧的个数", "total_frames * src_fps // avg_fps" in _ro3)
+    check("run_ocr2：_meta 记 frame_key = t_us、nominal_fps、sample_clock、aux_clock、cell_tol_us；不再记 sample_grid / stride / aux_grid / seek_rev / decoder",
+          '"frame_key": "t_us"' in _ro3 and '"nominal_fps"' in _ro3 and '"sample_clock": vp.clock.as_list()' in _ro3
+          and '"aux_clock": aux_clock.as_list()' in _ro3 and '"cell_tol_us": DELTA_US' in _ro3
+          and not any(k in _ro3 for k in ('"sample_grid"', '"stride"', '"aux_grid"', '"seek_rev"', '"decoder":')))
+    check("obs 行没有 `frame` 字段（两处写 obs 的地方：run_ocr2 主路 + reuse_v2 延迟落盘）",
+          '"frame":' not in _ro3 and '"frame":' not in (ROOT / "src/flowocr/extract/reuse_v2.py").read_text(encoding="utf-8"))
+    from flowocr.extract import framegrid as _fg
+    check("δ = 1000.5 µs：表达式里的字面和 meta 里记的是同一个数", _fg.DELTA == "0.0010005" and _fg.DELTA_US == 1000.5)
+    # 硬解核对（frame-pts 计划第 6 节）：被吞的帧会由同一桶的下一帧顶上，"偏离"查不出来 -> 问源文件
+    c2, TB = SampleClock(2), Axis((1, 60))
+    w = window2(0, 8)
+    _pk = list(range(0, 480))
+    check("eaten：跳过的桶（①）里源有包 -> 吞帧；比交出的帧更早、同桶的包（②）-> 吞帧；上一帧那个桶里的不算",
+          fs.eaten(_pk, c2, TB, after_pts=30, before_pts=90, after_cell=1, window=w) == list(range(60, 90))
+          and fs.eaten(_pk, c2, TB, after_pts=30, before_pts=61, after_cell=1, window=w) == [60]
+          and fs.eaten(_pk, c2, TB, after_pts=30, before_pts=60, after_cell=1, window=w) == [])
+    check("eaten：窗口起点之前（after_cell = a − 1）、窗口外的不算；探不出来原样返回 None",
+          fs.eaten(_pk, c2, TB, after_pts=None, before_pts=30, after_cell=-1, window=window2(0, 1)) == list(range(0, 30))
+          and fs.eaten([500], c2, TB, after_pts=None, before_pts=None, after_cell=-1, window=w) == []
+          and fs.eaten(None, c2, TB, after_pts=1, before_pts=2, after_cell=0) is None)
+    check("FfmpegSource 的硬解核对：① 隔了空桶、② 晚过 1.5 个参考帧间隔才问源；块的第一帧不在这里核（合流那边核）",
+          "cell <= after_cell + 1 and not late" in _insp.getsource(fs.FfmpegSource._check_hw)
+          and "1.5 / max(self.stream.ref_fps" in _insp.getsource(fs.FfmpegSource._check_hw)
+          and "self.block[0] is not None" in _insp.getsource(fs.FfmpegSource._check_hw))
+    check("硬解试解：不管有没有前摇，都比硬解和软解交出的 pts 列表；有前摇的再比像素",
+          "if a != b_:" in _insp.getsource(fs.hwaccel_blocker) and "if preroll:" in _insp.getsource(fs.hwaccel_blocker))
     # 复审第三轮 P2：重试由外层进程监督，第一趟退出之后才起第二趟
     # 2026-09-22 监督者搬进 extract/supervisor.py（console script `flowocr-ocr` 要不 import run_ocr2 就能起它）
     _sv = (ROOT / "src/flowocr/extract/supervisor.py").read_text(encoding="utf-8")
@@ -3222,69 +3055,26 @@ def t_frame_grid() -> None:
     check("监督者用 Job Object 绑住 worker（被杀时连 ffmpeg / ORT 服务一起收；不用 stdin 看门狗——Windows 上会死锁）",
           "_kill_on_close_job()" in _ro3 and "AssignProcessToJobObject" in _ro3
           and "sys.stdin.buffer.read()" not in _ro3)
-    from flowocr.extract import ocr_args as _oa3
-    check("帧身份口径进 config、且不在 ADDED_NOOP（平均帧率那一版的产物不复用）",
-          _oa3.config_of(["v.mp4", "--out", "x.jsonl"]).get("frame_id") == "nominal"
-          and "frame_id" not in _oa3.ADDED_NOOP
-          and "frame_id" not in _oa3.config_of(["v.mp4", "--out", "x.jsonl", "--decoder", "cv2"]))
-    check("probe_interval：起点 ≤ 0 时从头读（首包 pts 为负的文件上 `0%1` 一个包都读不出来）",
+    check("probe_interval：起点 ≤ 0 时从头读（首包 pts 为负的文件上 `0%1` 一个包都读不出来）；不设终点读到文件尾",
           fs.probe_interval(-1.0, 1.0) == "%1.000000" and fs.probe_interval(0.0, 1.0) == "%1.000000"
-          and fs.probe_interval(58.0, 61.0) == "58.000000%61.000000")
-    check("source_has_frames：探不出来按「源里有」算（不许读成合法缺口）",
-          fs.source_has_frames("不存在的文件.mp4", [30, 60], 60.0) == [30, 60])
-    check("格子上的帧：偏移 0", fs.grid_skew_of(0.5, 30, 60.0) == 0)
-    check("少交付 1 帧：pts 比帧号晚一格", fs.grid_skew_of(0.5 + 1 / 60, 30, 60.0) == 1)
-    check("少交付 3 帧（gi-s2 实测的那个数）", fs.grid_skew_of(0.5 + 3 / 60, 30, 60.0) == 3)
-    check("整格丢掉（pts 选帧下硬解的形态）", fs.grid_skew_of(1.0, 30, 60.0) == 30)
-    check("非整数帧率上仍按最近的源帧数", fs.grid_skew_of(30 / 59.978, 30, 59.978) == 0)
-    # **写出去的帧号认 pts**（2026-09-20 修，owner："是 bug 就直接修掉"）：
-    # 09-09 把 `t_us` 改成了真实 pts，`frame` 当时**没跟着改**，于是在有缺口的素材上
-    # `frame` 是"第几个采样帧 × stride + 起点"而不是源帧号（f3 跨缺口的窗上差 309~330 帧）。
-    # 实测：修前 606 行里 335 行的 `frame/src_fps` 和 `t_us` 对不上，修后 0 行。
-    for t, want_idx in ((0.5, 30), (0.5 + 3 / 60, 30), (26349.633, 1580070)):
-        got = want_idx + fs.grid_skew_of(t, want_idx, 59.97819708554055 if t > 1 else 60.0)
-        fps = 59.97819708554055 if t > 1 else 60.0
-        check(f"帧号认 pts：t={t} -> {got}", got == round(t * fps), (got, round(t * fps)))
-    # **写 obs 行的地方有两处**（run_ocr2 的主路 + reuse_v2 的延迟落盘，而 `--reuse-v2` 是默认）。
-    # 2026-09-20 第一版只改了主路：缺口之后一半的行还是旧编号，552 行里 281 行对不上，
-    # **而没有任何一层报错**。这条守卫钉的就是"别再只改一处"。
-    from pathlib import Path as _P
-    _root = ROOT
-    for _f in ("src/flowocr/extract/run_ocr2.py", "src/flowocr/extract/reuse_v2.py"):
-        _src = (_root / _f).read_text(encoding="utf-8")
-        check(f"{_f} 写 frame 走 framesource.pts_frame", "framesource.pts_frame(" in _src)
-        check(f"{_f} 里没有裸的 \"frame\": idx", '"frame": idx' not in _src)
-    check("pts_frame 就是 idx + grid_skew_of（判据只有一份）",
-          all(fs.pts_frame(int(t * 1e6), i, f) == i + fs.grid_skew_of(t, i, f)
-              for t, i, f in ((0.5, 30, 60.0), (26350.083, 1580100, 59.97819708554055))))
-
-    import inspect
-    check("cv2 那条路也按 pts 编号、也记 grid_off（两条来源同一套口径）",
-          "grid_off" in inspect.getsource(fs.Cv2Source) and "round(t * self.src_fps)" in inspect.getsource(fs.Cv2Source))
-    check("FfmpegSource yield 的就是 pts 帧号（不是『第几个采样帧 × stride』那第三种编号）",
-          "idx = round(float(t) * self.src_fps)" in inspect.getsource(fs.FfmpegSource))
-    check("AuxReader 按 pts 编号（和采样帧同一套身份）",
-          "key = round(t * self.src_fps)" in inspect.getsource(fs.AuxReader))
+          and fs.probe_interval(58.0, 61.0) == "58.000000%61.000000" and fs.probe_interval(58.0, None) == "58.000000%")
+    _pi = fs.PacketIndex("不存在的文件.mp4", Axis((1, 60)))
+    check("PacketIndex：探不出来返回 None（不许读成「源里没有」= 合法缺口）", _pi.between(1.0, 2.0) is None)
     _ro2 = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
     _sv2 = (ROOT / "src/flowocr/extract/supervisor.py").read_text(encoding="utf-8")
     check("硬解中途交付不对：worker 退出码 75，外层监督者等它退出后再起软解那一趟",
           "except framesource.HwaccelMismatch" in _ro2 and '"--hwaccel", ""' in _sv2
           and "rc == EXIT_HW_MISMATCH" in _sv2 and "raise SystemExit(worker_main())" in _ro2)
-    check("硬解判据只在源里真有那一帧时才算错（素材缺口放行）",
-          "source_has_frames(" in inspect.getsource(fs.FfmpegSource))
     check("HwaccelMismatch 是 RuntimeError（hwaccel_blocker 的 except 接得住，开头试解才退得回软解）",
           issubclass(fs.HwaccelMismatch, RuntimeError))
     # 辅助流跟着硬解一起走（2026-09-20）：辅路在显存里缩完再下传，不再拒绝这个组合
-    hw_aux = " ".join(fs.build_ffmpeg_cmd(
-        "a.mp4", grid=_every(30), start_sec=0, n_out=4, hwaccel="cuda",
-        aux={"grid": [1, 1, 1, 30], "scale": 0.5, "n_frames": 120, "url": "tcp://x", "w": 960, "h": 540}))
+    _aux = {"clock": [60, 1, 2, 1], "scale": 0.5, "url": "tcp://x", "w": 960, "h": 540}
+    hw_aux = " ".join(fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60)), hwaccel="cuda", aux=_aux))
     check("硬解的辅路在 GPU 上缩（scale_cuda），不是 CPU 的 scale",
           "scale_cuda=960:540" in hw_aux and "scale=trunc" not in hw_aux)
     check("硬解的辅路缩完才 hwdownload（过 PCIe 的是 540p 不是 1080p）",
           hw_aux.index("scale_cuda=960:540") < hw_aux.index("hwdownload,format=nv12,format=gray"))
-    sw_aux = " ".join(fs.build_ffmpeg_cmd(
-        "a.mp4", grid=_every(30), start_sec=0, n_out=4,
-        aux={"grid": [1, 1, 1, 30], "scale": 0.5, "n_frames": 120, "url": "tcp://x", "w": 960, "h": 540}))
+    sw_aux = " ".join(fs.build_ffmpeg_cmd("a.mp4", window=window2(0, 8), axis=Axis((1, 60)), aux=_aux))
     check("软解那条还是 CPU 的 scale（没被带跑）",
           "scale=trunc" in sw_aux and "scale_cuda" not in sw_aux)
     from flowocr.extract import ocr_args as _oa
@@ -3303,40 +3093,191 @@ def t_frame_grid() -> None:
                              _oa.config_of(_base + ["--pipe-pix", "bgr24"])) == ["hwaccel"])
     check("但软解臂仍分得开（arm_check 拦得住）",
           not _oa.same_arm(_base, _base + ["--hwaccel", ""]))
-    # **回退路径不许被新默认咬断**（2026-09-20 整体检查抓到的）：`--hwaccel` / `--frame-select`
-    # 都只有 ffmpeg 后端认，翻默认那天写死成 `cuda` / `pts`，于是当时文档里写着的
-    # `--decoder cv2` 一跑就是"--hwaccel 要 --decoder ffmpeg"。现在两个默认跟着解码器走
-    _cv2 = _oa.config_of(_base + ["--decoder", "cv2"])
-    check("`--decoder cv2` 不给别的：硬解自动为空（不进 config）", "hwaccel" not in _cv2, _cv2.get("hwaccel"))
-    check("`--decoder cv2` 不给别的：选帧自动取 index", _cv2["frame_select"] == "index")
-    check("ffmpeg 默认仍是 cuda + pts",
-          _oa.config_of(_base).get("hwaccel") == "cuda" and _oa.config_of(_base)["frame_select"] == "pts")
-    check("显式冲突（cv2 + --hwaccel cuda）不被悄悄改掉——留给 run_ocr2 报错",
-          _oa.config_of(_base + ["--decoder", "cv2", "--hwaccel", "cuda"]).get("hwaccel") == "cuda")
     # 并行拼 `_meta` 从父进程那份起步，而父进程不做试解——子进程的生效值和格子核对不能丢
     from flowocr.extract import ocr_parallel as _op
-    _ms = [{"hwaccel_effective": "", "grid_off": {"3": 2}, "grid_skipped": 1}, {"hwaccel_effective": "cuda"},
-           {"hwaccel_effective": "cuda", "grid_off": {"3": 1}, "grid_skipped": 2}]
+    _ms = [{"hwaccel_effective": "", "cells_skipped": 1, "cell_first": 0, "cell_last": 1}, {"hwaccel_effective": "cuda", "cell_first": 2, "cell_last": 3},
+           {"hwaccel_effective": "cuda", "cells_skipped": 2, "cell_first": 4, "cell_last": 5}]
     for _x in _ms:
-        _x.update(frames_advanced=10, frames_requested=10, complete=True, start_sec=0, end_sec=1)
-    _m = _op.merge_metas(_ms, {}, wall=1.0, cuts_sec=[0.3, 0.6], interval=0.5)
+        _x.update(advanced_us=10, requested_us=10, complete=True, start_sec=0, end_sec=1)
+    _m = _op.merge_metas(_ms, {}, wall=1.0, cuts_sec=[0.3, 0.6])
     check("并行拼接：各段硬解生效值不一致时如实写 mixed", _m.get("hwaccel_effective") == "mixed:soft,cuda,cuda",
           _m.get("hwaccel_effective"))
-    check("并行拼接：grid_off 各段逐键相加、grid_skipped 相加",
-          _m.get("grid_off") == {"3": 3} and _m.get("grid_skipped") == 3, (_m.get("grid_off"), _m.get("grid_skipped")))
+    check("并行拼接：cells_skipped 各段相加", _m.get("cells_skipped") == 3, _m.get("cells_skipped"))
     # 开不了的素材要**退回去**，不是整段跑不了（同 `--workers` 的老规矩）
     check("有试解这道预检", callable(getattr(fs, "hwaccel_blocker", None)))
     _ro = (ROOT / "src/flowocr/extract/run_ocr2.py").read_text(encoding="utf-8")
     check("run_ocr2 真的接了预检（2026-09-23 起在后台和建模型并行跑、建取帧层之前取结论）+ 记生效值",
           "framesource.hwaccel_blocker" in _ro and "hw_probe.result()" in _ro and 'meta["hwaccel_effective"]' in _ro)
 
-    check("预取包在外面时 grid_off / grid_skipped 透得出来",
-          fs.PrefetchSource.grid_off.fget(
-              type("X", (), {"inner": type("Y", (), {"grid_off": {3: 7}})()})()) == {3: 7}
-          and fs.PrefetchSource.grid_skipped.fget(
-              type("X", (), {"inner": type("Y", (), {"grid_skipped": 4})()})()) == 4)
-    check("没有这一项的来源（cv2）也不炸",
-          fs.PrefetchSource.grid_off.fget(type("X", (), {"inner": object()})()) == {})
+    check("预取包在外面时 cells_skipped / cell_first / cell_last 透得出来",
+          fs.PrefetchSource.cells_skipped.fget(type("X", (), {"inner": type("Y", (), {"cells_skipped": 4})()})()) == 4
+          and fs.PrefetchSource.cell_last.fget(type("X", (), {"inner": type("Y", (), {"cell_last": 9})()})()) == 9)
+    # 广播解码的 hub 拿各组经连接 pickle 过来的取帧参数互相比（`decode_proc` 的 `same`）：两份独立反序列化的配置要相等，
+    # 否则 2 组以上必然判"取帧参数不一致"（Window 曾只按身份比）
+    import pickle as _pk
+    _kw = {"stream": fake_stream(duration=10.0), "window": window2(0, 20), "width": 4, "height": 4, "pix": "nv12", "hwaccel": None}
+    _aux = {"clock": AuxClock.for_video(60, 60.0, SampleClock(2)), "scale": (32, 18)}
+    check("广播解码：两组 pickle 往返的 source_kw / 辅助桶相等，窗口不同就不等",
+          _pk.loads(_pk.dumps(_kw)) == _pk.loads(_pk.dumps(_kw)) and _pk.loads(_pk.dumps(_aux)) == _pk.loads(_pk.dumps(_aux))
+          and _pk.loads(_pk.dumps(_kw)) != dict(_kw, window=window2(0, 21)))
+
+
+def t_select_contracts() -> None:
+    """**要 ffmpeg 的选帧契约**（frame-pts 计划的契约测试）：合成小视频在这里现造（64×48、几十帧，整组几秒）。
+
+    * 桶号的 Python 复刻和 ffmpeg `select` 选出同一批（采样流 + 辅助流）：毫秒时间基的 VFR（正好早 1 ms 的帧离桶边界 0.5 µs；
+      容器 start_time = 2 s）；1/10⁷ 时间基、帧正好落在桶边界 T_k − δ 上（旁边 ±1 µs 各一帧）。
+    * 容器 start_time ≠ 0：整片 / `--start` 窗口 / 两段拼交出同一批 t_us，t_us 从 0 起。
+    * 开放 GOP（x264 `open-gop`、B 帧）：前导帧（pts < kf、解码序在 kf 之后）在 kf 那一块里不被选中；按块的范围直接跑 select（不 seek）时
+      它们仍算"上一帧"（被范围挡掉的帧照样参与换桶判断）；按这些 kf 切块的分片合流和整片同一批。"""
+    print("选帧契约（ffmpeg）：桶号对 select、容器 start_time、开放 GOP")
+    import re
+
+    from flowocr.extract import decode_shards as dsh
+    from flowocr.extract import framesource as fs
+    from flowocr.extract.framegrid import AuxClock, SampleClock, Window
+
+    def make(out: Path, pts: list[int], den: int, *extra: str) -> None:
+        """时间基 1/den 上给定 pts 的小视频（libx264、B 帧、12 帧一个 GOP）。"""
+        terms = "+".join(rf"eq(N\,{i})*{p}" for i, p in enumerate(pts))
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=120",
+                        "-frames:v", str(len(pts)), "-vf", f"settb=1/{den},setpts={terms}", "-fps_mode", "passthrough",
+                        "-enc_time_base", f"1/{den}", "-c:v", "libx264", "-g", "12", "-bf", "2", "-pix_fmt", "yuv420p",
+                        *extra, str(out)], check=True)
+
+    def decoded(video: Path, axis) -> list[tuple[int, int]]:
+        """整片解一遍、不选帧：交付顺序（= 显示顺序）里每一帧的 (整数 pts, t_us)。t_us 拿 showinfo 打的串经 `Axis.key` 算，
+        和取帧层同一个换算（正好落在半微秒上的帧，身份取决于 showinfo 怎么打印，这里不另算）。"""
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-copyts", "-i", str(video), "-vf", "showinfo",
+                            "-f", "null", "-"], capture_output=True, text=True)
+        return [(int(p), axis.key(t)) for p, t in re.findall(r"\] n: *\d+ +pts: *(-?\d+) +pts_time:(-?[0-9.]+(?:e[-+]?\d+)?)",
+                                                              r.stderr)]
+
+    def want(frames, axis, sc, ac, win):
+        """Python 按时间桶模拟两路该选的帧（t_us）：每格的第一帧；"上一帧"是上一个**输入**帧（范围外的也算）。"""
+        s_keys, a_keys, ps, pa = [], [], None, None
+        for p, k in frames:
+            c, pair = sc.cell(p, axis), ac.cells(p, axis)
+            if axis.sec(p) >= 0 and win.contains(c):
+                if c != ps:
+                    s_keys.append(k)
+                if pair != pa:
+                    a_keys.append(k)
+            ps, pa = c, pair
+        return s_keys, a_keys
+
+    class Sink:
+        def __init__(self) -> None:
+            self.keys: list[int] = []
+
+        def push(self, key, frame, cells=None) -> None:
+            self.keys.append(key)
+
+        def close(self) -> None:
+            pass
+
+    def run(video: Path, st, win, ac=None, block=None):
+        """取帧层交出的 [(t_us, 采样桶号, 整数 pts)] 和辅助流的 t_us（`ac` 给了才有）。"""
+        sink = Sink() if ac is not None else None
+        src = fs.FfmpegSource(str(video), stream=st, window=win, width=st.width, height=st.height, block=block,
+                              aux={"sink": sink, "clock": ac.as_list(), "scale": 1.0} if ac is not None else None)
+        got = [(f.key, f.cell, f.pts) for f in src]
+        if src.aux is not None:
+            src.aux.join()
+        return got, (sink.keys if sink is not None else None)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        # 毫秒时间基：采样 2 fps 的桶边界在 0.5k s − 1.0005 ms，499 / 999 / 1499 … 正好早 1 ms（离边界 0.5 µs，算进目标点那一桶），498 / 998 早 2 ms
+        ms = [0, 40, 120, 498, 499, 500, 560, 998, 999, 1000, 1001, 1200, 1499, 1501, 1700, 1998, 1999, 2000, 2300, 2499,
+              2700, 2998, 3001, 3300, 3499, 3500, 3800, 3999]
+        make(d / "ms.mkv", ms, 1000, "-output_ts_offset", "2")
+        # 1/10⁷ 时间基：桶边界 T_k − δ = 5,000,000 k − 10,005 刻正好表示得出来；每个边界上一帧，前后 ±1 µs 各一帧
+        e7 = [0] + [b + o for k in range(1, 8) for b in [5_000_000 * k - 10_005] for o in (-10, 0, 10)]
+        make(d / "e7.mp4", e7, 10_000_000, "-video_track_timescale", "10000000")
+        for name, n_min in (("ms.mkv", 8), ("e7.mp4", 8)):
+            v = d / name
+            st = fs.probe_stream(str(v))
+            ax = st.axis
+            sc = SampleClock.for_rate(st.nominal, 2.0)
+            ac = AuxClock.for_video(st.nominal, 60.0, sc)
+            win = Window(sc, 0, None)
+            frames = decoded(v, ax)
+            ws, wa = want(frames, ax, sc, ac, win)
+            got, got_aux = run(v, st, win, ac)
+            gs = [k for k, _, _ in got]
+            edge = sum(sc.cell(p, ax) != sc.cell_exact(p, ax) for p, _ in frames)
+            check(f"{name}（时间基 {ax.tb[0]}/{ax.tb[1]}、start_time {ax.origin_us} µs）：Python 复刻的桶号和 ffmpeg select 选出同一批"
+                  f"（采样 {len(gs)} 帧、辅助 {len(got_aux)} 帧）",
+                  gs == ws and got_aux == wa and len(ws) >= n_min and set(gs) <= set(got_aux), (gs, ws, got_aux, wa))
+            if name == "ms.mkv":
+                check("ms.mkv：容器 start_time = 2 s、t_us 从 0 起；正好早 1 ms 的帧算进目标点那一桶（499 / 999 / 1499 / 2499 ms 被选中）",
+                      ax.origin_us == 2_000_000 and gs[0] == 0 and {499_000, 999_000, 1_499_000, 2_499_000} <= set(gs), gs)
+                # mkv 的流没有自己的时长，`format=duration` 报的是结束的绝对时刻（S + 长度）；`--end 0` 的要求按它算就多出 S、跑完也判未完成
+                check("ms.mkv：start_time = 2 s 时 StreamInfo.duration 是相对长度（尾包 pts + 时长 − S），不是 format=duration 的 S + 长度",
+                      st.duration is not None and 3.999 <= st.duration < 4.2, st.duration)
+                # 长于 10 s 才走"从结尾前 10 s 读起"那一支（4 s 的 ms.mkv 是从文件头读）
+                _long = d / "long.mkv"
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10", "-frames:v", "200",
+                                "-c:v", "libx264", "-output_ts_offset", "2", str(_long)], check=True)
+                _ls = fs.probe_stream(str(_long))
+                check("20 s 的 mkv、start_time = 2 s：从结尾前 10 s 读尾包，duration = 20 s（format=duration 报 22 s）",
+                      _ls.duration is not None and abs(_ls.duration - 20.0) < 1e-3, _ls.duration)
+                cut = 3
+                whole = [(k, c) for k, c, _ in got]
+                p1, _ = run(v, st, Window(sc, 0, cut))
+                p2, _ = run(v, st, Window(sc, cut, None))
+                wl = Window.of(sc, 1.3, 0)
+                late, _ = run(v, st, wl)
+                check("start_time ≠ 0：整片 / --start 窗口 / 两段拼交出同一批 t_us（-ss 给相对秒，ffmpeg 自己加 S）",
+                      [(k, c) for k, c, _ in p1 + p2] == whole and [(k, c) for k, c, _ in late] == [x for x in whole if x[1] >= wl.a]
+                      and len(late) >= 3, (whole, p1, p2, late))
+            else:
+                check("e7.mp4：真有帧落在桶边界上（双精度复刻和精确有理数分到不同桶的帧），两边仍选同一批", edge >= 1, edge)
+
+        # 开放 GOP：x264 open-gop、3 个 B 帧、12 帧一个 GOP、30 fps；非 IDR 的关键帧之后、解码序紧跟着 pts 更早的前导帧
+        og = d / "og.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=30", "-frames:v", "60",
+                        "-c:v", "libx264", "-bf", "3", "-x264-params", "open-gop=1:keyint=12:min-keyint=12:scenecut=0",
+                        "-pix_fmt", "yuv420p", str(og)], check=True)
+        pk = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,flags",
+                             "-of", "csv=p=0", str(og)], capture_output=True, text=True).stdout.split()
+        pk = [(int(a), "K" in b) for a, b in (x.split(",")[:2] for x in pk)]
+        kfs = [p for i, (p, k) in enumerate(pk) if k and i + 1 < len(pk) and pk[i + 1][0] < p]
+        check("造出了开放 GOP：有关键帧解码序后面紧跟 pts 更早的前导帧", len(kfs) >= 2, pk)
+        if len(kfs) >= 2:
+            st = fs.probe_stream(str(og))
+            ax = st.axis
+            frames = decoded(og, ax)
+            k1, k2 = kfs[:2]
+            for fps in (2.0, 2.5):                  # 2 fps：kf（0.4 s）在桶中间、和前导帧同桶；2.5 fps：kf 正好在目标点上
+                sc = SampleClock.for_rate(st.nominal, fps)
+                win = Window(sc, 0, None)
+                whole, _ = run(og, st, win)
+                blk, _ = run(og, st, win, block=(k1, k2))
+                check(f"开放 GOP、{fps:g} fps：kf 那一块不选 pts < kf 的前导帧（它们由上一块交）",
+                      bool(blk) and all(p >= k1 for _, _, p in blk) and (blk[0][2] == k1), blk)
+                sh = dsh.ShardedSource(str(og), lanes=["sw", "sw"], blocks=[(None, k1), (k1, k2), (k2, None)], stream=st,
+                                       window=win, width=st.width, height=st.height)
+                got = [(f.key, f.cell) for f in sh]
+                check(f"开放 GOP、{fps:g} fps：按 kf 切三块的分片合流和整片同一批",
+                      got == [(k, c) for k, c, _ in whole] and len(got) >= 4, (got, whole))
+            # 被块范围挡掉的前导帧照样是 select 的"上一帧"：不 seek、整片解，范围从 k1 起；2 fps 时 k1 和前导帧同桶，所以 k1 不选
+            sc = SampleClock.for_rate(st.nominal, 2.0)
+            win = Window(sc, 0, None)
+            sel = f"select='{fs.select_range(win, ax, (k1, None))}*{sc.changed(ax)}',showinfo"
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-copyts", "-i", str(og), "-vf", sel, "-f", "null", "-"],
+                               capture_output=True, text=True)
+            got = [int(p) for p in re.findall(r"\] n: *\d+ +pts: *(-?\d+)", r.stderr)]
+            sim, prev = [], None
+            for p, _ in frames:
+                c = sc.cell(p, ax)
+                if p >= k1 and c != prev:
+                    sim.append(p)
+                prev = c
+            lead = max(p for p, _ in frames if p < k1)
+            check("开放 GOP：被块范围挡掉的前导帧仍算 select 的上一帧（kf 和它同桶时 kf 不选），和 Python 模拟同一批",
+                  got == sim and bool(got) and k1 not in got and sc.cell(lead, ax) == sc.cell(k1, ax), (got, sim))
 
 
 def t_accel_defaults() -> None:
@@ -3775,10 +3716,10 @@ def t_model_paths() -> None:
           and 'meta["device_resolved"]' in src2 and 'meta["device_fallback"]' in src2)
     from flowocr.extract import ocr_parallel as _op2
     _dm = [{"device_resolved": "gpu", "device_fallback": None, "device_effective": {"det": "ort:CUDAExecutionProvider", "rec": "ort:CUDAExecutionProvider"},
-            "frames_advanced": 10, "frames_requested": 10, "complete": True, "start_sec": 0, "end_sec": 1} for _ in range(2)]
+            "advanced_us": 10, "requested_us": 10, "complete": True, "start_sec": 0, "end_sec": 1} for _ in range(2)]
     _dm2 = [dict(_dm[0]), {**_dm[1], "device_resolved": "cpu", "device_fallback": "x"}]
-    _mm = _op2.merge_metas(_dm, {}, wall=1.0, cuts_sec=[0.5], interval=0.5)
-    _mm2 = _op2.merge_metas(_dm2, {}, wall=1.0, cuts_sec=[0.5], interval=0.5)
+    _mm = _op2.merge_metas(_dm, {}, wall=1.0, cuts_sec=[0.5])
+    _mm2 = _op2.merge_metas(_dm2, {}, wall=1.0, cuts_sec=[0.5])
     check("并行拼接带上各段的实际设备（父进程不建模型，不抄就丢）；各段不一致时逐段列出",
           _mm.get("device_effective") == _dm[0]["device_effective"] and _mm.get("device_resolved") == "gpu"
           and _mm2.get("device_resolved") == {"mixed": ["gpu", "cpu"]}, (_mm.get("device_effective"), _mm2.get("device_resolved")))
@@ -3792,33 +3733,14 @@ def t_model_paths() -> None:
     import inspect as _inspect
     from flowocr.analyze import build_tracks as _bt
     settle_src = _inspect.getsource(_bt.settle_refine)
-    check("阶段 2 按 obs 证据结算时帧率取 obs 的 _meta.src_fps、不开视频（原来一律 cv2 读视频，视频挪走会把 60 fps 当 30）；"
-          "obs 没记 src_fps 就不结算",
+    check("阶段 2 按 obs 证据结算时参考帧率取 obs 的 _meta.src_fps、不开视频；obs 没记 src_fps 就不结算；"
+          "**帧身份是旧的帧号（没有 frame_key）的 obs 要回抠时报错**（frame-pts 计划：重跑阶段 1；--refine off 照读）",
           'fps = float(meta["src_fps"])' in settle_src and 'not meta.get("src_fps")' in settle_src
-          and 'decoder="obs"' in settle_src)
-    probe_src = (ROOT / "dev_tools" / "refine_offline_probe.py").read_text(encoding="utf-8")
-    check("开视频测只在开发探针里，而且要给 --video", 'ap.add_argument("--video", required=True' in probe_src)
-    sys.path.insert(0, str(ROOT / "dev_tools"))
-    import refine_offline_probe as ROP
-    pbase = {"regions": [{"index": 0, "label": "subtitle"}, {"index": 1, "label": "static-overlay"}],
-             "events": [{"id": i, "region": 1 if i == 4 else 0, "text": "x", "t_start": 0, "t_full": None, "t_end": 9000} for i in range(5)]}
-
-    def pev(i, **kw):
-        return {**pbase["events"][i], **kw}
-    p_on = {"events": [pev(0, t_full=300, t_full_how={"first": "glyph", "full": "glyph"}, t_end_how="curve"),
-                       pev(1, t_end=9300, t_end_how="ncc"),                                 # 只量到结尾：没有 t_full_how
-                       pev(2, t_full=500, t_full_how={"first": "glyph", "full": "none"}),  # 全字是采样级退回值
-                       pev(3), pev(4, t_end=9900, t_end_how="curve")]}
-    p_off = {"events": [pev(0, t_full=1300, t_full_how={"first": "glyph", "full": "glyph"}, t_end_how="curve"),
-                        pev(1), pev(2, t_full=1500, t_full_how={"first": "glyph", "full": "glyph"}), pev(3), pev(4)]}
-    pst, _ = ROP.compare(pbase, p_on, p_off, "subtitle", 1.0)
-    check("离线对照探针：三个时刻各算各的分母（目标 = 回抠标签区域的全部事件、四类加起来守恒）；只量到结尾的事件算进消失；"
-          "`full == none` 的退回值不算量到；差值只在两边都量到的上面算",
-          all(sum(pst[k][c] for c in ("both", "online_only", "offline_only", "neither")) == 4 for k in pst)
-          and (pst["t_end"]["both"], pst["t_end"]["online_only"], pst["t_end"]["neither"]) == (1, 1, 2)
-          and (pst["t_full"]["both"], pst["t_full"]["offline_only"], pst["t_full"]["neither"]) == (1, 1, 2)
-          and len(pst["t_full"]["diffs"]) == 1 and abs(pst["t_full"]["diffs"][0] - 1.0) < 1e-6,
-          {k: {c: v for c, v in s.items() if c != "diffs"} for k, s in pst.items()})
+          and 'meta.get("frame_key") != "t_us"' in settle_src)
+    from flowocr.analyze import refine_boundaries as _rb
+    check("开视频的离线回抠那一支删了（refine_ffmpeg / refine_sequential / measure、开发探针 refine_offline_probe）",
+          not any(hasattr(_rb, n) for n in ("refine_ffmpeg", "refine_sequential", "measure", "obs_sample_grid"))
+          and not (ROOT / "dev_tools" / "refine_offline_probe.py").exists())
 
 
 @high_quality_default
@@ -3873,7 +3795,7 @@ def t_extract_debts() -> None:
           "R.start_ort_services(args" in _insp.getsource(_RG.main)
           and 'want = [("rec", onnx_path(args, "rec")), ("det", onnx_path(args, "det", srv_dev))]' in _ro2s)
     import json as _json
-    from flowocr.extract import framesource as _FS, ocr_complete as _OC
+    from flowocr.extract import ocr_complete as _OC
     with tempfile.TemporaryDirectory() as rd:
         rj = Path(rd) / "r.json"
         rj.write_text(_json.dumps({"groups": [{"name": "g", "rects": [{"box": [0, 50, 100, 100], "neg": False}]}]}),
@@ -3883,8 +3805,9 @@ def t_extract_debts() -> None:
         def crop_reusable(meta_extra: dict, argv_extra=()) -> bool:
             p = Path(rd) / "o.jsonl"
             cfg = _OA.config_of(rargv)                   # 默认 --region-crop（给了 --regions 就开）
-            p.write_text(_json.dumps({"_meta": {"complete": True, "timebase": "pts", "decoder": _FS.DEFAULT_DECODER,
-                                                "config": cfg, "src_fps": 60.0, "stride": 30, **meta_extra}}) + "\n",
+            p.write_text(_json.dumps({"_meta": {"complete": True, "timebase": "pts", "frame_key": "t_us",
+                                                "config": cfg, "src_fps": 60.0, "nominal_fps": 60.0, "sample_clock": [2, 1],
+                                                "aux_clock": [60, 1, 2, 1], **meta_extra}}) + "\n",
                          encoding="utf-8")
             return _OC.obs_reusable(p, [*rargv, *argv_extra])[0]
         off = {"region_crop_off": "组范围的外接矩形就是全屏（或某一时段全屏），没得裁"}
@@ -3917,14 +3840,16 @@ def t_extract_debts() -> None:
           (slow.error, stuck.error, round(stuck_dt, 3)))
 
     from flowocr.extract import framesource as fsx
-    # 精确 seek 退半帧：毫秒量化 pts 的帧（比 帧号/帧率 早 0.33 ms）不能被 seek 丢掉（yuka-f5 14843 s，--fps 2.2）
-    ms = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=890591 / 60, n_out=4, select_by="pts", src_fps=60.0)
-    blk = fsx.build_ffmpeg_cmd("v.mp4", grid=_every(30), start_sec=890591 / 60, n_out=4, select_by="pts", src_fps=60.0,
-                               block=(890591, 891791, None))
+    from flowocr.extract.framegrid import Axis, SampleClock, Window
+    # 精确 seek 落在起点之前：毫秒量化 pts 的帧（比目标点早零点几毫秒）不能被 seek 丢掉（yuka-f5 14843 s，--fps 2.2）。
+    # 现在窗口起点是桶边界 T_a − δ，seek 再退 1 ms：桶的第一帧要么被 seek 剪掉前一帧、算新桶，要么前一帧进了 select 被范围挡掉
+    _w22 = Window.of(SampleClock(2.2), 14843.183, 0)
+    ms = fsx.build_ffmpeg_cmd("v.mp4", window=_w22, axis=Axis((1, 16000)))
+    blk = fsx.build_ffmpeg_cmd("v.mp4", window=_w22, axis=Axis((1, 16000)), block=(None, 14843 * 16000 + 20000))
     ss = float(ms[ms.index("-ss") + 1])
-    check("窗口起点的精确 seek 落在起点帧前半帧：盖得住 pts 取整到 ms 的起点帧（14843.183 < 890591/60），又放不进前一帧",
-          14843.183 - 0.0005 > ss > 890590 / 60 + 0.0005 and float(blk[blk.index("-ss") + 1]) == ss
-          and abs(ss + float(blk[blk.index("-t") + 1]) - 891790.5 / 60) < 1e-5, (ss, blk))
+    check("窗口起点吸附到目标点、精确 seek 落在 T_a − δ − 1 ms：盖得住早了不到 1 ms 的起点帧；第一块同一个 seek",
+          _w22.a == 32655 and abs(ss - (float(SampleClock(2.2).start_sec(32655)) - 0.0020005)) < 1e-6
+          and float(blk[blk.index("-ss") + 1]) == ss, (ss, _w22))
 
 
 def t_recover_batch() -> None:
@@ -4008,7 +3933,7 @@ def t_recover_async() -> None:
         def u(self, k):                                  # 链 uid 是全局计数，两趟之间按出现顺序重新编号
             return self.uid.setdefault(k, len(self.uid))
 
-        def sample(self, seq, idx, t_us, items, ended, stale=()):
+        def sample(self, seq, t_us, items, ended, stale=()):
             self.seen.append((seq, [(self.u(it[0]), it[3], it[4]) for it in items], [(self.u(e[0]), e[3]) for e in ended],
                               sorted(self.u(k) for k in stale)))
             self.sent = seq
@@ -4070,7 +3995,7 @@ def t_recover_async() -> None:
             def crop(i, _s=seq):
                 return np.dstack([np.full((18, 60), _s % 256, np.uint8), np.full((18, 60), i, np.uint8),
                                   np.full((18, 60), _s // 256, np.uint8)])
-            st = v.commit_stage1(seq, seq * 30, seq * 500_000, boxes, polys, list(dec) + [(i, "", 0.0, 0) for i in todo],
+            st = v.commit_stage1(seq, seq * 500_000, boxes, polys, list(dec) + [(i, "", 0.0, 0) for i in todo],
                                  set(todo), assign, crop, {}, False)
             win.append((st, {i: read(crop(i)) for i in todo}))
             if pool is not None:
@@ -4210,9 +4135,9 @@ def t_quality_tiers() -> None:
           and qa("--quality", "high", "--aux-max-fps", "30") == "default"
           and qa("--quality", "high", "--aux-max-fps", "45") == "custom"
           and qa("--no-refine-fused") == "custom")
-    check("辅助流网格：60 fps 素材上 high 和 default 不同（不互相复用）；30 fps 素材上一样",
-          OA.aux_grid(60.0, 2.0, 60.0) != OA.aux_grid(60.0, 2.0, 30.0)
-          and OA.aux_grid(30.0, 2.0, 60.0) == OA.aux_grid(30.0, 2.0, 30.0))
+    check("辅助桶：60 fps 素材上 high 和 default 不同（不互相复用）；30 fps 素材上一样",
+          OA.aux_clock(60.0, 2.0, 60.0) != OA.aux_clock(60.0, 2.0, 30.0)
+          and OA.aux_clock(30.0, 2.0, 60.0) == OA.aux_clock(30.0, 2.0, 30.0))
     drivers = {"sampleset.sh": 2, "run_full_ocr.sh": 1, "run_gamestream_ocr.sh": 1, "regions_run.sh": 1, "ocr_ab.sh": 1, "nsys_server.sh": 1}
     bad = []
     for name, n in drivers.items():

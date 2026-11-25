@@ -18,15 +18,25 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
 
+import numpy as np
+
 from flowocr import paths
+from flowocr.artifacts import textdir
 from flowocr.extract import ortclient, recdecode, recprep
 
 MAX_BATCH = 16
 """共享内存按这个批上限开（和 `--rec-bucket` 的默认值一致；2026-09-21 随它从 32 降到 16）。超了就自动分几次送。"""
+
+VERTICAL_COST = {"runs": 0, "extra_runs": 0, "crops": 0, "extra_crops": 0, "taken": 0}
+"""竖排读法的代价（本进程所有 `OrtRec` 累计，`run_ocr2` 写进 obs 的 `_meta.rec_vertical`）：原样读的识别请求批数（发给推理服务的一批，
+补零后算一次）和裁剪数，竖条多读的那批的请求批数和裁剪数，取了竖排读法的裁剪数。
+`runs` / `crops` 含开头试推理那一次（一个 48×160 的白块，`run_ocr2` 的 GPU 试推理），所以比 `_meta.rec_predict_calls` 多 1。"""
+_COST_LOCK = threading.Lock()
 
 GRID = 320
 """**张量宽向上取整到它的倍数**——和 worker 的"每形状一个 session"是**配套的两半**。
@@ -80,7 +90,7 @@ class OrtRec:
     """
 
     def __init__(self, model: str = "", max_batch: int = MAX_BATCH, grid: int = GRID,
-                 client: "ortclient.OrtClient | None" = None, pre: str = "server") -> None:
+                 client: "ortclient.OrtClient | None" = None, pre: str = "server", vertical: bool = True) -> None:
         from flowocr import models
         model = paths.resolve_model(model) if model else models.path("rec")
         # 字表跟着模型走：官方 ONNX 仓库自带 `inference.yml`（默认模型是官方 ONNX，`flowocr.models`；不给 `model` 就 `models.path("rec")`，缺了当场取）。
@@ -92,6 +102,8 @@ class OrtRec:
         self.model = model
         self.max_batch = max_batch
         self.grid = grid
+        self.vertical = vertical
+        """竖条裁剪也试竖排读法（`predict`）。"""
         self.own = client is None
         self.cli = client or ortclient.OrtClient({"rec": model})
         self.pre_on_server = pre == "server" and getattr(self.cli, "pre", False)
@@ -131,16 +143,40 @@ class OrtRec:
     def predict(self, crops: list, batch_size: int = 1) -> list[dict]:
         """和 PaddleX 同形状的返回：`[{"rec_text": …, "rec_score": …}, …]`，顺序对齐输入。
 
-        调用方（`recpack.predict_bucketed`）给进来的通常已经是同宽一批；这里**仍然自己按张量宽分组**，
-        因为单框回补那条路不分桶，而一次 `session.run` 只能吃一个形状。
+        `vertical`（`--rec-vertical`，默认开）时竖条裁剪（`textdir.tall`）再逆时针转 90° 读一遍，
+        按 `textdir.prefer_rotated` 取两种读法之一（为什么两种都读见 `flowocr.artifacts.textdir` 文件头）。
+        **所有 rec 调用（同步分桶、异步池、单框回补、判语言）都经过这里**，所以竖排的读法只有这一处。
+        转过去的裁剪**另成一批**读：混进原样的那批会改变同宽那组的批大小（补零行数），别的框的读数跟着抖。
+        分批后原样那批的组成和不开时一样，但多出来的这一批仍会改变共用推理服务按到达时序拼批的时机：
+        2026-11-23 quick 集六段约 4 万行，不开 vs 开，非竖条框的字变了 30 行；同一份代码跑两遍（A/A）是 8 行，多是 `口`/`O` 这类一笔之差的来回翻（也有多读一个字的），按拼批时机解释、没逐行验证。
+        """
+        out, runs = self._predict(crops)
+        tall = [i for i, c in enumerate(crops) if textdir.tall(c.shape[1], c.shape[0])] if self.vertical else []
+        rots, extra = self._predict([np.ascontiguousarray(np.rot90(crops[i], 1)) for i in tall])
+        taken = 0
+        for i, rot in zip(tall, rots):
+            up = out[i]
+            if up is not None and rot is not None and textdir.prefer_rotated(
+                    (up["rec_text"], up["rec_score"]), (rot["rec_text"], rot["rec_score"])):
+                out[i] = rot
+                taken += 1
+        with _COST_LOCK:
+            for k, v in (("runs", runs), ("extra_runs", extra), ("crops", len(crops)), ("extra_crops", len(tall)), ("taken", taken)):
+                VERTICAL_COST[k] += v
+        return out
+
+    def _predict(self, crops: list) -> tuple[list[dict], int]:
+        """一组裁剪原样读（不管方向），连同推理了几次（`session.run`）。调用方（`recpack.predict_bucketed`）给进来的通常已经是同宽一批；
+        这里**仍然自己按张量宽分组**，因为单框回补那条路不分桶，而一次 `session.run` 只能吃一个形状。
         """
         if not crops:
-            return []
+            return [], 0
         t0 = time.perf_counter()
         widths = [recprep.grid_w(recprep.rec_target_w(*c.shape[:2]), self.grid) for c in crops]
         self.t["pre"] += time.perf_counter() - t0
         out: list[dict | None] = [None] * len(crops)
         groups: dict[int, list[int]] = {}
+        runs = 0
         for i, tw in enumerate(widths):
             groups.setdefault(tw, []).append(i)
         for tw, idx in groups.items():
@@ -148,6 +184,7 @@ class OrtRec:
             for s in range(0, len(idx), cap):
                 part = idx[s:s + cap]
                 k = self._pad_batch(len(part), self.ladder)      # 补零行，回来只取前几条
+                runs += 1
                 if self.pre_on_server:
                     cls, prob = self.cli.run_crops("rec", [crops[i] for i in part], self.grid, k)
                 else:
@@ -160,7 +197,7 @@ class OrtRec:
                 self.t["decode"] += time.perf_counter() - t1
                 for i, (txt, score) in zip(part, dec):
                     out[i] = {"rec_text": txt, "rec_score": score}
-        return out
+        return out, runs
 
     def close(self) -> None:
         if self.t["pre"] or self.t["decode"]:

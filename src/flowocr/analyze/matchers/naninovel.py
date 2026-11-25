@@ -425,6 +425,10 @@ def cluster_patch(context: dict, options: dict | None = None) -> dict:
     return dict(PATCHES.get(str(context.get("game") or ""), {}))
 
 
+CONTEXT_KEYS = ("script", "names", "game", "layout", "viewport")
+OPTION_KEYS = ("start", "end", "merge_gap", "overlay")
+"""认哪些 `--ctx` / `--opt` 键（`extensions.warn_unknown_keys`，别的键打警告）；`match` / `cluster_patch` 多读一个键要加在这里。"""
+
 PRESET, PRESET_OPTS = "matched_srt", {"lang": "cn"}
 """推荐的输出预设（`flowocr.extensions.recommendation`，owner 2026-10-06）：《魔裁》是字幕带一条，用途 2 要的是一份中文 SRT。"""
 

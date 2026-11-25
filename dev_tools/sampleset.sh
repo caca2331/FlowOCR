@@ -22,7 +22,7 @@
 # ⚠ 这个驱动**不适合报墙钟 A/B**：两臂各自连跑六段，同一段的两臂相隔十几分钟。
 # 墙钟用 dev_tools/ocr_ab.sh（交错、逐对换先后）。
 #
-# yuka 那几段**不切文件**：run_ocr2 的 --start/--end 按原片绝对时间写时间戳，
+# yuka 那几段**不切文件**：run_ocr2 的 --start/--end 下时间戳和整片跑一样从片头算，
 # 窗口结果能直接和整片的参照对齐（素材只读）。
 # 产物：out/samples/<id>.jsonl（观测）、out/samples/<id>/（轨）。
 set -uo pipefail
@@ -38,8 +38,8 @@ MANIFEST="data/samples.json"
 source "$CODE/explore/env.sh"          # 缓存（uv / HF 等）指到数据根下 explore 的缓存目录，不落用户目录（残留清单）；开发机的 FLOWOCR_GAMETEXT
 
 SET=${1:-list}
-case "$SET" in list|quick|evidence|holdout2|zh) ;; *)
-  echo "用法：bash dev_tools/sampleset.sh list|quick|evidence|holdout2|zh [id…]"; exit 2;; esac
+case "$SET" in list|quick|evidence|holdout2|zh|vertical) ;; *)
+  echo "用法：bash dev_tools/sampleset.sh list|quick|evidence|holdout2|zh|vertical [id…]"; exit 2;; esac
 shift || true
 ONLY="$*"                   # 给了 id 就只跑这几段（**素材时长照旧按整个集子打印**，别以为跑了全套）
 
@@ -144,9 +144,10 @@ print(s['video'], s['start_s'], s['end_s'])" "$id" "$MANIFEST" | tr -d '\r')
       2>&1 | grep -v --line-buffered "Warning\|warn\|INFO\|ccache\|Model files\|WARNING"
     [ "${PIPESTATUS[0]}" = 0 ] || { echo "**[fail] $id$ARM OCR**"; FAILED=$((FAILED+1)); continue; }
   fi
+  # 失败只看 build_tracks 自己的退出码：短片可能一行摘要都没有（没有主轨候选），grep 什么都没挑出来不算失败
   "$PY" -m flowocr.analyze.build_tracks "$OBS" --outdir "out/samples/$id$ARM" --tag "$id" \
-    2>&1 | grep -E '主轨候选|主轨并带|槽位最终一致性|常驻 UI 剔除' \
-    || { echo "**[fail] $id build_tracks**"; FAILED=$((FAILED+1)); continue; }
+    2>&1 | grep -E '主轨候选|主轨并带|槽位最终一致性|常驻 UI 剔除'
+  [ "${PIPESTATUS[0]}" = 0 ] || { echo "**[fail] $id build_tracks**"; FAILED=$((FAILED+1)); continue; }
   MAIN=$("$PY" -m flowocr.artifacts.tracksio "out/samples/$id$ARM/$id-tracks.json" main_srt)
   if [ -n "$MAIN" ]; then
     # **--hours 必须给**：不给就按产物自己的时间跨度算，短窗口上"条/h"会虚高

@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from flowocr.burn import encode, plates
+from flowocr.output import export
 from flowocr.typeset import assfile, core, platecolor
 
 MP4_AUDIO = {"aac", "mp3", "opus", "ac3", "eac3", "flac", "alac"}
@@ -59,6 +60,8 @@ class Job:
     fps: Fraction | None
     codec: str
     quality: int
+    device: str = "auto"
+    """auto：修补推理和编码器能上 GPU 就上；cpu：修补走 CPU EP，编码只用软件编码器。"""
     probe: dict | None = None
     notes: list[str] = field(default_factory=list)
 
@@ -89,9 +92,11 @@ def same_file(a: Path | str, b: Path | str) -> bool:
     return os.path.normcase(a.resolve()) == os.path.normcase(b.resolve())
 
 
+FIX_LINE = "（字幕稿里行上写了 ;plate=… 的，整份的选项管不到它：改成 ;plate=src，或改回 ;plate 随整份）"
+
 def plan(ass: Path, video: str | None, out: Path | None, inpaint: bool, start: float | None, end: float | None,
-         size: tuple[int, int] | None, fps: Fraction | None, codec: str, quality: str | None, target: float) -> Job:
-    """定规格：范围默认整段，尺寸、帧率默认按源；编码器按先后挑；质量值：给了数就用，`auto` 搜，
+         size: tuple[int, int] | None, fps: Fraction | None, codec: str, quality: str | None, target: float, device: str = "auto") -> Job:
+    """定规格：范围默认整段，尺寸、帧率默认按源；编码器按先后挑（`device` 是 cpu 时只挑软件编码器）；质量值：给了数就用，`auto` 搜，
     不给时范围不短于 `encode.AUTO_MIN_S` 就搜、否则用编码器的保守默认值。"""
     v = video_of(ass, video)
     out = out or default_out(ass, inpaint)
@@ -103,14 +108,20 @@ def plan(ass: Path, video: str | None, out: Path | None, inpaint: bool, start: f
     if not s < e < float("inf"):
         raise ValueError(f"范围不对：{s}–{e} s（视频时长读不出来时用 --end 指定）")
     size = size or encode.src_size(v)
-    job = Job(ass, v, out, s, e, size, fps, "", 0)
+    job = Job(ass, v, out, s, e, size, fps, "", 0, device)
     if inpaint:                                     # 稿读不出底板就早报，别等搜完质量值
         pl, _ = plates.load(ass.read_text(encoding="utf-8-sig"), size)
         if not pl.evs:
             job.note("稿里没有打了标的底板，没有要抹的地方：输出和原样烧一样")
-        elif pl.mode not in (None, "src"):
-            job.note(f"底板是 plate={pl.mode} 出的，会连译文伸出原文的部分一起抹；只抹原文就给阶段 4 加 --opt plate=src 重出")
-    name = encode.resolve(codec)
+        else:
+            only_tr = sorted(pl.modes & {"text", "textbox"})
+            both = sorted(pl.modes - {"src", "text", "textbox"})
+            if only_tr:
+                job.note(f"有底板是 plate={'/'.join(only_tr)} 出的：抹的是底板实际盖着的地方，这类样式通常只盖译文底下，原文可能没抹干净；"
+                         f"要抹原文就给阶段 4 加 --opt plate=src 重出{FIX_LINE}")
+            if both:
+                job.note(f"有底板是 plate={'/'.join(both)} 出的：抹的是底板实际盖着的地方，这类样式通常连译文伸出原文的部分一起抹；只抹原文就给阶段 4 加 --opt plate=src 重出{FIX_LINE}")
+    name = encode.resolve(codec, device)
     want = quality == "auto" or quality is None and e - s >= encode.AUTO_MIN_S
     if want and not encode.has_vmaf():
         if quality == "auto":
@@ -182,12 +193,12 @@ def burn_plate(job: Job) -> Path:
     return job.out
 
 
-def burn_inpaint(job: Job, preset: str = "default", backend: str = "auto") -> Path:
+def burn_inpaint(job: Job, preset: str = "default") -> Path:
     """inpainting 路线：逐帧按底板（跟着打字机展开）修补，再烧其余的行。返回输出文件。"""
     from flowocr.burn import inpaint
     pl, rest = plates.load(job.ass.read_text(encoding="utf-8-sig"), job.size)
     fps = job.fps or encode.src_fps(job.video)
-    be, why = inpaint.backend_of(backend)
+    be, why = inpaint.backend_of(job.device)
     if why:
         job.note(f"修补走 {be}：{why}")
     cfg = inpaint.PRESETS[preset]
@@ -244,7 +255,7 @@ def burn_inpaint(job: Job, preset: str = "default", backend: str = "auto") -> Pa
             raise
     st = inp.stats
     print(f"[阶段 5] -> {job.out}（{preset} 档，{be}；{job.codec} 质量 {job.quality}；{n} 帧，{time.perf_counter() - t0:.1f} s；"
-          f"推理 {st['tiles']} 窗、{st['run_s']:.1f} s" + (f"，{st['nan_tiles']} 窗出 NaN" + ("、用 fp32 重算" if be == "trt" else "") if st["nan_tiles"] else "") + "）",
+          f"推理 {st['tiles']} 窗、{st['run_s']:.1f} s，到期判静止没重补 {st['still']} 次" + (f"，{st['nan_tiles']} 窗出 NaN" + ("、用 fp32 重算" if be == "trt" else "") if st["nan_tiles"] else "") + "）",
           flush=True)
     return job.out
 
@@ -280,8 +291,8 @@ def _cleanup_after(error: BaseException, what: str, action: Callable[[], None]) 
 
 
 def sub_filter(job: Job, seek: list[str]) -> list[str]:
-    """烧 `burn.ass` 的滤镜：只烧一段时时间戳先加回起点（ASS 的时间是原片的），烧完再归零。"""
-    sub = "subtitles=burn.ass"
+    """烧 `burn.ass` 的滤镜：只烧一段时时间戳先加回起点（ASS 的时间是原片的），烧完再归零。设了 `FLOWOCR_FONTS` 带上那个字体目录（`export.sub_filter`）。"""
+    sub = export.sub_filter("burn.ass")
     return [f"setpts=PTS+{job.start}/TB", sub, "setpts=PTS-STARTPTS"] if seek else [sub]
 
 

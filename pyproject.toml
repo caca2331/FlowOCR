@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowocr"
-version = "1.0.0"
+version = "1.0.1"
 description = "从视频里抽全部屏幕文字、带起止时间、按区域聚类，导出 SRT / ASS"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

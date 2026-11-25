@@ -41,6 +41,10 @@ def t_burn_encode() -> None:
         check("指定的编码器：不认识、压不了的当场报错，能用的照用",
               raises(lambda: E.resolve("vp9"), ValueError) and raises(lambda: E.resolve("hevc_nvenc"), ValueError)
               and E.resolve("libx265") == "libx265")
+    with patch.object(E, "usable", only("hevc_nvenc", "libx264", "libx265")):
+        check("--device cpu：auto 只挑软件编码器（libx264），指定硬件编码器报错、libx265 照用",
+              E.resolve("auto", "cpu") == "libx264" and raises(lambda: E.resolve("hevc_nvenc", "cpu"), ValueError)
+              and E.resolve("libx265", "cpu") == "libx265")
     with patch.object(E, "usable", only()):
         check("一个能用的编码器都没有：报带说明的 ValueError（不是光秃秃的 StopIteration）", raises(lambda: E.resolve("auto"), ValueError))
 
@@ -66,7 +70,7 @@ def t_burn_encode() -> None:
         calls.clear()
         with patch.object(P, "video_of", lambda a, v: "v.mp4"), patch.object(P.platecolor, "duration", lambda v: dur), \
                 patch.object(E, "src_size", lambda v: (1920, 1080)), patch.object(E, "src_fps", lambda v: Fraction(60)), \
-                patch.object(E, "resolve", lambda c: "hevc_nvenc"), patch.object(E, "has_vmaf", lambda: vmaf), \
+                patch.object(E, "resolve", lambda c, d: "hevc_nvenc"), patch.object(E, "has_vmaf", lambda: vmaf), \
                 patch.object(E, "search", lambda *a: calls.append(a) or {"q": 31}):
             return P.plan(Path("x.ass"), None, None, False, start, end, None, None, "auto", quality, 95.0)
     j = plan(1799, None)
@@ -243,8 +247,9 @@ def t_burn_inpaint() -> None:
     class Zero:
         def run(self, _, feed):
             return [np.zeros_like(feed["image"])]
+    asked = []
     with tempfile.TemporaryDirectory() as td, patch.object(I, "session", lambda *a: Zero()), \
-            patch.object(I, "backend_of", lambda b="auto": ("cpu", "")):
+            patch.object(I, "backend_of", lambda b: asked.append(b) or ("cpu", "")):
         d = Path(td)
         video = str(d / "w.mp4")
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=320x180:r=30:d=3",
@@ -255,7 +260,8 @@ def t_burn_inpaint() -> None:
         out = d / "o.mp4"
 
         def burn(**kw):
-            job = P.plan(ass, video, out, True, kw.get("start"), kw.get("end"), kw.get("size"), None, "libx264", "10", 95.0)
+            job = P.plan(ass, video, out, True, kw.get("start"), kw.get("end"), kw.get("size"), None, "libx264", "10", 95.0,
+                         kw.get("device", "auto"))
             return P.burn_inpaint(job), job
 
         def gray(t, box):
@@ -278,7 +284,8 @@ def t_burn_inpaint() -> None:
               got[0] > 200 and got[1] < 30 and got[2] > 200 and got[3] > 200
               and "aac" in subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(out)],
                                           capture_output=True, text=True).stdout, got)
-        burn(size=(640, 360), start=1.0, end=2.0)
+        burn(size=(640, 360), start=1.0, end=2.0, device="cpu")
+        check("修补推理的后端听 --device（auto / cpu 原样交给 backend_of）", asked == ["auto", "cpu"], asked)
         got = [gray(0.5, (220, 140, 420, 220)), gray(0.5, (20, 20, 120, 80))]
         check("给了 --size（非 1080p、和 PlayRes 不同）、只烧一段：底板换到输出像素上抹，时刻按原片", got[0] < 30 and got[1] > 200, got)
         out.unlink()
@@ -306,11 +313,18 @@ def t_burn_inpaint() -> None:
         rows = d / "rows.ass"
         rows.write_text(ASS_HEAD.replace("PlayResY: 180\n", "PlayResY: 180\nFlowOCR Typeset: plate=rows alpha=0x20\n")
                         + plate_line("0:00:01.00", "0:00:02.00", "\\pos(100,60)", 120, 60) + "\n", encoding="utf-8")
+        tb = d / "textbox.ass"
+        tb.write_text(rows.read_text(encoding="utf-8").replace("plate=rows", "plate=textbox"), encoding="utf-8")
         bare = d / "bare.ass"
         bare.write_text(ASS_HEAD, encoding="utf-8")
-        notes = [P.plan(x, video, out, True, None, None, None, None, "libx264", "10", 95.0).notes for x in (ass, rows, bare)]
-        check("inpainting 开跑前就提示：底板不是 plate=src 出的（会连译文伸出的部分一起抹）、稿里没有底板（没有要抹的）",
-              notes[0] == [] and len(notes[1]) == 1 and "plate=rows" in notes[1][0] and len(notes[2]) == 1 and "没有要抹" in notes[2][0], notes)
+        mixed = d / "mixed.ass"
+        mixed.write_text(rows.read_text(encoding="utf-8").replace("plate=rows", "plate=src plates_used=src,textbox"), encoding="utf-8")
+        notes = [P.plan(x, video, out, True, None, None, None, None, "libx264", "10", 95.0).notes for x in (ass, rows, bare, tb, mixed)]
+        check("inpainting 开跑前就提示：底板不是 plate=src 出的（rows 会连译文伸出的部分一起抹；text / textbox 只盖译文、原文可能没抹干净）、"
+              "稿里没有底板（没有要抹的）；行上另写了样式时按实际画的几种（plates_used）提示",
+              notes[0] == [] and len(notes[1]) == 1 and "plate=rows" in notes[1][0] and len(notes[2]) == 1 and "没有要抹" in notes[2][0]
+              and len(notes[3]) == 1 and "plate=textbox" in notes[3][0] and "原文可能没抹干净" in notes[3][0] and "实际盖着" in notes[3][0]
+              and len(notes[4]) == 1 and "plate=textbox" in notes[4][0] and ";plate=src" in notes[4][0], notes)
 
     tall = []
     for preset, rect in (("default", (200, 100, 1700, 900)), ("hq", (200, 300, 1700, 800))):
@@ -356,6 +370,156 @@ def t_burn_inpaint() -> None:
                   "lama_3dda85f72d1765c6_t1016111_o1290_sm120_fp16_cb4a90f6_5960910791567646261_0_fp16_sm120.engine"):
             (eng / n).write_bytes(b"")
         check("lama 的引擎缓存（.engine、.lock）flowocr-trt remove 认得、会删", T.ours(eng))
+
+
+def t_inpaint_still() -> None:
+    """修补器到期时判静止（`inpaint.verdict`）：底板内部和上次重补那一帧比没明显变化就不重补；推理换成计数的全零假会话，按推理窗数算重补次数。"""
+    print("阶段 5：修补器到期判静止")
+    import numpy as np
+    from flowocr.burn import inpaint as I
+
+    class Zero:
+        def run(self, _, feed):
+            return [np.zeros_like(feed["image"])]
+    rect = (200, 800, 1000, 900)                                # 一窗装得下：重补一次 = 推理 1 窗
+    base = np.full((1080, 1920, 3), 255, np.uint8)
+
+    def go(frame, n=600, rects=lambda t: [rect], shown=None, preset="default"):
+        """跑 n 帧（60 fps），返回 (每帧之后累计的推理窗数, stats)。"""
+        inp = I.Inpainter(I.PRESETS[preset], Zero(), 60.0, "cpu")
+        tiles = []
+        for t in range(n):
+            rs = rects(t)
+            inp(frame(t), rs, shown(t) if shown else rs)
+            tiles.append(inp.stats["tiles"])
+        return tiles, inp.stats
+
+    tiles, st = go(lambda t: base)
+    tiles_hq, st_hq = go(lambda t: base, preset="hq")
+    check("完全静止 10 s：每组只推理一次；每次到期都判静止、重新计时（default 每 20 帧一次共 29 次，hq 每 12 帧一次共 49 次）",
+          (tiles[-1], st["still"], tiles_hq[-1], st_hq["still"]) == (1, 29, 1, 49), (tiles[-1], st["still"], tiles_hq[-1], st_hq["still"]))
+
+    def typed(t):                                               # 打字机：底板里的字 2 s 内逐帧露出来（黑块逐帧变宽）；第 400 帧起字下面一小块（900 px）变黑
+        img = base.copy()
+        img[820:880, 210:210 + 6 * min(t, 119)] = 0
+        if t >= 400:
+            img[882:900, 600:650] = 0
+        return img
+    tiles, _ = go(typed, shown=lambda t: [(200, 800, min(1000, 216 + 6 * t), 900)])
+    check("打字机：露字期间（要抹的部分在长，到第 131 帧）和之后 2 个到期周期内这块底板不进静止判据，不重补；之后重新比，第 400 帧的变化当帧到期就重补",
+          (tiles[399], tiles[400], tiles[-1]) == (1, 2, 2), (tiles[399], tiles[400], tiles[-1]))
+
+    lines = [(200, 800, 1000, 850), (200, 860, 1000, 900)]     # 两行一组：第一行早就露完，第二行在露字
+
+    def typed2(t):
+        img = base.copy()
+        img[865:895, 210:210 + 4 * min(t, 190)] = 0
+        if t >= 30:
+            img[810:840, 300:330] = 0                           # 第一行里一小块变了：900 px，超过整组底板面积的 0.2%
+        return img
+    tiles, _ = go(typed2, n=200, rects=lambda t: lines, shown=lambda t: [lines[0], (200, 860, min(1000, 210 + 4 * t), 900)])
+    check("只跳过正在露字的那块底板：同组里早就露完的那一行变了，下次到期（第 40 帧）照常重补", (tiles[39], tiles[40], tiles[-1]) == (1, 2, 2),
+          (tiles[39], tiles[40], tiles[-1]))
+
+    def drift(t):                                               # 底板内部每 4 帧整体变暗 1：每次到期只比上一次多变 5
+        img = base.copy()
+        img[800:900, 200:1000] = 100 + t // 4
+        return img
+    tiles, _ = go(drift)
+    check("底板内部缓慢渐变：跟上次重补那一帧比、累计超过门才重补（第 0、80、…、560 帧共 8 次；参照若逐次滚动就一次也不补）", tiles[-1] == 8, tiles[-1])
+
+    def block(size):
+        def f(t):
+            img = base.copy()
+            if t >= 30:
+                img[820:820 + size, 300:300 + size] = 0
+            return img
+        return f
+    big, _ = go(block(30))                                      # 900 px，底板面积 80000 px 的 1.1%
+    small, _ = go(block(8))                                     # 64 px，0.08%
+    check("底板内部一小块变了：超过 0.2% 的在下次到期（第 40 帧）重补，不到 0.2% 的不补", (big[39], big[40], big[-1], small[-1]) == (1, 2, 2, 1),
+          (big[39], big[40], big[-1], small[-1]))
+
+    rng = np.random.default_rng(0)
+    noise = [np.clip(base.astype(np.int16) - rng.integers(0, 13, base.shape, dtype=np.int16), 0, 255).astype(np.uint8) for _ in range(4)]
+    tiles, _ = go(lambda t: noise[t % 4], n=200)
+    check("只有编码噪声那样的大面积小差（逐像素 ≤ 12）：判静止，只推理一次", tiles[-1] == 1, tiles[-1])
+
+    two = lambda t: [(200, 800, 1000, 850), (200, 860, 600 if t < 30 else 700, 900)]   # 外接矩形不变，下面那块变宽
+    tiles, _ = go(lambda t: base, rects=two, n=200)
+    check("外接矩形不变、组里某块底板变了大小：下次到期（第 40 帧）重补", (tiles[39], tiles[40], tiles[-1]) == (1, 2, 2), (tiles[39], tiles[40], tiles[-1]))
+
+    def ring(t):                                                # 底板内部不动，第 30 帧起外面整体变暗一大截
+        img = base.copy() if t < 30 else np.full_like(base, 128)
+        img[800:900, 200:1000] = 100
+        return img
+    tiles, _ = go(ring, n=60)
+    check("每帧的上下文判据仍先判：底板内部不动、外圈第 30 帧大变，当帧重补，不等到期", (tiles[29], tiles[30]) == (1, 2), (tiles[29], tiles[30]))
+
+    def ring_drift(t):                                          # 底板内部不动，外圈每 6 帧变暗 1，单帧远在上下文门以内
+        img = np.full_like(base, 200 - t // 6)
+        img[800:900, 200:1000] = 100
+        return img
+    tiles, st = go(ring_drift)
+    check("判静止后上下文的参照（old.sig）不换：外圈缓慢漂移累计超门照样重补（这段 600 帧里 10 次以上；换了就一次也不补）",
+          tiles[-1] > 10 and st["still"] > 0, (tiles[-1], st["still"]))
+
+    def step(dv):                                               # 第 10 帧起底板内部整体亮 dv
+        def f(t):
+            img = base.copy()
+            img[800:900, 200:1000] = 100 + (dv if t >= 10 else 0)
+            return img
+        return f
+    at16, _ = go(step(16), n=30)
+    at17, _ = go(step(17), n=30)
+    check("明显变化是严格大于 16：整块差 16 判静止，差 17 在到期（第 20 帧）重补", (at16[-1], at17[19], at17[20]) == (1, 1, 2), (at16[-1], at17[19], at17[20]))
+
+    def late(t):                                                # 要抹的部分第 60 帧就展开完，字却到第 90 帧才出完（字比涂抹区晚出）
+        img = base.copy()
+        img[820:880, 210:210 + 8 * min(t, 90)] = 0
+        return img
+    tiles, _ = go(late, n=200, shown=lambda t: [(200, 800, min(1000, 210 + 13 * t), 900)])
+    check("涂抹区展开停下之后字还在晚出：2 个到期周期的保留期内不重补（保留期写成 0 就会在第 80 帧补）", tiles[-1] == 1, tiles[-1])
+
+    class Gen:                                                  # 第 k 次推理输出整块 20·k：看得出显示的是哪一次生成
+        def __init__(self):
+            self.k = 0
+
+        def run(self, _, feed):
+            self.k += 1
+            return [np.full_like(feed["image"], 20.0 * self.k)]
+    inside = lambda o: sorted({int(v) for q in lines for v in np.unique(o[q[1] + 2:q[3] - 2, q[0] + 2:q[2] - 2])})   # noqa: E731  只看底板里；缩小 2 倍放大回来，边上一圈混进原图
+    still_inp, two_inp = I.Inpainter(I.PRESETS["default"], Gen(), 60.0, "cpu"), I.Inpainter(I.PRESETS["default"], Gen(), 60.0, "cpu")
+    for t in range(300):
+        a_out = still_inp(base, [rect], [rect])
+        b_out = two_inp(typed2(t), lines, [lines[0], (200, 860, min(1000, 210 + 4 * t), 900)])
+        if t == 39:                                             # 第二行这时还没露完（没露的地方是原图），只看第一行
+            q = lines[0]
+            before = sorted({int(v) for v in np.unique(b_out[q[1] + 2:q[3] - 2, q[0] + 2:q[2] - 2])})
+    check("显示的补丁始终是同一次生成的一整块：静止 5 s 一直是第 1 次生成；重补后渐变走完只剩第 2 次生成，没有两次生成拼在一起",
+          (inside(a_out), before, inside(b_out)) == ([20], [20], [40]), (inside(a_out), before, inside(b_out)))
+
+    def back(t):                                                # 第 36 帧起底板里一小块变了
+        img = base.copy()
+        if t >= 36:
+            img[820:850, 300:330] = 0
+        return img
+    tiles, _ = go(back, n=80, rects=lambda t: [] if t == 30 else [rect],
+                  shown=lambda t: [] if t == 30 else [(200, 800, 600, 900)] if t < 30 else [rect])
+    check("底板消失一帧再出现：露字记录清空，出现那一帧不算露字，之后底板里的变化在到期（第 51 帧）照常重补",
+          (tiles[30], tiles[31], tiles[50], tiles[51]) == (1, 2, 2, 3), (tiles[30], tiles[31], tiles[50], tiles[51]))
+
+    slow = I.Inpainter(I.PRESETS["default"], Zero(), 3.0, "cpu")    # 3 fps：到期 = 1 帧
+    for _ in range(30):
+        slow(base, [rect], [rect])
+    check("低帧率（到期 = 1 帧）的静止画面：每帧复查、判静止，整段只推理一次", (slow.n_age, slow.stats["tiles"], slow.stats["still"]) == (1, 1, 29),
+          (slow.n_age, slow.stats["tiles"], slow.stats["still"]))
+
+    small_frame = np.full((720, 1280, 3), 255, np.uint8)
+    inp = I.Inpainter(I.PRESETS["default"], Zero(), 60.0, "cpu")
+    for _ in range(300):
+        inp(small_frame, [(130, 530, 670, 600)], [(130, 530, 670, 600)])
+    check("720p 的静止画面：整段只推理一次", inp.stats["tiles"] == 1, inp.stats["tiles"])
 
 
 def t_burn_chain() -> None:

@@ -52,6 +52,8 @@ ENCODERS = {
 """名字 -> ffmpeg 参数（质量 q 进去）、默认质量、搜索的范围。"""
 AUTO = ("hevc_nvenc", "hevc_qsv", "hevc_amf", "h264_nvenc", "h264_qsv", "h264_amf", "libx264")
 """自动选择的先后（owner 2026-10-30）。"""
+SOFTWARE = ("libx264", "libx265")
+"""CPU 上编码的（`--device cpu` 只认这些），其余是硬件编码器。"""
 AUTO_MIN_S = 1800
 TARGET = 95.0
 
@@ -76,15 +78,18 @@ def has_vmaf() -> bool:
     return " libvmaf " in r.stdout
 
 
-def resolve(codec: str) -> str:
-    """`auto` -> 按先后挑第一个能用的；指定的名字要在表里且能用。"""
+def resolve(codec: str, device: str = "auto") -> str:
+    """`auto` -> 按先后挑第一个能用的（`device` 是 cpu 时只挑软件编码器）；指定的名字要在表里且能用，`device` 是 cpu 时还得是软件编码器。"""
     if codec == "auto":
-        name = next((n for n in AUTO if usable(n)), None)
+        order = AUTO if device == "auto" else tuple(n for n in AUTO if n in SOFTWARE)
+        name = next((n for n in order if usable(n)), None)
         if name is None:
-            raise ValueError(f"这个 ffmpeg 一个能用的编码器都没有（试了 {'、'.join(AUTO)}）：换一个带 libx264 的 ffmpeg 构建")
+            raise ValueError(f"这个 ffmpeg 一个能用的编码器都没有（试了 {'、'.join(order)}）：换一个带 libx264 的 ffmpeg 构建")
         return name
     if codec not in ENCODERS:
         raise ValueError(f"不认识的编码器 {codec}，可选：auto、{'、'.join(ENCODERS)}")
+    if device == "cpu" and codec not in SOFTWARE:
+        raise ValueError(f"--device cpu 只能用软件编码器（{'、'.join(SOFTWARE)}），{codec} 是硬件编码器")
     if not usable(codec):
         raise ValueError(f"编码器 {codec} 在这台机器上压不了")
     return codec

@@ -121,21 +121,20 @@ def orphans(doc: dict, tr: dict, cue: dict) -> list[dict]:
     out = []
     for i in hide:
         e = doc["events"][i]
-        if evalkit.content_len(e["text"]) >= 3 and not any(tracksio.same_row(e["box"], v["box"]) for v in vis):
+        if evalkit.content_len(e["text"]) >= 3 and not any(tracksio.same_row(e["box"], v["box"], e["text"], v["text"]) for v in vis):
             out.append(e)
     return out
 
 
 def doubled(doc: dict, tr: dict, cue: dict) -> list[tuple[dict, dict]]:
-    """同一条 cue 里看得见的两个事件同一行、横向重叠过半、文本相似（相同、一方是另一方开头、或相似度 ≥ 0.85）——同一行字写了两遍，要为 0。"""
+    """同一条 cue 里看得见的两个事件同一行、顺着行重叠过半（竖排的列比上下）、文本相似（相同、一方是另一方开头、或相似度 ≥ 0.85）——同一行字写了两遍，要为 0。"""
     vis = tracksio.cue_lines(doc, tr, cue)
     out = []
     for i, a in enumerate(vis):
         for b in vis[i + 1:]:
-            if not tracksio.same_row(a["box"], b["box"]):
+            if not tracksio.same_row(a["box"], b["box"], a["text"], b["text"]):
                 continue
-            ov = min(a["box"][2], b["box"][2]) - max(a["box"][0], b["box"][0])
-            if ov < 0.5 * min(a["box"][2] - a["box"][0], b["box"][2] - b["box"][0]):
+            if tracksio.along_overlap(a["box"], b["box"], a["text"], b["text"]) < 0.5:
                 continue
             x, y = squash([a["text"]]), squash([b["text"]])
             if x and y and (x.startswith(y) or y.startswith(x) or SequenceMatcher(None, x, y).ratio() >= HEAD_SIM):
@@ -148,13 +147,13 @@ def exported(doc: dict, tr: dict, cue: dict) -> list[dict]:
 
 
 def row_order_bad(evs: list[dict]) -> bool:
-    rows = tracksio.row_index([e["box"] for e in evs])
-    key = [(r, e["box"][0]) for r, e in zip(rows, evs)]
+    rows = tracksio.row_index([e["box"] for e in evs], [e["text"] for e in evs])
+    key = [(r, tracksio.reading_key(e["box"], e["text"])) for r, e in zip(rows, evs)]
     return key != sorted(key)
 
 
 def has_shared_row(evs: list[dict]) -> bool:
-    rows = tracksio.row_index([e["box"] for e in evs])
+    rows = tracksio.row_index([e["box"] for e in evs], [e["text"] for e in evs])
     return len(set(rows)) < len(rows)
 
 
@@ -195,7 +194,7 @@ def measure(d: Path) -> dict | None:
         if len(evs) >= 2 and has_shared_row(evs):
             shared += 1
             bad += row_order_bad(evs)
-        if len(set(tracksio.row_index([e["box"] for e in evs]))) >= 2:
+        if len(set(tracksio.row_index([e["box"] for e in evs], [e["text"] for e in evs]))) >= 2:
             multi += 1
             ids = {e["id"] for e in evs}
             hit = [x for x in sl if x[1] & ids]

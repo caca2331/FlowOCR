@@ -2,8 +2,13 @@
 
 * 分组切窗：竖向挨着（间隙 ≤ `GROUP_GAP`）、横向有重叠的底板并成一组，整帧缩小 `scale` 倍后每组切一串扁窗（窗高 × 宽见档位），
   补完放大回原尺寸，只贴回底板矩形里的像素。尺寸不能被整除时先镜像补到整除；缩小后不足一个窗的那一边镜像补齐，掩码跟着镜像。
-* 时间上复用：同一组（外接矩形不变）的上下文（外接矩形外扩 `CTX_PX` 的一圈、掩码外的像素，缩到 1/8 后的 Lab）和上次重补时比，
-  均差超过 `diff_thr` 或隔了 `max_age_s` 秒才重补；沿用时按上下文一圈的均色差给补丁整体校色。重补时从旧补丁逐帧渐变到新补丁，`fade_s` 秒走完。
+* 时间上复用：同一组（外接矩形不变）每帧拿上下文（外接矩形外扩 `CTX_PX` 的范围里掩码外的格，含行间缝，缩到 1/8 后的 Lab）
+  和上次重补时比，均差超过 `diff_thr` 就重补；没超就沿用，按上下文的均色差给补丁整体校色。
+  沿用到 `max_age_s` 秒时再看底板内部：和上次重补那一帧比，逐像素三通道最大 |差| 超过 `STILL_DIFF` 的像素不超过 `STILL_SHARE`，
+  就当画面静止、接着沿用（重新计时，参照仍是上次重补那一帧）；否则重补。静止的画面不重补，补丁就不会无故跳动。
+  露字的底板不比：要抹的部分在最近 `REVEAL_HOLD` 个到期周期里变过的那几块底板，里面的变化是字在出（掩码本来就盖着），整块跳过；
+  判成静止时把这几块的参照换成这一刻的像素。字比要抹的部分晚出一点也不怕，露完之后还要再等这么久才重新比这块。
+  重补时从旧补丁逐帧渐变到新补丁，`fade_s` 秒走完。
   时长类参数按调用的帧率换成帧数、四舍五入。有状态：要按帧序调用。
 * 打字机：调用时给要抹的部分（这一刻底板画出来的那段），只贴它；分组、推理、沿用仍按整块底板，还没有字露出来的组不补。
 * 非 1080p：组间隙、上下文宽、窗、缩小倍数都是在 1080p 上定的，别的高度先把整帧重采样到等效 1080p 再修补，补完重采样回来、只贴回要抹的部分；
@@ -30,6 +35,9 @@ OVERLAP = 128                               # 横向相邻窗的重叠
 GROUP_GAP = 32                              # 竖向间隙不超过这么多 px 的底板并成一组
 CTX_MIN = 128                               # 一组在缩小后的坐标里最高为窗高减这么多，上下各留至少 64 px 上下文
 CTX_PX = 24                                 # 上下文一圈的宽度（px）
+STILL_DIFF = 16                             # 到期时底板内部"明显变了"的像素：三通道最大 |差| 超过它（编码噪声是大面积的小差）
+STILL_SHARE = 0.002                         # 明显变了的像素不超过底板面积的这么多，就当静止、不重补（两档共用）
+REVEAL_HOLD = 2                             # 露字范围变过之后，这块底板这么多个到期周期内不进静止判据
 REF_H = 1080                                # 上面这些常量和档位按这个画面高定
 CUDA_MEM_LIMIT = 2 << 30                    # 每个会话 CUDA EP 显存池的上限（超了当场报错，不去挤别人的显存）；TRT 引擎自己的显存另算
 
@@ -38,7 +46,7 @@ CUDA_MEM_LIMIT = 2 << 30                    # 每个会话 CUDA EP 显存池的�
 class Cfg:
     scale: int                              # 整帧缩小这么多倍再切窗
     diff_thr: float                         # 上下文 Lab 均差（ΔE）超过它就重补
-    max_age_s: float                        # 最多沿用这么多秒
+    max_age_s: float                        # 沿用满这么多秒复查一次：底板内部有明显变化才重补（静止的画面可以一直沿用）
     fade_s: float                           # 重补时从旧补丁渐变到新补丁用的秒数
     win: tuple[int, int]                    # 推理窗的高、宽（缩小后的坐标）
     act: int                                # 图里激活整体缩小的倍数（`lamagraph.scaled`）
@@ -178,6 +186,8 @@ class Held:
     patch: np.ndarray                       # 补好的外接矩形（BGR）
     sig: tuple
     mean: np.ndarray                        # 补丁的 BGR 均色（float32，0–1），沿用时校色的基点
+    ref: np.ndarray                         # 到期时判静止的参照：重补那一帧外接矩形里的原图（BGR）；露字的底板判静止时换成那一刻的
+    rmask: np.ndarray                       # 同一范围里哪些像素在底板矩形里
     age: int = 0
     prev: np.ndarray | None = None          # 渐变：重补前最后显示的那块，从它渐变到新补丁
     fade_left: int = 0
@@ -191,8 +201,9 @@ class Inpainter:
     backend: str = "trt"
     fallback: object = None                 # fp16 出 NaN 时用的 fp32 会话，用到才建
     held: list[Held] = field(default_factory=list)
-    stats: dict = field(default_factory=lambda: {"frames": 0, "groups": 0, "reused": 0, "tiles": 0, "nan_tiles": 0, "run_s": 0.0})
+    stats: dict = field(default_factory=lambda: {"frames": 0, "groups": 0, "reused": 0, "still": 0, "tiles": 0, "nan_tiles": 0, "run_s": 0.0})
     keeps: tuple = field(default_factory=lambda: ([], {}))   # (这一帧的底板矩形, ctx_sig 按组缓存的"掩码外"格)
+    reveal: dict = field(default_factory=dict)              # 底板矩形 -> (这一刻要抹的部分落在它里面的几段, 最后一次变的帧号)
 
     def __post_init__(self):
         n = lambda sec: round(sec * self.fps)
@@ -218,14 +229,15 @@ class Inpainter:
         h, w = img.shape[:2]
         self.stats["frames"] += 1
         if not rects:
-            self.held = []
+            self.held, self.reveal = [], {}
             return out
         clamp = lambda rs: [r for r in ((max(0, x0), max(0, y0), min(w, x1), min(h, y1)) for x0, y0, x1, y1 in rs)   # noqa: E731
                             if r[2] > r[0] and r[3] > r[1]]                   # 整块出画的不要：负的终点会让切片标上一大片
         rects, shown = clamp(rects), clamp(shown)
         if not rects:
-            self.held = []
+            self.held, self.reveal = [], {}
             return out
+        self.track_reveal(rects, shown)
         mask = np.zeros((h, w), bool)
         for x0, y0, x1, y1 in rects:
             mask[y0:y1, x0:x1] = True
@@ -243,9 +255,12 @@ class Inpainter:
                 continue
             self.stats["groups"] += 1
             sig = ctx_sig(img, box, mask, self.keeps[1])
-            if old is not None and self.fresh(old, sig):
+            how = self.verdict(old, sig, img, mask) if old is not None else "new"
+            if how != "new":
                 self.stats["reused"] += 1
-                old.age += 1
+                if how == "still":
+                    self.stats["still"] += 1
+                old.age = 0 if how == "still" else old.age + 1
                 keep.append(old)
                 paste(out, self.shown_patch(old, self.corrected(old, sig)), box, shown)
             else:
@@ -255,12 +270,24 @@ class Inpainter:
                 todo.append((box, sig, prev))
         if todo:
             for (box, sig, prev), p in zip(todo, self.infer(img, mask, [b for b, *_ in todo])):
+                x0, y0, x1, y1 = box
                 hd = Held(box, p, sig, p.reshape(-1, 3).mean(axis=0, dtype=np.float32) / 255,
-                          prev=prev, fade_left=self.n_fade if prev is not None else 0)
+                          img[y0:y1, x0:x1].copy(), mask[y0:y1, x0:x1].copy(), prev=prev, fade_left=self.n_fade if prev is not None else 0)
                 paste(out, self.shown_patch(hd, p), box, shown)
                 keep.append(hd)
         self.held = keep
         return out
+
+    def track_reveal(self, rects: list, shown: list) -> None:
+        """记每块底板里要抹的部分最后一次变的帧号（第一次出现不算变）。"""
+        now, last = self.stats["frames"], self.reveal
+        cur = {}
+        for r in rects:
+            part = tuple((max(q[0], r[0]), max(q[1], r[1]), min(q[2], r[2]), min(q[3], r[3])) for q in shown
+                         if min(q[2], r[2]) > max(q[0], r[0]) and min(q[3], r[3]) > max(q[1], r[1]))
+            old = last.get(r)
+            cur[r] = (part, now if old is not None and old[0] != part else (old[1] if old is not None else -1 << 30))
+        self.reveal = cur
 
     def corrected(self, old: Held, sig) -> np.ndarray:
         """沿用的补丁按上下文一圈的 Lab 均色差整体校色。"""
@@ -278,13 +305,27 @@ class Inpainter:
         hd.fade_left -= 1
         return cv2.addWeighted(hd.prev, 1 - a, patch, a, 0)
 
-    def fresh(self, old: Held, sig) -> bool:
-        if old.age + 1 >= self.n_age:
-            return False
+    def verdict(self, old: Held, sig, img: np.ndarray, mask: np.ndarray) -> str:
+        """这一帧这一组怎么办：keep（上下文没变，沿用）| still（到期了，但底板内部和上次重补那一帧比没明显变化，沿用）| new（重补）。"""
         k = sig[1] & old.sig[1]
-        if not k.any():
-            return False
-        return float(np.linalg.norm(sig[0][k] - old.sig[0][k], axis=1).mean()) <= self.cfg.diff_thr
+        if not k.any() or float(np.linalg.norm(sig[0][k] - old.sig[0][k], axis=1).mean()) > self.cfg.diff_thr:
+            return "new"
+        if old.age + 1 < self.n_age:
+            return "keep"
+        x0, y0, x1, y1 = old.box
+        m = mask[y0:y1, x0:x1]
+        if not np.array_equal(m, old.rmask):                                  # 组里某块底板变了大小：重补
+            return "new"
+        skip = np.zeros_like(m)                                               # 正在露字的底板：整块不比
+        for r, (_, f) in self.reveal.items():
+            if self.stats["frames"] - f <= REVEAL_HOLD * self.n_age and r[2] > x0 and r[0] < x1 and r[3] > y0 and r[1] < y1:
+                skip[max(r[1], y0) - y0:min(r[3], y1) - y0, max(r[0], x0) - x0:min(r[2], x1) - x0] = True
+        moved = cv2.absdiff(img[y0:y1, x0:x1], old.ref).max(axis=-1) > STILL_DIFF
+        if np.count_nonzero(moved & m & ~skip) > STILL_SHARE * np.count_nonzero(m):
+            return "new"
+        if skip.any():                                                        # 字已经出来了：这几块的参照换成这一刻的
+            old.ref[skip] = img[y0:y1, x0:x1][skip]
+        return "still"
 
     def run(self, imgs: np.ndarray, masks: np.ndarray) -> np.ndarray:
         """推理一窗；出了 NaN 的窗都计数（`nan_tiles`），TensorRT fp16 的用 fp32 重算（fp32 会话用到才建，建会话不算进推理时间）。"""

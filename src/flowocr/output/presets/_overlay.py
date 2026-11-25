@@ -8,7 +8,7 @@
 
 options 按键分给两个阶段：`keep` `show` `hide` `why` `lang` `layers` `tracks` `style` `ruby` 给阶段 3（`flowocr.output.script.render_script`；
 `layers` 只为了传过去报错：匹配产物上它和 `keep` 都已去掉，改用 `show` / `hide`），
-`plate` `plate_alpha` `plate_color` `unknown` 给阶段 4（`flowocr.typeset.core`），`typewriter` `fade` 两边都给
+`plate` `plate_alpha` `plate_color` `flow` `unknown` 给阶段 4（`flowocr.typeset.core`），`typewriter` `fade` 两边都给
 （阶段 3 的 off 是不判、不写，阶段 4 的 off 是不画；`typewriter=off` 时阶段 3 照原来的规矩改判淡入）。
 匹配产物上 `default_all` / `dev` 等于 `show=all`，用户另给的 `show` / `hide` 照样生效（`hide` 关掉 `on` 档的组或填位）。
 `name` 是最终 ASS 的文件名，字幕稿在它旁边、`.ass` 换成 `.script.ass`。
@@ -25,7 +25,7 @@ from flowocr.typeset import core
 PRESETS = {"default": ("main", "off", "default"), "default_all": ("all", "off", "default"), "dev": ("all", "on", "dev")}
 """预设 → (保留范围, why, 阶段 4 的样子)。保留范围 `all` 在 tracks 上是 `keep=all`、在 matched 上是 `show=all`。"""
 STAGE3 = ("keep", "show", "hide", "why", "lang", "layers", "tracks", "style", "ruby", "typewriter", "fade")
-STAGE4 = ("plate", "plate_alpha", "plate_color", "unknown", "typewriter", "fade")
+STAGE4 = core.LOOK_OPTIONS
 
 
 def render(document: dict, output_dir, options: dict | None, preset: str) -> list[Path]:

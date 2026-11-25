@@ -106,21 +106,20 @@ def keys(rubies: list[Ruby]) -> list[str]:
     return [s for r in rubies for s in (r.prefix + r.base, r.base, r.reading)]
 
 
-def place(rubies: list[Ruby], axis: float, y: float, valign: str, align: str, size: int, line_ws: list[float],
+def place(rubies: list[Ruby], axis: float, y: float, valign: str, align: str, size: int, line_ws: list[float | None],
           font: str, widths: dict, W: int) -> list[Placed]:
-    """一个正文元素（锚在墨迹的锚轴 `axis`、竖直锚点 `y`；`valign` 是 `top` / `middle` / `bottom`，几行按每行一个字号的行距排）
-    上面的各处 Ruby。`line_ws` 是各可见行画出来的宽。
+    """一个正文元素（锚在墨迹的锚轴 `axis`、竖直锚点 `y`；`valign` 是 `top` / `middle` / `bottom`，几行按 `layout.line_centers` 排）
+    上面的各处 Ruby。`line_ws` 是画出来的各行（末尾的换行不算）的宽，空行是 None（只占半行高）。
     横向：正文中心 = 行左沿 + 墨迹宽(前缀+正文) − 墨迹宽(正文) / 2——按正文的右沿往回算，前缀末尾的空格、字间的留白都不会让中心偏；
     读音超出画面就往里推到 `layout.EDGE_PAD`。竖直：读音底边 = 这一行的字形顶（行中心 − 字形高 / 2）往上 `RUBY_GAP` 个字号。"""
     n = len(line_ws)
     gh = size / export.h_ratio(font)
+    ys = layout.line_centers([w is None for w in line_ws], y, valign, size)
     out = []
     for r in rubies:
-        if r.line >= n:
+        if r.line >= n or line_ws[r.line] is None:
             continue
-        j, w = r.line, line_ws[r.line]
-        cy = (y + (j - (n - 1) / 2) * size if valign == "middle" else y + (j + 0.5) * size if valign == "top"
-              else y - (n - 1 - j + 0.5) * size)
+        w, cy = line_ws[r.line], ys[r.line]
         left = layout.text_span(axis, w, align)[0]
         cx = left + (widths.get((font, r.prefix + r.base), 0.0) - widths.get((font, r.base), 0.0) / 2) * size
         w1 = widths.get((font, r.reading), 0.0)
@@ -149,12 +148,12 @@ def union(plate: list[float], rects: list[list[float]], pad: float) -> list[floa
 
 
 def with_rubies(plates: list[list[float]], rects: list[list[list[float]]], mode: str, pad: float) -> list[list[float]]:
-    """底板并进读音：`box` 一整块并进全部，`rows` / `text` 每行那块并进这一行的（`rects[i]` 是第 i 行的读音矩形）。
+    """底板并进读音：`box` / `textbox` 一整块并进全部，`rows` / `text` 每行那块并进这一行的（`rects[i]` 是第 i 行的读音矩形）。
     逐行的底板往上长进了上一行那块、而读音（外扩边距后）横向都在上一行那块以内时，上沿停在上一行的下沿：
     那一截已经被上一行盖着，再叠一层半透明会更黑；横向伸出去的照并（叠一条，R6 的已知限度）。"""
     if not plates or not any(rects):
         return plates
-    if mode == "box":
+    if mode in ("box", "textbox"):
         return [union(plates[0], [r for rs in rects for r in rs], pad)]
     out = [union(pl, rs, pad) for pl, rs in zip(plates, rects)]
     for k in range(1, len(out)):

@@ -40,10 +40,10 @@ import ocr_progress as op
 from pathlib import Path
 p = Path(sys.argv[1])
 m = json.loads(p.open(encoding='utf-8').readline()).get('_meta', {})
-f = op._last_frame(p) or 0
+t = op._last_t_us(p) or 0
 # 别在这里四舍五入：`--hours` 是 条/h 的分母，0.167 和 0.16667 差出 2 条/h，
 # 文档里的数就对不回来了（docs/dev-guide/verification.md「报数口径」：写进文档的每个数都要能数回来）。
-print('ok' if m.get('complete') else 'partial', round(f / (m.get('src_fps') or 60) / 3600, 6))
+print('ok' if m.get('complete') else 'partial', round(t / 1e6 / 3600, 6))
 " "$obs" "$CODE_W/dev_tools")
   state=${info%% *}; hrs=${info##* }
   if [ "$state" != ok ]; then

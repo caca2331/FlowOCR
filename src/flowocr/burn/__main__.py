@@ -19,7 +19,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--video", default="", help="源视频（默认按 ASS 的 [Script Info] 里的 FlowOCR Video）")
     ap.add_argument("--inpaint", nargs="?", const="default", choices=("default", "hq"),
                     help="走 inpainting：default（快）/ hq（慢一些、补得更好）")
-    ap.add_argument("--codec", default="auto", help=f"编码器：auto（H.265 硬件 → H.264 硬件 → libx264）| {' | '.join(encode.ENCODERS)}")
+    ap.add_argument("--device", default="auto", choices=("auto", "cpu"),
+                    help="auto：修补推理和编码能上 GPU 就上；cpu：全走 CPU（修补用 CPU 推理，编码器只用 libx264 / libx265）")
+    ap.add_argument("--codec", default="auto", help=f"编码器：auto（H.265 硬件 → H.264 硬件 → libx264；--device cpu 时只有 libx264）"
+                                                    f"| {' | '.join(encode.ENCODERS)}")
     ap.add_argument("--quality", help="质量值（CRF / NVENC 的 cq，越大文件越小）| auto = 按目标 VMAF 在源上搜；"
                                       f"不给：不短于 {encode.AUTO_MIN_S // 60} 分钟就搜，否则用编码器的保守默认值")
     ap.add_argument("--target", type=float, default=encode.TARGET, help="搜质量值时的目标 VMAF（抽样帧均值）")
@@ -33,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"--quality 要整数或 auto：{a.quality}")
     try:
         job = pipeline.plan(Path(a.ass), a.video or None, a.out, bool(a.inpaint), a.start, a.end, a.size, a.fps,
-                            a.codec, a.quality, a.target)
+                            a.codec, a.quality, a.target, a.device)
     except ValueError as ex:
         ap.error(str(ex))
     if job.probe:

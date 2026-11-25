@@ -13,6 +13,7 @@ audit-4 C6（`--srt-only` 绕过了输出过滤）在结构上不可能再发生
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from flowocr.artifacts import srtio            # noqa: E402
@@ -32,9 +33,13 @@ FONT_H_RATIO = {FONT_CN: 1.35}
 """
 
 
-def h_ratio(font: str) -> float:
-    """`FONT_H_RATIO` 里查不到的字体（用户在字幕稿里换了字体）按 `FONT_CN` 的比例算；阶段 4 会打一行提示。"""
-    return FONT_H_RATIO.get(font, FONT_H_RATIO[FONT_CN])
+def h_ratio(font: str, widths: dict | None = None) -> float:
+    """`FONT_H_RATIO` 里查不到的字体：给了 `widths` 且量过 `METRIC_REF`（`ink_widths` 量的墨迹高）就按它现算（`Fontsize` / 这串的墨迹高）；
+    否则按 `FONT_CN` 的比例算（用户在字幕稿里换了字体时阶段 4 会打一行提示）。"""
+    if font in FONT_H_RATIO:
+        return FONT_H_RATIO[font]
+    tall = ink_tall(font, METRIC_REF, widths or {})
+    return 1 / tall if tall > 0 else FONT_H_RATIO[FONT_CN]
 
 
 FONT_INK_DY = {FONT_CN: 0.04}
@@ -44,9 +49,43 @@ FONT_INK_DY = {FONT_CN: 0.04}
 同一个框里各行的基线要齐，逐行按墨迹居中会让「一二三」这类扁字的行上下跳。换字体照这个量法重量。"""
 
 
-def ink_dy(font: str) -> float:
-    """`FONT_INK_DY` 里查不到的字体按 `FONT_CN` 的算。"""
-    return FONT_INK_DY.get(font, FONT_INK_DY[FONT_CN])
+def ink_dy(font: str, widths: dict | None = None) -> float:
+    """`FONT_INK_DY` 里查不到的字体：给了 `widths` 且量过 `METRIC_REF` 就用量出来的（`ink_widths` 的竖直居中那一遍），否则按 `FONT_CN` 的算。"""
+    if font in FONT_INK_DY:
+        return FONT_INK_DY[font]
+    k = (DY, font, METRIC_REF)
+    return (widths or {})[k] if k in (widths or {}) else FONT_INK_DY[FONT_CN]
+
+
+METRIC_REF = "Hdgy"
+"""表里没有的字体（阶段 4 的 `latin_font`）现量行高和竖直偏移用的串：大写、升部、降部都有，墨迹高约是一行拉丁字的高。"""
+FONTS_ENV = "FLOWOCR_FONTS"
+"""放额外字体文件的目录（环境变量）：设了就交给 libass（`subtitles` 滤镜的 `fontsdir`），量字宽和阶段 5 烧字幕都用它。
+有的 ffmpeg 构建里 libass 走 fontconfig，只看 `C:\\Windows\\Fonts`：装在用户字体目录里的、变体字体的命名实例（`Bahnschrift Condensed`）都找不到，
+会静默换成替身。不设时和以前一样。"""
+
+
+def fonts_dir() -> str | None:
+    """`FONTS_ENV` 指的目录（存在才算；指了却不存在报错，免得静默换替身）。"""
+    d = os.environ.get(FONTS_ENV, "").strip()
+    if not d:
+        return None
+    p = Path(d).expanduser()
+    if not p.is_dir():
+        raise SystemExit(f"{FONTS_ENV}={d} 不是目录")
+    return str(p.resolve())
+
+
+def sub_filter(name: str) -> str:
+    """烧 / 渲 ASS 的 `subtitles` 滤镜（`name` 是 cwd 下的文件名）；设了 `FONTS_ENV` 就加 `fontsdir`
+    （滤镜参数里盘符的冒号要转义，引号包住空格）。"""
+    d = fonts_dir()
+    if d is None:
+        return f"subtitles={name}"
+    if "'" in d:
+        raise SystemExit(f"{FONTS_ENV} 的路径里不能有单引号：{d}")
+    esc = Path(d).as_posix().replace(":", "\\:")
+    return f"subtitles={name}:fontsdir='{esc}'"
 
 
 INK_REF_SIZE = 48
@@ -76,8 +115,9 @@ def ass_doc(W: int, H: int, styles: list[str], events: list[str], comment: str =
 
 def render_ink(items: list[tuple[str, float, str]]) -> list[tuple[int, int, int, int]]:
     """把 `(字体, 字号, 单行文本)` 逐条用 **libass 真渲**（ffmpeg 的 subtitles 滤镜），
-    返回每条白色墨迹的 `(宽, 高, 左留白, 右留白)`；渲不出墨迹的记全 0。
+    返回每条白色墨迹的 `(宽, 高, 左留白, 右留白, 竖直偏移)`；渲不出墨迹的记全 0。
     左 / 右留白是墨迹到这一行字格（步进宽）左 / 右边的距离：一遍左对齐、一遍右对齐各渲一次量出来。
+    左对齐那一遍竖直居中（`\\an4`，同阶段 4 逐行摆的锚法），竖直偏移是墨迹中心比锚点低多少（`ink_dy` 给表里没有的字体用）。
     libass 按字格对齐，墨迹在字格里不一定居中（「。」的墨迹在左半边），底板按墨迹算位置时要它（2026-10-05：
     「疑惑，……问你。」居中排，墨迹比按墨迹居中算的偏左 17 px，冲出底板）。
 
@@ -100,21 +140,23 @@ def render_ink(items: list[tuple[str, float, str]]) -> list[tuple[int, int, int,
             styles = [f"Style: s{i},{f},{INK_REF_SIZE},&H00FFFFFF,&H000000FF,&H00000000,"
                       "&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1" for i, f in enumerate(fonts)]
             boxes = {}
-            for an, x in ((7, pad), (9, INK_PAGE_W - pad)):           # 左对齐量左留白，右对齐量右留白
+            # 左对齐（竖直居中）量左留白和竖直偏移，右对齐量右留白；横向的量法和竖直怎么锚无关
+            for an, x, y in ((4, pad, row_h // 2), (9, INK_PAGE_W - pad, 4)):
                 events = [f"Dialogue: 0,0:00:00.00,0:00:01.00,s{fonts.index(f)},,0,0,0,,"
-                          + "{" + f"\\an{an}\\pos({x},{k * row_h + 4})\\fs{s:g}" + "}" + ass_text(t)
+                          + "{" + f"\\an{an}\\pos({x},{k * row_h + y})\\fs{s:g}" + "}" + ass_text(t)
                           for k, (f, s, t) in enumerate(page)]
                 (Path(d) / "ink.ass").write_text(ass_doc(INK_PAGE_W, H, styles, events), encoding="utf-8")
                 # 相对文件名 + cwd：filter 语法里 Windows 盘符那个冒号不好转义（同 probe_ass_fontsize）
                 r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
-                                    f"color=c=black:s={INK_PAGE_W}x{H}:d=1", "-vf", "subtitles=ink.ass",
+                                    f"color=c=black:s={INK_PAGE_W}x{H}:d=1", "-vf", sub_filter("ink.ass"),
                                     "-frames:v", "1", "ink.png"], capture_output=True, text=True, cwd=d)
                 if r.returncode != 0:
                     raise SystemExit(f"字宽渲染失败（ffmpeg）：{r.stderr.strip()[:300]}")
                 img = Image.open(Path(d) / "ink.png").convert("L").point(lambda v: 255 if v > 128 else 0)
                 boxes[an] = [img.crop((0, k * row_h, INK_PAGE_W, (k + 1) * row_h)).getbbox() for k in range(len(page))]
-            for lb, rb in zip(boxes[7], boxes[9]):
-                out.append((lb[2] - lb[0], lb[3] - lb[1], lb[0] - pad, INK_PAGE_W - pad - rb[2]) if lb and rb else (0, 0, 0, 0))
+            for lb, rb in zip(boxes[4], boxes[9]):
+                out.append((lb[2] - lb[0], lb[3] - lb[1], lb[0] - pad, INK_PAGE_W - pad - rb[2], (lb[1] + lb[3]) / 2 - row_h // 2)
+                           if lb and rb else (0, 0, 0, 0, 0))
     return out
 
 
@@ -123,8 +165,15 @@ SIDE = "\0side"
 阶段 3 量好的交给阶段 4 时一起带过去；只查 `(字体, 文本)` 的地方碰不到它。"""
 
 
+TALL = "\0tall"
+"""字宽表里另记墨迹高的键 `(TALL, 字体, 文本)` → 字号 1 时的墨迹高（`ink_tall`；竖排列横排时量拉丁大写字母高用）。"""
+DY = "\0dy"
+"""字宽表里另记竖直偏移的键 `(DY, 字体, 文本)` → 字号 1 时竖直居中的墨迹中心比锚点低多少（`ink_dy` 给表里没有的字体用）。"""
+
+
 def ink_widths(pairs, known: dict | None = None) -> dict:
-    """`{(字体, 单行文本): 字号 1 时的墨迹宽}`，另带 `{(SIDE, 字体, 单行文本): (左留白, 右留白)}`（`ink_side`）。
+    """`{(字体, 单行文本): 字号 1 时的墨迹宽}`，另带 `{(SIDE, 字体, 单行文本): (左留白, 右留白)}`（`ink_side`）、`{(TALL, 字体, 单行文本): 墨迹高}`（`ink_tall`）、
+    `{(DY, 字体, 单行文本): 竖直偏移}`（`ink_dy`）。
     同一行文本只渲一次；`known` 里已经量过的不再渲（叠加预设连跑阶段 3、4 时，阶段 4 用阶段 3 量好的）。返回的包含 `known` 里的。"""
     known = known or {}
     uniq = sorted({(f, ln) for f, t in pairs for ln in t.split("\n") if ln.strip()} - set(known))
@@ -133,7 +182,14 @@ def ink_widths(pairs, known: dict | None = None) -> dict:
     for k, r in zip(uniq, got):
         out[k] = r[0] / INK_REF_SIZE
         out[(SIDE, *k)] = (r[2] / INK_REF_SIZE, r[3] / INK_REF_SIZE)
+        out[(TALL, *k)] = r[1] / INK_REF_SIZE
+        out[(DY, *k)] = r[4] / INK_REF_SIZE
     return out
+
+
+def ink_tall(font: str, text: str, widths: dict) -> float:
+    """字号 1 时这一行的墨迹高；没量过是 0。"""
+    return widths.get((TALL, font, text), 0.0)
 
 
 def ink_side(font: str, text: str, widths: dict) -> tuple[float, float]:
@@ -158,11 +214,15 @@ def fit_size(text: str, font: str, box_w: float, box_h: float,
     return max(FIT_MIN_SIZE, int(min(by_h, by_w)))
 
 
+def start_cs(us: int) -> int:
+    """事件起点写进 ASS 的厘秒数（向上取整，`ass_time`）：同一条里晚出现的元素按两条起点**写出来的**差平移 `\\move` 的时刻。"""
+    return max(-(-us // 10_000), 0)
+
+
 def ass_time(us: int, up: bool) -> str:
     """µs → `H:MM:SS.cc`。ASS 只到厘秒：**起点向上取整、终点向下取整**，
     免得两条相邻事件重叠出一个假的"同屏"（`output-format-plan（已归档）`）。"""
-    cs = -(-us // 10_000) if up else us // 10_000
-    cs = max(cs, 0)
+    cs = start_cs(us) if up else max(us // 10_000, 0)
     h, cs = divmod(cs, 360_000)
     m, cs = divmod(cs, 6_000)
     s, cs = divmod(cs, 100)

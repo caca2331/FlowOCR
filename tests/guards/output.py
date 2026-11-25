@@ -8,6 +8,7 @@ import sys  # noqa: F401
 import tempfile  # noqa: F401
 from pathlib import Path  # noqa: F401
 
+import math  # noqa: E402,F401
 import re  # noqa: E402,F401
 from guards._common import *  # noqa: F401,F403
 
@@ -44,6 +45,26 @@ def t_extensions() -> None:
     ex_p, ex_m = ROOT / "examples" / "preset_minimal.py", ROOT / "examples" / "matcher_minimal.py"
     check("examples 里的两个例子按文件路径加载得到", callable(X.load(str(ex_p), "preset").render)
           and callable(X.load(str(ex_m), "matcher").match) and callable(X.load(str(ex_m), "matcher").cluster_patch))
+    import contextlib
+    import io
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        gm = X.load("gametext", "matcher")
+        w = (X.warn_unknown_keys(gm, "gametext", "--ctx", {"ref", "lang"}), X.warn_unknown_keys(gm, "gametext", "--opt", {"fuzzy"}),
+             X.warn_unknown_keys(gm, "gametext", "--opt", {"layout"}), X.warn_unknown_keys(X.load(str(ex_m), "matcher"), "m", "--ctx", {"x"}),
+             X.warn_unknown_keys(X.load("default_srt", "preset"), "p", "--opt", {"x"}))
+    check("匹配器声明了认哪些 --ctx / --opt 键时，别的键打警告、不退出；写错边的指出该写哪边；没声明的不查",
+          w == (["lang"], [], ["layout"], ["x"], []) and "layout 要写在 --ctx" in err.getvalue() and err.getvalue().count("⚠") == 3,
+          (w, err.getvalue()))
+    read = {}
+    for name in ("gametext", "naninovel"):
+        src = (ROOT / "src" / "flowocr" / "analyze" / "matchers" / f"{name}.py").read_text(encoding="utf-8")
+        ctx_read = set(re.findall(r'context(?:\.get\(|\[)"(\w+)"', src)) - {"tracks_path", "argv"}
+        opt_read = set(re.findall(r'\bo(?:\.get\(|\[)"(\w+)"', src))
+        m = X.load(name, "matcher")
+        read[name] = (ctx_read - set(m.CONTEXT_KEYS), opt_read - set(m.OPTION_KEYS), bool(ctx_read), bool(opt_read))
+    check("内置匹配器代码里读的 context / options 键都在它声明的 CONTEXT_KEYS / OPTION_KEYS 里（多读一个键忘了加会被当成不认得）",
+          all(r == (set(), set(), True, True) for r in read.values()), read)
     check("点分模块名和内置名加载到同一个模块",
           X.load("flowocr.output.presets.default_srt", "preset") is X.load("default_srt", "preset"))
     check("没有的内置名报 LookupError（列出有的）", raises(lambda: X.load("nope", "preset"), LookupError))
@@ -760,7 +781,7 @@ def t_overlay_style() -> None:
         obs2 = d2 / "o.jsonl"
         rows2 = [{"t_us": i * 500_000, "box": [100, 800, 700, 840], "text": "ずっと同じ台詞です", "conf": .95} for i in range(12)]
         obs2.write_text("\n".join(_json.dumps(x) for x in [
-            {"_meta": {"width": 1000, "height": 1000, "sample_fps": 2, "video": "synthetic", "src_fps": 30.0,
+            {"_meta": {"width": 1000, "height": 1000, "sample_fps": 2, "video": "synthetic", "src_fps": 30.0, "frame_key": "t_us",
                        "config": {"refine_fused": True}, "edge": {"on": 3}}}, *rows2]), encoding="utf-8")
 
         def build(stub, export_fails=False):
@@ -783,7 +804,7 @@ def t_overlay_style() -> None:
             for ev in [*data["events"], *(c for tr in data["tracks"] for c in tr["cues"])]:
                 ev["t_end"] += 1000                                   # 帧级时刻：SRT 重出之后看得出来
             data["text_effect"] = {"samples": 0}
-            data["boundary_refined"] = {"runs": 1, "decoder": kw["decoder"]}
+            data["boundary_refined"] = {"runs": 1, "decoder": "obs"}
             return {"runs": 1, "moved": 1, "mean_start": 0.0, "mean_end": 0.0, "how": {}}
         build(stub)
         back = tracksio.load(tp2) if tp2.is_file() else {}
@@ -952,7 +973,7 @@ def t_overlay_style() -> None:
 
         def fake_ink(items):                                 # 记下每次真渲了几行：连跑时阶段 4 不该再渲
             inked.append(len(items))
-            return [(48 * len(t), 30, 0, 0) for _f, _s, t in items]
+            return [(48 * len(t), 30, 0, 0, 0) for _f, _s, t in items]
         with patch.object(export, "render_ink", fake_ink):
             rc = R.main([str(tp), "--outdir", str(d / "r"), "--opt", "plate_color=off"])   # 底板取色要视频，另有守卫
             inked.clear()
@@ -2230,6 +2251,139 @@ def t_plate_src() -> None:
               [r for r, _ in r_src] == [want] and r_rows[0][0][1] < w_rows[0][0][1], (r_src, r_rows))
 
 
+@fixed_pad
+def t_plate_textbox() -> None:
+    """`plate=textbox`（owner 2026-11-24）：只盖译文、几行一整块——`text` 的整块版。普通行是逐行 `text` 底板的外接矩形、不并进原文框；
+    打字机行跟着译文长，全字后等于静态底板；`col` 行竖排几列、横排几行各连成一块，都只算盖译文。"""
+    print("底板只盖译文、一整块（plate=textbox）")
+    import re
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.output import script as SC
+    from flowocr.typeset import assfile as AF
+    from flowocr.typeset import core as TS
+    from flowocr.typeset import vertical as V
+
+    doc = {"size": [1920, 1080], "frame_us": 500_000, "meta": {"src_fps": 30.0}}
+    wide = [500, 600, 1400, 640]
+    ev = {"id": 1, "box": wide, "t_start": 0, "t_end": 6_000_000, "region": 0, "text": "x", "t_full_sampled": 2_000_000}
+    it = SC.Item(0, 6_000_000, [wide], ["很长很长很长的一行\n短"], "line", events=[ev], region=0, translated=True, layer="body")
+    two = [[400, 300, 1500, 340], [400, 345, 1500, 385]]
+    it_s = SC.Item(0, 6_000_000, two, ["一行"], "line", events=[{**ev, "id": 2, "box": b, "region": 1} for b in two], region=1)
+    with tempfile.TemporaryDirectory() as td, patch.object(export, "ink_widths", fake_widths):
+        d = Path(td)
+        SC.export_script(d / "m.script.ass", [it, it_s], doc)
+        text = (d / "m.script.ass").read_text(encoding="utf-8")
+
+        def rects(txt=None, actor="r0", **kw):
+            ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **kw), TS.load_fx(()))
+            doc_ = AF.loads(txt or text)
+            ts.run(doc_)
+            out = []
+            for ln in doc_.dumps().splitlines():
+                if _gen(ln) and "\\p1" in ln and ln.split(",")[4] == actor:
+                    x, y = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", ln).groups())
+                    w, h = (float(v) for v in re.search(r"m 0 0 l ([\d.]+) 0 [\d.]+ ([\d.]+)", ln).groups())
+                    out.append(((x, y, x + w, y + h), ln))
+            return out
+        per_line, whole, both = (rects(typewriter="off", plate=m) for m in ("text", "textbox", "box"))
+        hull = tuple(f(r[i] for r, _ in per_line) for i, f in enumerate((min, min, max, max)))
+        check("两行译文：text 逐行两块，textbox 一块、正好是这两块的外接矩形（比原文框窄，没并进原文），box 连原文框一起盖",
+              len(per_line) == 2 and len(whole) == 1 and whole[0][0] == hull and hull[0] > wide[0] and hull[2] < wide[2]
+              and len(both) == 1 and both[0][0][0] < wide[0] and both[0][0][2] > wide[2], (per_line, whole, both))
+        tw = rects(plate="textbox")
+        check("打字机行：textbox 一块，clip 跟着译文长，全字后等于静态底板",
+              len(tw) == 1 and "\\clip" in tw[0][1] and _clip_at(tw[0][1].split("\\1a&H20&", 1)[1], 6000) == whole[0][0]
+              and _clip_at(tw[0][1].split("\\1a&H20&", 1)[1], 1)[2] < whole[0][0][2], tw)
+        line = next(ln for ln in text.splitlines() if ",r0," in ln)
+        tail = text.replace(line, line + "\\N")
+        t_static, t_tw = rects(tail, typewriter="off", plate="textbox"), rects(tail, plate="textbox")
+        from flowocr.output import layout as LY
+        rows3 = [[500.0, 100.0, 900.0, 140.0], [500.0, 150.0, 900.0, 190.0], [500.0, 200.0, 900.0, 240.0]]
+        unit = LY.plate_rects(rows3, [300.0, 100.0, 0.0], 700.0, "textbox", 6.0)
+        check("译文尾部多一个空行：textbox 的静态底板不算没有字的行（竖直只到有字的第二行），打字机全字后的 clip 等于静态底板",
+              unit == [[544.0, 94.0, 856.0, 196.0]] and len(t_static) == 1 and len(t_tw) == 1
+              and _clip_at(t_tw[0][1].split("\\1a&H20&", 1)[1], 6000) == t_static[0][0], (unit, t_static, t_tw))
+        s_box, s_tb = rects(actor="r1", typewriter="off", plate="box"), rects(actor="r1", typewriter="off", plate="textbox")
+        s_tw = rects(actor="r1", plate="textbox")
+        s_full = _clip_at(s_tw[0][1].split("\\1a&H20&", 1)[1], 6000) if s_tw else None
+        check("原文框两个、正文一行（对不上，整块画在 \\pos 上）：textbox 和别的样式一样按原框加边距（静态底板不按各行的位置）；"
+              "跟着字长时只盖译文，全字后的 clip 在静态底板以内",
+              len(s_box) == 1 and s_tb == s_box and len(s_tw) == 1 and s_full[0] >= s_box[0][0][0] and s_full[2] <= s_box[0][0][2]
+              and s_full[2] - s_full[0] < s_box[0][0][2] - s_box[0][0][0], (s_box, s_tb, s_full))
+        one, nl = [("ch", "字", None)], ("nl", "\\N", None)
+        fw = {("f", "字"): 1.0, ("f", " "): 0.3}
+        gh, dy = 40 / export.h_ratio("f", fw), export.ink_dy("f", fw) * 40
+
+        def span(t, y=150.0, va="middle"):
+            return TS.free_lines(t, 500.0, y, va, 40, "f", fw, "center")
+
+        def ys(c):
+            return (c + dy - gh / 2, c + dy + gh / 2)
+        f_bot = span(one + [nl, nl] + one, 300.0, "bottom")
+        check("整块画的几行（free_lines）按 \\pos 的锚点和 libass 的行距排：有字的行一个字号、空行半个、末尾的 \\N 不画；只有 \\h 的行占一整行但不算有字",
+              span(one) == span(one + [nl]) == [(0, 480.0, 40.0, *ys(150.0))] and span([("ch", "\\h", None), nl] + one) == [(1, 480.0, 40.0, *ys(170.0))]
+              and span([nl] + one) == [(1, 480.0, 40.0, *ys(160.0))] and span([nl] + one, 100.0, "top") == [(1, 480.0, 40.0, *ys(140.0))]
+              and [(r[0], r[3:]) for r in f_bot] == [(0, ys(220.0)), (2, ys(280.0))], f_bot)
+        # 2026-11-24 用 libass 渲微软雅黑 48 号量的墨迹（相对锚点的上下沿）：\\an5「\\N国」(-2, 30)；\\an7「国\\N\\N国」第二个字 (82, 114)；
+        # \\an2「国\\N国」(-86, -54)、(-38, -6)。算出来的每行要盖住墨迹，又不比墨迹高出几像素
+        F, g = export.FONT_CN, [("ch", "国", None)]
+        gw = {(F, "国"): 1.0}
+        m1, m2, m3 = (TS.free_lines(t, 0.0, 0.0, va, 48, F, gw, "center")
+                      for t, va in (([nl] + g, "middle"), (g + [nl, nl] + g, "top"), (g + [nl] + g, "bottom")))
+        meas = [(m1[0], -2, 30), (m2[1], 82, 114), (m3[0], -86, -54), (m3[1], -38, -6)]
+        check("整块画的几行：按 libass 实测的墨迹，算出来的每行竖直范围盖住墨迹、多出不到 6 像素（原来按原框等分会切进字形）",
+              len(m1) == 1 and len(m2) == len(m3) == 2 and all(r[3] <= a and r[4] >= b and (r[4] - r[3]) - (b - a) < 6 for r, a, b in meas), meas)
+        pos = re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", line)
+        moved = text.replace(line, line.replace(pos[0], "\\pos(%s,%s)" % (float(pos[1]) + 300, pos[2]), 1))
+        tsm = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", typewriter="off", plate="textbox"), TS.load_fx(()))
+        dm = AF.loads(moved)
+        tsm.run(dm)
+        head_m = next(ln for ln in dm.dumps().splitlines() if ln.startswith(TS.INFO_KEY + ":"))
+        check("整份 textbox、有一行被人挪开（底板留在原文框上）：都是只盖译文那一类，头部不另写 plates_used",
+              "plate=textbox" in head_m and "plates_used" not in head_m, head_m)
+        empty = text.replace(line, line.replace(";plate;", ";plate=text;", 1).rsplit("}", 1)[0] + "}")
+        tse = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", plate="src"), TS.load_fx(()))
+        de = AF.loads(empty)
+        tse.run(de)
+        out_e = de.dumps().splitlines()
+        head_e = next(ln for ln in out_e if ln.startswith(TS.INFO_KEY + ":"))
+        check("行上写了 plate=text、译文清空（跟着字长时一块底板事件都没生成）：不记进 plates_used",
+              not any(_gen(ln) and "\\p1" in ln and ln.split(",")[4] == "r0" for ln in out_e) and "plates_used" not in head_e, head_e)
+        hl = text.replace(line, line.replace("很长很长很长的一行", "\\h", 1))
+        h_tw = rects(hl, plate="textbox")
+        h_clip = _clip_at(h_tw[0][1].split("\\1a&H20&", 1)[1], 1) if h_tw else None
+        check("只有 \\h 的一行：textbox 跟着字长时也不算它，第二行的字出现之前没有一块露出来的底板",
+              len(h_tw) == 1 and (h_clip[2] <= h_clip[0] or h_clip[3] <= h_clip[1]), (h_tw, h_clip))
+        mixed = text.replace(line, line.replace(";plate;", ";plate=textbox;", 1) if ";plate;" in line else line)
+        ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", typewriter="off"), TS.load_fx(()))
+        doc_ = AF.loads(mixed)
+        ts.run(doc_)
+        head = next(ln for ln in doc_.dumps().splitlines() if ln.startswith(TS.INFO_KEY + ":"))
+        ts0 = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", typewriter="off"), TS.load_fx(()))
+        doc0 = AF.loads(text)
+        ts0.run(doc0)
+        head0 = next(ln for ln in doc0.dumps().splitlines() if ln.startswith(TS.INFO_KEY + ":"))
+        bad = text.replace(line, line.replace(";plate;", ";plate=boxx;", 1))
+        ts2 = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", typewriter="off"), TS.load_fx(()))
+        ts2.run(AF.loads(bad))
+        check("行上另写 plate=textbox：FlowOCR Typeset 记实际生成了底板的几种 plates_used=rows,textbox；"
+              "整份都是默认样式时不写；行上写错的打提示、按整份的画",
+              ";plate;" in line and "plate=rows" in head and "plates_used=rows,textbox" in head
+              and "plates_used" not in head0
+              and any("boxx" in n for _, n in ts2.notes), (line, head, ts2.notes))
+    src = [[1500.0, 100.0, 1560.0, 700.0], [1420.0, 100.0, 1480.0, 500.0]]
+    cols = [[1300.0, 100.0, 1360.0, 600.0], [1220.0, 100.0, 1280.0, 400.0]]
+    v = V.plates("textbox", src, cols, 6.0, True, False)
+    block, lines = [100.0, 100.0, 300.0, 220.0], [[100.0, 100.0, 300.0, 140.0], [140.0, 140.0, 260.0, 180.0]]
+    h = V.plates("textbox", src, [block], 6.0, False, False, lines)
+    check("col 行：竖排两列译文连成一块、横排块一块，都不盖原列、只算盖译文",
+          [p.rect for p in v] == [[1214.0, 94.0, 1366.0, 606.0]] and v[0].cover == frozenset({0, 1})
+          and [p.rect for p in h] == [[94.0, 94.0, 306.0, 226.0]] and h[0].cover == frozenset({0}), (v, h))
+
+
 def t_ink_shift() -> None:
     """底板按墨迹实际落在哪里算（2026-10-05 owner 截图：译文左沿冲出底板）：libass 按字格对齐，墨迹偏移 = 居中 (左留白 − 右留白)/2、
     左对齐 左留白、右对齐 −右留白；字宽表里另记留白、只查 (字体, 文本) 的地方碰不到它。"""
@@ -2974,8 +3128,12 @@ def t_game_ruby_draw() -> None:
     (x, y), s1 = at(t_1), fs(t_1)
     g1 = s1 / export.h_ratio(export.FONT_CN)
     want = [(x - 2 * s1 + 3 * s1, y - s1 / 2 - g1 / 2 - gap * s1), (x - 1.5 * s1 + s1, y + s1 / 2 - g1 / 2 - gap * s1)]
-    check("一个框画几行（single）：几行按锚点竖直等分（行距按字号），各行按对齐算左沿",
+    check("一个框画几行（single）：几行按锚点排（行距一个字号），各行按对齐算左沿",
           "\\N" in body(t_1) and len(r_1) == 2 and all(near(a, b) for p, w in zip(r_1, want) for a, b in zip(at(p), w)), (r_1, want))
+    rw = {(export.FONT_CN, "二"): 1.0, (export.FONT_CN, "よみ"): 2.0}
+    r_e = RB.place([RB.Ruby("よみ", "", "二", [], None, 1)], 500.0, 300.0, "middle", "center", 40, [None, 40.0], export.FONT_CN, rw, 1920)
+    check("读音所在的行前面是空行（\\N二）：空行只占半行高（libass），读音按第二行的中心（锚点往下 1/4 个字号）摆",
+          len(r_e) == 1 and near(r_e[0].y, 300 + 10 - 40 / export.h_ratio(export.FONT_CN) / 2 - gap * 40), r_e)
     pos0 = re.search(r"\\pos\(960,\d+\)", text)[0]           # 阶段 3 写的预览位置（行中心往上挪了 export.ink_dy × 字号）
     moved = text.replace(pos0, "\\pos(800,500)")
     gen_m, ts_m = run(moved)
@@ -3608,3 +3766,950 @@ def t_timing_check() -> None:
     alone = [replace(tw_item(k, 1.8), region=10 + k) for k in range(6)] + [replace(tw_item(6, 9.0), region=20)]
     check("B2：同组邻居不足 3 个时比整份的中位数（原来阶段 3 打字机偏慢警告的口径）",
           [s.start_us for s in TC.rule_b2(alone, doc, ctx)] == [alone[-1].start_us])
+
+
+# ---- 竖排的列（`col` 行，vertical-text 计划的两种摆法）----
+
+_VCOL_A, _VCOL_B, _VROW_H = [1500, 100, 1620, 700], [1300, 150, 1420, 750], [600, 900, 1300, 950]
+"""守卫的竖排夹具：两列错开的竖排（右列 A、左列 B 往下错 50 px）和一行横排。字宽用 `fake_widths`（每个字宽 1）：
+全角步进宽 1、墨迹宽 1，原文 6 字 / 600 px → 字距 100 → 字号 int(100 / 1.04) = 96（列宽上限 120 × 0.82 = 98.4 不起作用）。"""
+
+
+def _vcol_doc() -> dict:
+    return {"size": [1920, 1080], "frame_us": 500_000, "meta": {"src_fps": 30.0}}
+
+
+def _vcol_items(mixed: bool = False, typed: bool = False):
+    """竖排两列的一条句条目（第二列晚 2 s 出现）；`mixed` 前面再加一行横排；`typed` 每行 1.5 s 打完（出 `tw` / `rowt` / `grow`）。"""
+    from flowocr.output import script as SC
+
+    def ev(i, box, text, t0):
+        e = {"id": i, "box": box, "t_start": t0, "t_end": 6_000_000, "region": 0, "text": text}
+        return {**e, "t_full_sampled": t0 + 1_500_000} if typed else e
+    rows = ([(_VROW_H, "横排的字幕", 0)] if mixed else []) + [(_VCOL_A, "あいうえおか", 0), (_VCOL_B, "きくけこさし", 2_000_000)]
+    evs = [ev(i, b, t, t0) for i, (b, t, t0) in enumerate(rows)]
+    return SC.Item(0, 6_000_000, [b for b, _, _ in rows], [t for _, t, _ in rows], "line", events=evs, region=0,
+                   row_events=[[e] for e in evs], row_leads=[[] for _ in evs])
+
+
+def _vcol_script(items, d: Path) -> str:
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.output import script as SC
+    with patch.object(export, "ink_widths", fake_widths):
+        SC.export_script(d / "v.script.ass", items, _vcol_doc())
+    return (d / "v.script.ass").read_text(encoding="utf-8")
+
+
+def _vcol_run(text: str, notes: list | None = None, **look) -> str:
+    """阶段 4 跑一遍字幕稿（`default` 预设，`look` 覆盖字段），返回生成的 ASS；给了 `notes` 就把提示的文字追加进去。"""
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.typeset import assfile as AF
+    from flowocr.typeset import core as TS
+    with patch.object(export, "ink_widths", fake_widths):
+        ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", **look))
+        doc = AF.loads(text)
+        ts.run(doc)
+    if notes is not None:
+        notes += [m for _, m in ts.notes]
+    return doc.dumps()
+
+
+def _plates_of(text: str) -> list[tuple[tuple[float, float, float, float], str]]:
+    """生成的底板行 → (矩形, 行)。"""
+    out = []
+    for ln in text.splitlines():
+        if ",fo-fx|plate," not in ln:
+            continue
+        x, y = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", ln).groups())
+        w, h = (float(v) for v in re.search(r"m 0 0 l ([\d.]+) 0 [\d.]+ ([\d.]+)", ln).groups())
+        out.append(((x, y, x + w, y + h), ln))
+    return out
+
+
+def _glyphs_of(text: str) -> list[tuple[float, float, str, str]]:
+    """生成的字行 → (x, y, 字, 行)。"""
+    out = []
+    for ln in text.splitlines():
+        if ",fo-fx," in ln and "\\p1" not in ln:
+            x, y = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", ln).groups())
+            out.append((x, y, re.sub(r"\{[^}]*\}", "", ln.split(",", 9)[9]), ln))
+    return out
+
+
+def _covered(r, plates, step: int = 7) -> bool:
+    """矩形 `r` 里的格点都落在某块底板里。"""
+    xs = [r[0] + (r[2] - r[0]) * k / step for k in range(step + 1)]
+    ys = [r[1] + (r[3] - r[1]) * k / step for k in range(step + 1)]
+    return all(any(p[0] <= x <= p[2] and p[1] <= y <= p[3] for p in plates) for x in xs for y in ys)
+
+
+def _with_text(script: str, text: str, extra: str = "") -> str:
+    """把字幕稿里 `col` 行的正文换成 `text`（行首块留着），`extra` 加进 fo 参数。"""
+    out = []
+    for ln in script.splitlines():
+        if ";col;" in ln:
+            head, body = ln.split("}", 1)
+            ln = head + "}" + text
+            if extra:
+                ln = ln.replace(";col;", f";col;{extra};", 1)
+        out.append(ln)
+    return "\n".join(out) + "\n"
+
+
+def t_vertical_flow() -> None:
+    """竖排列选摆法：按译文有没有中日韩字（`textdir.cjk_count`），`flow` 覆盖；非法值当场报错。"""
+    print("竖排列：选摆法")
+    from flowocr.typeset import core as TS
+    from flowocr.typeset import vertical as V
+    check("有中日韩字竖排（没译的日文、夹着 YouTube 的中文），没有就横排（英文、全角拉丁字母 ＳＮＳ）",
+          [V.flow_of(t) for t in ("はじめて", "看YouTube的", "Hello there", "ＳＮＳ")] == ["v", "v", "h", "h"])
+    check("flow=v|h 覆盖按内容选的", V.flow_of("Hello", "v") == "v" and V.flow_of("你好", "h") == "h")
+    check("阶段 4 的 --opt flow 取值不合法报错，合法的记进 FlowOCR Typeset",
+          raises(lambda: TS.look_of("default", {"flow": "x"}), ValueError) and TS.look_of("default", {"flow": "h"})[0].flow == "h")
+    with tempfile.TemporaryDirectory() as td:
+        s = _vcol_script([_vcol_items()], Path(td))
+        check("行上的 flow 取值不合法：阶段 4 报错", raises(lambda: _vcol_run(_with_text(s, "你好", "flow=x")), ValueError))
+        out = _vcol_run(s, flow="h")
+        check("FlowOCR Typeset 记着 flow", "flow=h" in next(ln for ln in out.splitlines() if ln.startswith("FlowOCR Typeset:")))
+
+
+def t_vertical_script() -> None:
+    """阶段 3：竖排列单独成 `col` 行；混排条目拆两条、`rowt` / `grow` 段数和各自的 `box` 一一对应；matched 的译文条目带竖条框也不出 `col`；条目、SRT 不变。"""
+    print("竖排列：阶段 3 的 col 行")
+    from dataclasses import replace
+
+    from flowocr.output import script as SC
+    from flowocr.typeset import assfile as AF
+    with tempfile.TemporaryDirectory() as td:
+        it = _vcol_items(mixed=True, typed=True)
+        s = _vcol_script([it], Path(td))
+        rows = [AF.parse_fo(ln.split(",", 9)[8]) for ln in s.splitlines() if ln.startswith("Dialogue:")]
+        flat, col = rows if len(rows) == 2 else ({}, {})
+        check("横竖都有的条目写成两条：横排一条（没有 col）、竖排一条（col，box 是从右往左的两列）",
+              len(rows) == 2 and "col" not in flat and col.get("col") is True
+              and AF.numbers(flat["box"]) == _VROW_H and col["box"] == "1500 100 1620 700|1300 150 1420 750", rows)
+        check("两条的 rowt（横排那条还有 grow）段数和各自的 box 行数一一对应，col 行不写 grow（阶段 4 不用），tw 是整个条目的",
+              len(rows) == 2 and all(len(r.get(k, "").split("|")) == len(r["box"].split("|")) for r, ks in ((flat, ("rowt", "grow")), (col, ("rowt",))) for k in ks)
+              and "grow" not in col and flat.get("tw") == col.get("tw") is not None, rows)
+        body = next(ln for ln in s.splitlines() if ";col;" in ln).split("}", 1)[1]
+        check("col 行正文按列 \\N 分开、预览字号按原文的字距（字距 100 → 96）",
+              body == "あいうえおか\\Nきくけこさし" and "|fs:96|an:5" in col["was"], (body, col["was"]))
+        check("条目本身没拆：SRT 还是一条三行", SC.srt_blocks([it]) == [(0, 6_000_000, ["横排的字幕", "あいうえおか", "きくけこさし"])])
+        tr = replace(_vcol_items(), translated=True, layer="body", lines=["竖排的译文"])
+        s2 = _vcol_script([tr], Path(td))
+        check("matched 的译文条目（rows 是原文整块、正文是译文）带竖条框也不出 col 行", ";col" not in s2)
+
+
+def _vcol_item(rows, typed: bool = True, end: int = 6_000_000):
+    """任意几行（`(框, 字, 出现时刻)`）的一条句条目；`typed` 每行 1.5 s 打完（出 `tw` / `rowt`）。"""
+    from flowocr.output import script as SC
+
+    def ev(i, box, text, t0):
+        e = {"id": i, "box": box, "t_start": t0, "t_end": end, "region": 0, "text": text}
+        return {**e, "t_full_sampled": t0 + 1_500_000} if typed else e
+    evs = [ev(i, b, t, t0) for i, (b, t, t0) in enumerate(rows)]
+    return SC.Item(0, end, [b for b, _, _ in rows], [t for _, t, _ in rows], "line", events=evs, region=0,
+                   row_events=[[e] for e in evs], row_leads=[[] for _ in evs])
+
+
+def _script_fo(text: str) -> list[dict]:
+    from flowocr.typeset import assfile as AF
+    return [AF.parse_fo(ln.split(",", 9)[8]) for ln in text.splitlines() if ln.startswith("Dialogue:")]
+
+
+def t_vertical_split() -> None:
+    """阶段 3：一个条目里不相邻的列（建轨的判据 `textdir.columns_adjacent`）拆成各自的 `col` 行——各自的 `ev`、`rowt`、`box`、字号，
+    效果（`tw`、`\\fad`）整个条目算一次；相邻的列还是一行；列宽比门取 tracks 的 provenance 里建轨用的那个。"""
+    print("竖排列：阶段 3 拆开不相邻的列")
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.output import script as SC
+    # 片段 8 的样子：右边两个挨着的小标签（宽 38）、画面另一头一整列大字说明（宽 118），说明晚 1 s 出现
+    lab1, lab2, cap = [1126, 810, 1164, 901], [1070, 808, 1108, 901], [24, 52, 142, 1044]
+    it = _vcol_item([(lab1, "応接室", 0), (lab2, "校長室", 0), (cap, "各々隠れる場所が決定", 1_000_000)])
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        s = _vcol_script([it], d)
+        rows = _script_fo(s)
+        check("远处的列拆开：两个小标签一行、说明一行，都是 col 行", len(rows) == 2 and all(r.get("col") is True for r in rows), rows)
+        a, b = rows if len(rows) == 2 else ({}, {})
+        check("各行的 box、ev 是自己那几列的（从右往左），rowt 段数和 box 列数一一对应",
+              a.get("box") == "1126 810 1164 901|1070 808 1108 901" and a.get("ev") == "0 1" and len(a.get("rowt", "").split("|")) == 2
+              and b.get("box") == "24 52 142 1044" and b.get("ev") == "2" and b.get("rowt", "").startswith("1000+"), rows)
+        lines = [ln for ln in s.splitlines() if ln.startswith("Dialogue:")]
+        fs = [re.search(r"\|fs:(\d+)\|", r.get("was", "")) for r in rows]
+        check("效果整个条目算一次（tw、\\fad、起止相同），字号各按自己那几列（说明的字号大于标签的）",
+              len(lines) == 2 and a.get("tw") == b.get("tw") is not None and all(fs)
+              and int(fs[1][1]) > int(fs[0][1])
+              and re.findall(r"\\fad\([^)]*\)", lines[0]) == re.findall(r"\\fad\([^)]*\)", lines[1])
+              and lines[0].split(",")[1:3] == lines[1].split(",")[1:3], (rows, lines))
+        both = _script_fo(_vcol_script([SC.part(it, [0, 1])], d))
+        check("挨着的两列还是一行，字号、位置和整个条目拆出来的那行相同（不受远处那列影响）",
+              len(both) == 1 and (both[0]["box"], both[0]["was"]) == (a.get("box"), a.get("was")), (both, a))
+        check("SRT 不变：条目没拆", SC.srt_blocks([it]) == [(0, 6_000_000, ["応接室", "校長室", "各々隠れる場所が決定"])])
+        # 列宽比门：挨着但宽一倍多的两列默认拆开；建轨用 --region-h-ratio 0（provenance 里记着）时不拆
+        wide = _vcol_item([([1500, 100, 1540, 700], "あいうえお", 0), ([1400, 100, 1500, 700], "かきくけこ", 0)])
+        with patch.object(export, "ink_widths", fake_widths):
+            SC.export_script(d / "w.script.ass", [wide], _vcol_doc())
+            dflt = _script_fo((d / "w.script.ass").read_text(encoding="utf-8"))
+            SC.export_script(d / "w.script.ass", [wide], {**_vcol_doc(), "provenance": {"args": {"region_h_ratio": 0}}})
+            off = _script_fo((d / "w.script.ass").read_text(encoding="utf-8"))
+        check("列宽比门取建轨的：默认 1.7 时宽 40 / 100 的两列拆成两行，provenance 记着 region_h_ratio=0 时一行",
+              len(dflt) == 2 and len(off) == 1, (dflt, off))
+        mixed = _vcol_script([_vcol_item([(_VROW_H, "横排的字幕", 0), (lab1, "応接室", 500_000), (cap, "各々隠れる場所が決定", 1_000_000)])], d)
+        mr = _script_fo(mixed)
+        check("横竖混排的条目：横排一行、两块列各一行，rowt 各自对上自己的 box",
+              len(mr) == 3 and "col" not in mr[0] and all(r.get("col") for r in mr[1:])
+              and all(len(r["rowt"].split("|")) == len(r["box"].split("|")) for r in mr), mr)
+        # 阶段 4 译成英文（横排）：同时在屏的几块只在原文字号相近时取同一字号
+        def en(text: str, bodies: list[str]) -> str:
+            out, k = [], 0
+            for ln in text.splitlines():
+                if ln.startswith("Dialogue:") and ";col" in ln:
+                    head, body = ln.split(",", 9)[:9], ln.split(",", 9)[9]
+                    ln = ",".join(head) + "," + body[:body.index("}") + 1] + bodies[k]
+                    k += 1
+                out.append(ln)
+            return "\n".join(out) + "\n"
+
+        def sizes(text: str) -> dict[bool, set[int]]:
+            got: dict[bool, set[int]] = {True: set(), False: set()}
+            for x, _, _, ln in _glyphs_of(_vcol_run(text)):
+                got[x < 700].add(int(re.search(r"\\fs(\d+)", ln)[1]))
+            return got
+        far = sizes(en(s, ["Reception\\NPrincipal's office", "Everyone has picked a hiding spot"]))
+        check("横排：原文字号差得远的两块（小标签、大字说明）各定各的字号，说明的英文比标签的大",
+              len(far[True]) == len(far[False]) == 1 and min(far[True]) > max(far[False]), far)
+        # 原文字号相近（列长 600 / 540、各 6 字）的两块同时在屏：取同一字号
+        pair = _vcol_item([([1500, 100, 1600, 700], "あいうえおか", 0), ([60, 100, 160, 640], "きくけこさし", 0)])
+        ps = _vcol_script([pair], d)
+        near = sizes(en(ps, ["Dog person", "or cat person?"]))
+        check("横排：原文字号相近、同时在屏的两块取同一字号", len(_script_fo(ps)) == 2 and near[True] == near[False] and len(near[True]) == 1,
+              (near, _script_fo(ps)))
+        from flowocr.typeset import vertical as V
+        chain = V.size_groups([(0, 10, 30), (0, 10, 45), (0, 10, 70)])
+        apart = V.size_groups([(0, 10, 40), (20, 30, 40), (5, 25, 100)])
+        brk = V.size_groups([(0, 10, 30), (0, 10, 50), (0, 10, 52)])
+        check("分组：原文字号 30 / 45 / 70 同时在屏 → {30, 45}、{70}（组内同一字号，差得远的不被中间那块串起来）；"
+              "时间上靠中间那块连起来的两块同字号的同组",
+              chain == [[0, 1], [2]] and apart == [[0, 1], [2]], (chain, apart))
+        check("分组在相邻比值最大处切：30 / 50 / 52 → {30}、{50, 52}（几乎一样大的两块不分开）", brk == [[0], [1, 2]], brk)
+
+
+def _word_times(chars: list[tuple[str, int]]) -> list[list[int]]:
+    """一行的 (字, 出现时刻) → 各个词（空格分开）的字的时刻。"""
+    out: list[list[int]] = [[]]
+    for c, t in chars:
+        if c == " ":
+            out.append([])
+        else:
+            out[-1].append(t)
+    return [w for w in out if w]
+
+
+def t_vertical_words() -> None:
+    """阶段 4 横排块跟着打字机按整词出（`vertical.by_word`）：拉丁词在首字母的时刻整个显出，中日韩字仍逐字；
+    普通横排行（不是 `col` 行）的逐字打字机不变。"""
+    print("竖排列：横排块按整词出")
+    from flowocr.typeset import vertical as V
+
+    def ch(c, t):
+        return ("ch", c, t)
+    got = V.by_word([[ch("p", 0), ch("e", 10), ("tags", "\\i1"), ch("e", 20), ch("l", 30), ch(" ", 40), ch("j", 50), ch("u", 60)],
+                     [ch("s", 70), ch("t", 80)]])
+    check("一个词的字都取首字母的时刻（行内 tag 不断词），空格照旧，换行另起一个词",
+          [[t[2] for t in r if t[0] == "ch"] for r in got] == [[0, 0, 0, 0, 40, 50, 50], [70, 70]], got)
+    got = V.by_word([[ch("你", 0), ch("好", 10), ch("Y", 20), ch("o", 30), ch("u", 40), ch("的", 50), ch("x", None)]])
+    check("中日韩字逐字，夹在里面的拉丁词整词；没有时刻的不动", [t[2] for t in got[0]] == [0, 10, 20, 20, 20, 50, None], got)
+
+    def times(line: str) -> list[tuple[str, int]]:
+        body = line.split(",", 9)[9]
+        return [(c, int(t)) for t, c in re.findall(r"\\t\((\d+),\d+,\\alpha&H00&\)\}(.)", body)]
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        typed = _vcol_script([_vcol_items(typed=True)], d)
+        for name, script, full in (("rowt", typed, 3500), ("tw", typed.replace(";tw=3500;rowt=0+1500|2000+3500", ";tw=2000"), 2000)):
+            out = _vcol_run(_with_text(script, "fifteen minutes to peel"))
+            words = [sorted(set(ts)) for *_, ln in _glyphs_of(out) for ts in _word_times(times(ln))]
+            starts = [ts[0] for ts in words if ts]
+            check(f"横排块（{name}）：每个词的字同一时刻出（{len(words)} 个词），词与词先后错开、都在 [0, {full}] 里",
+                  len(words) == 4 and all(len(ts) == 1 for ts in words) and starts == sorted(set(starts)) and 0 == starts[0] and starts[-1] <= full,
+                  words)
+        dim = [ln for *_, ln in _glyphs_of(_vcol_run(_with_text(typed, "fifteen minutes"), typewriter="dim"))]
+        check("横排块 dim：整块按首字 / 全字两步显出，没有逐字的 \\alpha", dim and all(ln.count("\\t(") == 1 for ln in dim), dim)
+        flat = _vcol_script([_vcol_item([(_VROW_H, "peel just one", 0)])], d)
+        got = [t for *_, ln in _glyphs_of(_vcol_run(flat)) for t in times(ln)]
+        check("普通横排行（不是 col 行）照旧逐字母出", len(got) == 13 and [t for _, t in got] == sorted({t for _, t in got}), got)
+
+
+def t_vertical_cells() -> None:
+    """竖排的格：标点换竖排字形、默认字体有这些字形、縦中横 / 侧躺、自动分列避头尾、原文原样放得回原列。"""
+    print("竖排列：格、字形、分列")
+    import struct
+
+    from flowocr.output import layout
+    from flowocr.typeset import vertical as V
+
+    def toks(s):
+        return [("ch", c, None) for c in s]
+    c = V.cells_of(toks("你好，「世界」。"), "f", {})
+    check("标点换竖排字形（，→︐、「→﹁、」→﹂、。→︒），！？不换",
+          "".join(x.tokens[-1][1] for x in c) == "你好︐﹁世界﹂︒" and V.cells_of(toks("！？"), "f", {})[0].tokens[-1][1] == "！")
+    wave = V.cells_of(toks("～"), "f", {})[0]
+    check("默认字体没有的竖排字形（≀）退回原字形、转 90°；逗号句号缺字形时挪到右上",
+          wave.tokens[-1][1] == "～" and wave.tail == "\\frz-90" and "≀" in V.NO_GLYPH)
+    font = Path("C:/Windows/Fonts/msyh.ttc")
+    if font.is_file():
+        b = font.read_bytes()
+        off = struct.unpack(">I", b[12:16])[0] if b[:4] == b"ttcf" else 0
+        ntab = struct.unpack(">H", b[off + 4:off + 6])[0]
+        tabs = {b[off + 12 + 16 * i:off + 16 + 16 * i]: struct.unpack(">I", b[off + 20 + 16 * i:off + 24 + 16 * i])[0] for i in range(ntab)}
+        co, cps = tabs[b"cmap"], set()
+        for i in range(struct.unpack(">H", b[co + 2:co + 4])[0]):
+            st = co + struct.unpack(">I", b[co + 8 + 8 * i:co + 12 + 8 * i])[0]
+            if struct.unpack(">H", b[st:st + 2])[0] == 4:
+                n2 = struct.unpack(">H", b[st + 6:st + 8])[0]
+                ends = struct.unpack(">%dH" % (n2 // 2), b[st + 14:st + 14 + n2])
+                starts = struct.unpack(">%dH" % (n2 // 2), b[st + 16 + n2:st + 16 + 2 * n2])
+                cps.update(cp for a, z in zip(starts, ends) for cp in range(a, z + 1))
+        forms = set(V.VERT_FORMS.values())
+        check("默认字体（微软雅黑）逐字核：用到的竖排字形都有，NO_GLYPH 里的确实没有",
+              all(ord(g) in cps for g in forms - V.NO_GLYPH) and not any(ord(g) in cps for g in V.NO_GLYPH),
+              [g for g in forms if (ord(g) in cps) == (g in V.NO_GLYPH)])
+    else:
+        print("  SKIP  默认字体的竖排字形（这台机器没有 msyh.ttc）")
+    w = {("f", "2"): 0.5, ("f", "YouTube"): 3.2}
+    c = V.cells_of(toks("2セット目"), "f", w)
+    check("1–2 个半角字母数字横着挤进一格（縦中横）", c[0].kind == "tcy" and c[0].text == "2" and len(c) == 5)
+    c = V.cells_of(toks("看YouTube的"), "f", w)
+    check("3 个以上整段侧躺（\\frz-90），占的长度 = 墨迹宽 + 字间的空",
+          [x.kind for x in c] == ["ch", "side", "ch"] and c[1].tail == "\\frz-90"
+          and abs(V.cell_len(c[1], 100, "f", w) - (320 + 100 * layout.COL_PITCH - 100)) < 1e-6, c)
+    cells = V.cells_of(toks("あいうえ、おかきくけこ"), "f", {})
+    got = V.split(cells, [1.0] * len(cells), [4.0] * 4)
+    check("自动分列：从右往左填，「、」不打头（断点往前挪一个字），列的后半段有标点就断在标点后",
+          [["".join(x.text for x in col) for col in got] if got else None] == [["あいう", "え、", "おかきく", "けこ"]],
+          got and [["".join(x.text for x in col) for col in got]])
+    got = V.split(V.cells_of(toks("あいう」えお"), "f", {}), [1.0] * 6, [3.0, 3.0, 3.0])
+    check("「」」不打头：断点往前挪", got is not None and all(col[0].text not in "」" for col in got), got)
+    with tempfile.TemporaryDirectory() as td:
+        s = _vcol_script([_vcol_items()], Path(td))
+        out = _vcol_run(s)
+        g = _glyphs_of(out)
+        check("原文不翻译（正文原样）：两列各放回自己的列（不拆列、不缩字号、首字从原列顶起）",
+              len(g) == 12 and {x for x, *_ in g} == {1560.0, 1360.0} and all("\\fs96" in ln for *_, ln in g)
+              and min(y for x, y, *_ in g if x == 1560) < 100 + 96 and max(y for x, y, *_ in g if x == 1560) < 700, g[:3])
+
+
+def t_vertical_plates() -> None:
+    """竖排 / 横排的底板：带镜像转置后的四种模式；译文列数和原文对不上时 rows / box / src 都盖全原文列；各列底板从自己的首字时刻起；
+    人挪过时原文列底板和擦除矩形留在原列、译文那几块正好平移 \\pos − was 的 pos；restore 往返逐字节相同；底板取色按列分块。"""
+    print("竖排列：底板、擦除、人改过的")
+    from flowocr.burn import plates as BP
+    from flowocr.output import layout
+    from flowocr.typeset import core as TS
+    from flowocr.typeset import platecolor as PC
+    from flowocr.typeset import vertical as V
+    pd = layout.plate_pad(96)
+
+    def pad(r, p=pd):
+        return (r[0] - p, r[1] - p, r[2] + p, r[3] + p)
+    near = [[1500, 100, 1620, 700], [1420, 120, 1530, 700]]          # 两列外扩后左右交叠（原文本身也压着 10 px）
+    src_pl = V.plates("src", near, [], 6.0, True, False)
+    check("src：每列原文外扩边距、不劈开（交叠的两列也不劈：擦除要盖全原文）",
+          [p.rect for p in src_pl] == [[1494, 94, 1626, 706], [1414, 114, 1536, 706]], [p.rect for p in src_pl])
+    trs = [[1540, 100, 1580, 500], [1440, 120, 1480, 400]]
+    rows = V.plates("rows", near, trs, 6.0, True, False)
+    check("rows（列数相同）：每列一块 = 原列 ∪ 译文列，左右交叠的从中线劈开，盖着原文 i 和译文 i",
+          len(rows) == 2 and rows[0].rect[0] == rows[1].rect[2] and [sorted(p.cover) for p in rows] == [[0, 2], [1, 3]], [p.rect for p in rows])
+    box = V.plates("box", near, trs, 6.0, True, False)
+    text = V.plates("text", near, trs, 6.0, True, False)
+    check("box 一整块盖住全部；text 只盖译文列",
+          len(box) == 1 and box[0].rect == [1414, 94, 1626, 706]
+          and [p.rect[1::2] for p in text] == [[94, 506], [114, 406]], ([p.rect for p in box], [p.rect for p in text]))
+
+    with tempfile.TemporaryDirectory() as td:
+        s = _vcol_script([_vcol_items()], Path(td))
+        one = _with_text(s, "短译")
+        three = _with_text(s, "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地人")      # 25 字：两列往下长也放不下，往左加一列
+        for name, txt, ncol in (("译文 1 列 / 原文 2 列", one, 1), ("译文 3 列 / 原文 2 列", three, 3)):
+            got = {m: _vcol_run(txt, plate=m) for m in ("rows", "box", "src")}
+            xs = sorted({x for x, *_ in _glyphs_of(got["rows"])}, reverse=True)
+            ok = {m: all(_covered(pad(c), [r for r, _ in _plates_of(o)]) for c in (_VCOL_A, _VCOL_B)) for m, o in got.items()}
+            check(f"{name}：rows / box / src 都盖全原文两列", len(xs) == ncol and all(ok.values()), (xs, ok))
+        out = _vcol_run(s, plate="src")
+        pl = _plates_of(out)
+        check("各列底板从这一列的首字时刻起（第二列晚 2 s：那块底板的行从 0:00:02.00 起）",
+              sorted(ln.split(",")[1] for _, ln in pl) == ["0:00:00.00", "0:00:02.00"], [ln.split(",")[1] for _, ln in pl])
+        P, _rest = BP.load(out, (1920, 1080))
+        early, late = P.at(1.0)[1], P.at(3.0)[1]
+        want = [tuple(round(v) for v in pad(c)) for c in (_VCOL_A, _VCOL_B)]
+        check("擦除（burn.plates.load）：矩形 = 外扩过的原列，起点 = 各列首字时刻（1 s 时只擦第一列）",
+              early == want[:1] and sorted(late) == sorted(want), (early, late))
+
+        line = next(ln for ln in one.splitlines() if ";col;" in ln)
+        pos = re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", line)
+
+        def moved(dx, dy, mode):
+            return _vcol_run(one.replace(pos[0], "\\pos(%g,%g)" % (float(pos[1]) + dx, float(pos[2]) + dy), 1), plate=mode)
+        m1, m2 = moved(100, 50, "rows"), moved(30, 20, "rows")
+        p1, p2 = [r for r, _ in _plates_of(m1)], [r for r, _ in _plates_of(m2)]
+        srcs = [r for r in p1 if r in p2]
+        tr1, tr2 = [r for r in p1 if r not in p2], [r for r in p2 if r not in p1]
+        g1 = _glyphs_of(m1)
+        pitch = layout.COL_PITCH * 96
+        check("人挪过（译文 1 列 / 原文 2 列，rows）：原文列的底板留在原地、就是外扩过的原列",
+              sorted(srcs) == sorted(tuple(round(v) for v in pad(c)) for c in (_VCOL_A, _VCOL_B)), srcs)
+        check("人挪过：译文的字和盖译文的底板正好平移 \\pos − was 的 pos",
+              len(tr1) == len(tr2) == 1 and (tr1[0][0] - tr2[0][0], tr1[0][1] - tr2[0][1]) == (70, 30)
+              and abs(g1[0][0] - (1560 + 100)) < 0.6 and abs(g1[0][1] - (100 + pitch / 2 - 0.04 * 96 + 50)) < 0.6, (tr1, tr2, g1[:1]))
+        P, _rest = BP.load(moved(100, 50, "src"), (1920, 1080))
+        check("人挪过：src 擦除矩形仍是外扩过的原列", sorted(P.at(3.0)[1]) == sorted(tuple(round(v) for v in pad(c)) for c in (_VCOL_A, _VCOL_B)), P.at(3.0)[1])
+        an = _vcol_run(one.replace(line, line.replace("\\an5", "\\an7", 1)))
+        check("\\an 对 col 行没意义：改了不用、不算挪过（和没改时的生成行相同）", _glyphs_of(an) == _glyphs_of(_vcol_run(one)))
+
+        hz = _with_text(s, "Hello there my friends")
+        o = _vcol_run(hz)
+        hp = [r for r, _ in _plates_of(o)]
+        check("横排（英文）：rows 盖全原文两列（外扩）、不是一整块（几块拼成），字一行一条",
+              len(hp) > 1 and _covered(pad(_VCOL_A), hp) and _covered(pad(_VCOL_B), hp) and len(_glyphs_of(o)) >= 1, (hp, _glyphs_of(o)))
+        hs = [r for r, _ in _plates_of(_vcol_run(hz, plate="src"))]
+        check("横排 + src：只擦两列原文（各自外扩）", sorted(hs) == sorted(tuple(round(v) for v in pad(c)) for c in (_VCOL_A, _VCOL_B)), hs)
+
+        fin = _vcol_run(three)
+        from flowocr.typeset import assfile as AF
+        doc = AF.loads(fin)
+        TS.restore(doc)
+        check("带 col 行的字幕稿过一遍阶段 4 再 restore：逐字节相同", doc.dumps() == three)
+    kinds = ["src", "plate#0", "text#0", "plate#1", "text#1"]
+    lines = ["Comment: x"] + ["Dialogue: 0,0:00:00.00,0:00:01.00,S,,0,0,0,fo-fx|plate,{\\an7\\pos(0,0)\\p1}m 0 0 l 1 0 1 1 0 1{\\p0}",
+                              "Dialogue: 1,0:00:00.00,0:00:01.00,S,,0,0,0,fo-fx,{\\pos(0,0)}字"] * 2
+    blocks = PC.blocks_of(lines, kinds)
+    check("底板取色：同一条 col 行按列分块（plate#g / text#g 各成一块），字色按它所在那块定",
+          len(blocks) == 3 and [len(b.plates) for b in blocks] == [0, 1, 1] and [len(b.texts) for b in blocks] == [0, 1, 1])
+
+
+def t_vertical_balance() -> None:
+    """横排的均衡折行：固定的词宽下各行剩余宽度的平方和最小、只在空格处断，不剩孤词（和贪心折不一样）。"""
+    print("竖排列：横排的均衡折行")
+    from flowocr.typeset import vertical as V
+    got = V.balance([6, 1, 1, 1, 6], 1.0, 12.0)
+    check("贪心会折成 [6 1 1 1] [6]，均衡折行两行各三四个词", got in ([(0, 3), (3, 5)], [(0, 2), (2, 5)]), got)
+    check("放得下就一行；比行宽还宽的词独占一行", V.balance([2, 2], 1.0, 10.0) == [(0, 2)] and V.balance([20, 1], 1.0, 10.0) == [(0, 1), (1, 2)])
+
+
+def _area(a, b) -> float:
+    """两个矩形交叠的面积（不交是 0）。"""
+    return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+
+
+def t_vertical_block_plates() -> None:
+    """竖排列横排时的 `rows` 底板（`vertical.block_rows` / `layout.pieces`）：外扩过的原列 + 逐行外扩过的译文拼成不重叠的几块，
+    原列、每行译文都盖全，不多盖（两列之间的空当不填），每块的 `cover` 是它碰到的那些（时刻按它取），同一个 `group`；
+    人挪过时原文那部分就是外扩过的原列、译文那部分另拼；`box` 仍是一整块；生成的底板行从它盖着的里面最早出现的时刻起。"""
+    print("竖排列：横排块的逐行底板")
+    from flowocr.output import layout
+    from flowocr.typeset import vertical as V
+    src = [[1500, 100, 1620, 700], [1300, 150, 1420, 750]]
+    lines = [[1250, 300, 1670, 380], [1350, 380, 1570, 460]]          # 一行比两列都宽、一行窄些
+    trs = [layout.union(lines)]
+    pd = 6.4
+
+    def pad(r):
+        return layout.padded(r, pd)
+    pl = V.plates("rows", src, trs, pd, False, False, lines)
+    rs = [q.rect for q in pl]
+    inputs = [(pad(r), 0) for r in lines] + [(pad(r), 1 + i) for i, r in enumerate(src)]
+    check("横排 rows：几块之间不重叠（半透明的底板叠起来更黑）",
+          len(pl) > 1 and all(_area(a, b) == 0 for i, a in enumerate(rs) for b in rs[i + 1:]), rs)
+    check("横排 rows：两列原文（外扩过）和每行译文（外扩过）都盖全",
+          all(_covered(r, rs) for r, _ in inputs), rs)
+    check("横排 rows：不多盖——每块都在某个外扩过的原列或译文行里，两列之间、译文上面的空当不填",
+          all(_covered(r, [layout.padded(i, 1) for i, _ in inputs], 3) for r in rs) and not _covered([1455, 120, 1465, 130], rs, 1), rs)   # 往外取整，多 1 px
+    want = [frozenset(c for r_in, c in inputs if _area(q.rect, r_in) > 0) for q in pl]
+    check("横排 rows：每块的 cover = 它碰到的译文（0）和原列（1..k），时刻按它取；同一个 group（底板取色按整张）",
+          [q.cover for q in pl] == want and {q.group for q in pl} == {0}, ([q.cover for q in pl], want))
+    mv = V.plates("rows", src, trs, pd, False, True, lines)
+    srcs = [q for q in mv if not q.cover & {0}]
+    check("横排 rows 人挪过：原文那部分就是外扩过（往外取整）的两列、只盖原文；译文那部分只盖译文（跟着字走）",
+          sorted(q.rect for q in srcs) == sorted([float(math.floor(v)) if k < 2 else float(math.ceil(v)) for k, v in enumerate(pad(r))] for r in src)
+          and all(q.cover == {0} for q in mv if q not in srcs) and len(mv) > len(srcs), [(q.rect, q.cover) for q in mv])
+    bx = V.plates("box", src, trs, pd, False, False, lines)
+    check("横排 box 仍是一整块 = 原列 ∪ 译文块（外扩）", [q.rect for q in bx] == [pad(layout.union(src + trs))], [q.rect for q in bx])
+
+    with tempfile.TemporaryDirectory() as td:
+        s = _vcol_script([_vcol_items()], Path(td))
+        o = _vcol_run(_with_text(s, "Hello there my friends"))
+        got = _plates_of(o)
+        t0 = {r: ln.split(",")[1] for r, ln in got}
+
+        def at(x, y):
+            return [t0[r] for r in t0 if r[0] <= x <= r[2] and r[1] <= y <= r[3]]
+        gl = _glyphs_of(o)
+        check("生成的底板行：盖着译文的从 0 s 起，只盖第二列（晚 2 s）的从 2 s 起，只盖第一列的从 0 s 起",
+              gl and all(at(x, y) == ["0:00:00.00"] for x, y, *_ in gl) and at(1360, 160) == ["0:00:02.00"]
+              and at(1360, 745) == ["0:00:02.00"] and at(1560, 110) == ["0:00:00.00"], (sorted(t0.items()), [g[:2] for g in gl]))
+
+
+def t_vertical_block_width() -> None:
+    """竖排列横排时的块宽（`vertical.narrowest` / `block`）：放得进原列并集高度的最窄宽度（逐个宽度试出来的最窄的那个），不窄于最长的词；
+    到上限还放不下取上限、行往上下长；最长的词比上限宽时取那个词宽。"""
+    print("竖排列：横排块的宽")
+    from flowocr.output import export
+    from flowocr.typeset import vertical as V
+    ws = [20.0, 45.0, 12.0, 70.0, 33.0, 28.0, 51.0, 9.0, 40.0]
+    sp, pitch, gh = 8.0, 36.0, 24.0
+
+    def height(w):
+        return (len(V.balance(ws, sp, w)) - 1) * pitch + gh
+    for uh in (100.0, 170.0, 260.0, 400.0):
+        w = V.narrowest(ws, sp, pitch, gh, uh, 1000.0)
+        brute = next(x / 4 for x in range(int(max(ws) * 4), 4001) if height(x / 4) <= uh)
+        check(f"U 高 {uh:.0f}：最窄的放得下的宽（逐 0.25 px 试的 {brute}）", height(w) <= uh and w >= max(ws) and w <= brute + 1e-6
+              and all(height(x) > uh for x in (w - 0.25, w - 1.0) if x >= max(ws)), (w, brute))
+    check("U 足够高：一行一个词，块宽就是最长的词", abs(V.narrowest(ws, sp, pitch, gh, 1e6, 1000.0) - max(ws)) < 1e-3)
+    check("到上限还放不下：取上限（之后行往上下长）", V.narrowest(ws, sp, pitch, gh, 30.0, 200.0) == 200.0)
+    check("最长的词比上限宽：取那个词宽", V.narrowest(ws, sp, pitch, gh, 100.0, 60.0) == 70.0)
+
+    words_s = "go to the shop and buy some milk".split()
+    wd = {("f", t): 0.5 * len(t) for t in words_s}
+    wd.update({("f", "xx"): 1.0, ("f", V.SPACE_KEYS[1]): 3.5})
+    words = [[("ch", c, None) for c in t] for t in words_s]
+    size = 40
+    src = [[1500, 100, 1560, 700]]                       # 一列 600 px 高
+    lines, centers, rect, rows = V.block(words, src, size, "f", wd, 1920, 1080)
+    gh = size / export.h_ratio("f", wd)
+    check("block：块高放得进原列的高、块宽不窄于最长的词、比 6 个字号窄（原来的下限）",
+          rect[3] - rect[1] <= 600 + 1e-6 and rect[2] - rect[0] >= 0.5 * 4 * size - 1e-6 and rect[2] - rect[0] < 6 * size
+          and abs(rect[3] - rect[1] - ((len(lines) - 1) * V.LINE_PITCH * size + gh)) < 1e-6, (rect, [len(x) for x in lines]))
+    check("block 各行的矩形：居中、上下相接（行距中线分开）、首末两行到块的上下沿",
+          len(rows) == len(lines) and rows[0][1] == rect[1] and rows[-1][3] == rect[3]
+          and all(abs(a[3] - b[1]) < 1e-9 for a, b in zip(rows, rows[1:]))
+          and all(abs((r[0] + r[2]) / 2 - (rect[0] + rect[2]) / 2) < 1e-9 and r[2] - r[0] <= rect[2] - rect[0] + 1e-9 for r in rows), rows)
+
+    jw = {("f", "jump"): 2.3, (export.SIDE, "f", "jump"): (-0.05, 0.0), ("f", "xx"): 1.0, ("f", V.SPACE_KEYS[1]): 3.5}
+    jump = [[("ch", c, None) for c in "jump"]]
+    jsize = int(V.word_cap(jump, "f", jw, 200))
+    jrect = V.block(jump, [[100, 20, 130, 180]], jsize, "f", jw, 200, 200)[2]
+    check("左留白为负的词（墨迹比步进宽）：字号上限和块宽按同一个宽（墨迹 + 为正的留白）量，块不超过上限",
+          jrect[2] - jrect[0] <= V.block_max_w(200) + 1e-9, (jsize, jrect, V.block_max_w(200)))
+
+
+def t_vertical_text_lines() -> None:
+    """横排块的 `text` 底板（只盖译文）逐行一块、拼成不重叠的几块，和普通行的 `text` 一样，不是整个译文块一块。"""
+    print("竖排列：横排块的 text 底板逐行")
+    from flowocr.typeset import vertical as V
+    lines = [[100.0, 100.0, 300.0, 140.0], [140.0, 140.0, 260.0, 180.0], [120.0, 180.0, 280.0, 220.0]]
+    block = [100.0, 100.0, 300.0, 220.0]
+    got = V.plates("text", [[400.0, 50.0, 440.0, 600.0]], [block], 6.0, False, False, lines)
+    rects = [p.rect for p in got]
+    area = sum((r[2] - r[0]) * (r[3] - r[1]) for r in rects)
+    whole = (300 - 100 + 12) * (220 - 100 + 12)
+    check("text：不盖原列、逐行拼块（面积小于整块外扩）、各行都盖全、块之间不重叠、都算盖译文（cover 0）",
+          all(r[0] < 400 - 6 for r in rects) and area < whole - 1
+          and all(any(r[0] <= l[0] - 5 and r[2] >= l[2] + 5 and r[1] <= l[1] and r[3] >= l[1] for r in rects) for l in lines)
+          and all(min(a[2], b[2]) <= max(a[0], b[0]) or min(a[3], b[3]) <= max(a[1], b[1]) for i, a in enumerate(rects) for b in rects[i + 1:])
+          and all(p.cover == frozenset({0}) for p in got), (rects, [p.cover for p in got]))
+
+
+def t_vertical_block_floor() -> None:
+    """横排块宽的下限 `BLOCK_MIN_CAP` 个大写字母高：原列很高时也不一行一个词竖着叠（片段 8 的「On / the / 2nd / …」）。"""
+    print("竖排列：横排块宽的下限")
+    from flowocr.typeset import vertical as V
+    words_s = "on the second floor where mukai is".split()
+    wd = {("f", t): 0.5 * len(t) for t in words_s}
+    wd.update({("f", "xx"): 1.0, ("f", V.SPACE_KEYS[1]): 3.5, (V.export.TALL, "f", V.CAP_KEY): 0.7})
+    words = [[("ch", c, None) for c in t] for t in words_s]
+    size = 40
+    from unittest.mock import patch
+
+    def run():
+        return V.block(words, [[1500, 50, 1560, 1050]], size, "f", wd, 1920, 1080)[0]
+    with patch.object(V, "BLOCK_MIN_CAP", 0):
+        bare = run()
+    lines = run()
+    check(f"原列 1000 px 高：没有下限时几乎一行一个词（{len(bare)} 行）；按下限 {V.BLOCK_MIN_CAP} 个大写高折成更少的行（{len(lines)} 行）",
+          len(bare) >= len(words_s) - 1 and len(lines) < len(bare), ([len(x) for x in bare], [len(x) for x in lines]))
+
+
+def t_vertical_latin_font() -> None:
+    """竖排列横排时的拉丁字体（`Look.latin_font`、`--opt latin_font`）：横排块的字行带 `\\fn`、按这个字体量字宽（行高、竖直偏移在表里没有时现量），
+    竖排、不设时照旧；记进 `FlowOCR Typeset`；字体名不合法报错；libass 找不到（量出来和替身一样）打提示。
+    字体目录 `FLOWOCR_FONTS`（`export.sub_filter`）：设了就给 `subtitles` 滤镜加 `fontsdir`（盘符冒号转义），不设和以前一样，不是目录报错。"""
+    print("竖排列：横排的拉丁字体、字体目录")
+    import os
+    from unittest.mock import patch
+
+    from flowocr.output import export
+    from flowocr.typeset import core as TS
+    lk, _ = TS.look_of("default", {"latin_font": "Bangers"})
+    check("--opt latin_font 进 Look；默认是空（跟着样式的字体）",
+          lk.latin_font == "Bangers" and TS.look_of("default", {})[0].latin_font == "")
+    check("latin_font 里有逗号、花括号、反斜杠：报错", all(raises(lambda v=v: TS.look_of("default", {"latin_font": v}), ValueError)
+                                                   for v in ("A,B", "A{x}", "A\\N")))
+    seen = []
+
+    def spy(pairs, known=None):
+        pairs = list(pairs)
+        seen.extend(pairs)
+        return fake_widths(pairs, known)
+    with tempfile.TemporaryDirectory() as td:
+        s = _vcol_script([_vcol_items()], Path(td))
+        en = _with_text(s, "Hello there my friends")
+        notes = []
+        with patch.object(export, "ink_widths", spy):
+            from dataclasses import replace
+            from flowocr.typeset import assfile as AF
+            ts = TS.Typesetter(replace(TS.LOOKS["default"], plate_color="off", latin_font="Bangers"))
+            doc = AF.loads(en)
+            ts.run(doc)
+            out = doc.dumps()
+        notes = [m for _, m in ts.notes]
+        g = _glyphs_of(out)
+        fonts = {f for f, t in seen for k in t.split("\n") if k == "Hello"}
+        check("横排块的字行带 \\fnBangers，量词宽用 Bangers（原文字号仍按样式的字体量）",
+              g and all("\\fnBangers" in ln for *_, ln in g) and fonts == {"Bangers"}
+              and any(f == export.FONT_CN and layout_key in t for f, t in seen for layout_key in ("的",)), (fonts, [ln[-80:] for *_, ln in g]))
+        check("FlowOCR Typeset 记下 latin_font", "latin_font=Bangers" in out)
+        check("量出来和找不到字体时的替身一样（假字宽都一样）：打提示", any("多半 libass 找不到" in m for m in notes), notes)
+        plain = _vcol_run(en)
+        check("不设 latin_font：字行不带 \\fn，FlowOCR Typeset 不记", all("\\fn" not in ln for *_, ln in _glyphs_of(plain)) and "latin_font" not in plain)
+        zh = _vcol_run(_with_text(s, "你好朋友"), latin_font="Bangers")
+        check("竖排（有中日韩字）不用 latin_font", all("\\fn" not in ln for *_, ln in _glyphs_of(zh)))
+    w = {(export.TALL, "X", export.METRIC_REF): 0.8, (export.DY, "X", export.METRIC_REF): 0.07}
+    check("表里没有的字体：行高换算、竖直偏移按量出来的；没量过退回微软雅黑的；表里有的照表",
+          export.h_ratio("X", w) == 1 / 0.8 and export.ink_dy("X", w) == 0.07
+          and export.h_ratio("X") == export.FONT_H_RATIO[export.FONT_CN] and export.ink_dy("X", {}) == export.FONT_INK_DY[export.FONT_CN]
+          and export.h_ratio(export.FONT_CN, {(export.TALL, export.FONT_CN, export.METRIC_REF): 0.5}) == export.FONT_H_RATIO[export.FONT_CN])
+    with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {export.FONTS_ENV: td}):
+        f = export.sub_filter("burn.ass")
+        want = Path(td).resolve().as_posix().replace(":", "\\:")
+        missing = raises(lambda: (os.environ.__setitem__(export.FONTS_ENV, td + "/nope"), export.sub_filter("a.ass")), SystemExit)
+    with patch.dict(os.environ, {export.FONTS_ENV: ""}):
+        bare = export.sub_filter("burn.ass")
+    check("FLOWOCR_FONTS：设了加 fontsdir（盘符冒号转义、引号包住），不设照旧，不是目录报错",
+          f == f"subtitles=burn.ass:fontsdir='{want}'" and bare == "subtitles=burn.ass" and missing, (f, bare))
+    from flowocr.output.presets import _overlay as OV
+    from flowocr.typeset import core as TS4
+    keys = set(re.findall(r'o\.get\("([a-z_]+)"', inspect.getsource(TS4.look_of)))
+    check("阶段 4 认的选项只有一份（`core.LOOK_OPTIONS`，含 latin_font）：look_of 读的键都在里面，连跑的叠加预设和预览工具按它分",
+          keys == set(TS4.LOOK_OPTIONS) and "latin_font" in keys and OV.STAGE4 is TS4.LOOK_OPTIONS, (keys, OV.STAGE4))
+
+
+def t_vertical_timing() -> None:
+    """`col` 行的时刻策略（`vertical.col_timing`、`Timing.starts`）和人挪过时的位移（`col_offset` / `moved_where`）、晚出现的元素切段（`core.cut_seg` / `shift_move`）：纯函数逐项核。"""
+    print("竖排列：时刻、人挪过的位移、切段")
+    from flowocr.typeset import core as TS
+    from flowocr.typeset import vertical as V
+    rowt = [(0, 1500), (2000, 3500)]
+    t = V.col_timing(rowt, 3500, None, 2, 2, "on", True)
+    check("竖排、rowt 段数 = 原文列数 = 译文列数：逐列 spans、不用 tw、全字取最晚一列、底板起点是各列首字",
+          (t.spans, t.tw, t.full, t.mode, t.src, t.notes) == (rowt, None, 3500, "on", [0, 2000], []), t)
+    check("有 spans 时关了打字机也按首字起显（mode on），dim 照用",
+          V.col_timing(rowt, 3500, None, 2, 2, "off", True).mode == "on" and V.col_timing(rowt, 3500, None, 2, 2, "dim", True).mode == "dim")
+    t = V.col_timing(rowt, 3500, None, 3, 3, "on", True)
+    check("rowt 段数 ≠ 原文列数（人改过 box）：不用 rowt、按整条 tw、打提示，原文各列底板从 0 起",
+          (t.spans, t.tw, t.full, t.src) == (None, 3500, 3500, [0, 0, 0]) and len(t.notes) == 1 and "原文 3 列" in t.notes[0], t)
+    auto, hand = V.col_timing(rowt, 3500, None, 2, 3, "on", False), V.col_timing(rowt, 3500, None, 2, 3, "on", True)
+    check("译文列数 ≠ 原文列数：退回 tw；人用 \\N 分过列才打提示，自动分列（一段译文、空译文）不打",
+          (auto.spans, auto.tw, auto.notes) == (None, 3500, []) and len(hand.notes) == 1 and "译文 3 列" in hand.notes[0]
+          and auto.src == [0, 2000], (auto, hand))
+    t = V.col_timing(rowt, 3500, None, 2, None, "on", False)
+    check("横排：整块一段，最早一列的首字到最晚一列的全字", (t.spans, t.full, t.mode) == ([(0, 3500)], 3500, "on"), t)
+    t = V.col_timing(None, None, 900, 2, 2, "dim", True)
+    check("人写的 \\k：不改时刻（spans、tw 都没有）、全字是 \\k 的、打字机方式照预设",
+          (t.spans, t.tw, t.full, t.mode) == (None, None, 900, "dim"), t)
+    t = V.col_timing(rowt, None, 900, 2, 2, "on", True)
+    check("人写的 \\k 且有 rowt：译文不用 rowt（没有 spans），原文各列的底板起点仍是 rowt 的首字",
+          (t.spans, t.tw, t.full, t.src, t.notes) == (None, None, 900, [0, 2000], []), t)
+    check("不打字（没有 rowt / tw / \\k）：off", V.col_timing(None, None, None, 2, 2, "on", False).mode == "off")
+
+    def glyph(unit, *times):
+        return V.Glyph(0, 0, [("ch", "字", x) for x in times], 10, "", None, None, unit)
+    gl = [glyph(0, 0, 300), glyph(1, 900, 600)]
+    on = V.col_timing(None, 1000, None, 2, 2, "on", False)
+    check("底板起点（没有 spans）：逐字显出时译文各列取这一列最早的字，dim 时都是 0；后面接原文各列",
+          on.starts(gl, 2) == [0, 600, 0, 0] and V.col_timing(None, 1000, None, 2, 2, "dim", False).starts(gl, 2) == [0, 0, 0, 0],
+          on.starts(gl, 2))
+    check("底板起点（有 spans）：取各列的首字", V.col_timing(rowt, 3500, None, 2, 2, "on", True).starts([], 2) == [0, 2000, 0, 2000])
+
+    was = TS.parse_was("pos:100 200|fs:96|an:5")
+    half = [V.col_offset(was, "100.5,231.5", None), V.col_offset(was, None, "100.5,200.5,120.5,201.5")]
+    tops = [float(re.search(r"\\pos\([-\d.]+,([-\d.]+)\)", V.moved_where(0, y, half[0]))[1]) for y in (100.0, 131.0)]
+    check("半像素的位移取整一次：各块平移同样多，在整数边界上拼严的底板不错开一像素",
+          all(v == int(v) for q in half for v in q[1:5] if isinstance(v, float)) and tops[1] - tops[0] == 31, (half, tops))
+    from flowocr.output import layout as LY
+    seg = (0, 1_000_000, (10.5, 20.5), (10.5, 60.5))
+    auto = [re.search(r"\\move\(([-\d.]+),([-\d.]+),[-\d.]+,([-\d.]+)", LY.pos_tag(0.0, y, seg, (0.0, 0.0))) for y in (100.0, 131.0)]
+    check("自动轨迹截段插值到半像素：同一条的各块平移量先取整、平移同样多（拼严的底板不错开一像素）",
+          all(auto) and float(auto[1][2]) - float(auto[0][2]) == 31 and float(auto[1][3]) - float(auto[0][3]) == 31, [a_[0] for a_ in auto if a_])
+    early, late = LY.pos_tag(0.0, 100.0, seg, (0.0, 0.0)), LY.pos_tag(0.0, 100.0, seg, (0.0, 0.0), 500_000)
+    from flowocr.output import export as EX
+    check("晚出现的元素的平移按写进 ASS 的起点差算：33.333 ms 和 50 ms 起的两条写成 0.04 / 0.05 s，差 10 ms（不是 16.667 ms）",
+          (EX.start_cs(50_000) - EX.start_cs(33_333)) * 10 == 10 and EX.ass_time(33_333, True).endswith(".04"), EX.ass_time(33_333, True))
+    check("晚出现、从段中间切开的元素：\\move 沿用整段的端点、起止时刻减去晚的那段（起点为负），和先出现的同一条插值",
+          early.split(",")[:4] == late.split(",")[:4] and late.endswith(",-500,500)") and early.endswith(",0,1000)"), (early, late))
+    d = V.col_offset(was, "130,250", None)
+    check("人挪了 \\pos：位移 = 新 \\pos − was 的 pos，元素平移这么多",
+          d == ("pos", 30, 50) and V.moved_where(10, 20, d) == "\\pos(40,70)", d)
+    d = V.col_offset(was, None, "110,200,310,220")
+    check("人写了不带时刻的 \\move：起止点各减 was 的位置，生成的 \\move 也不带时刻（整条）",
+          V.moved_where(10, 20, d) == "\\move(20,20,220,40)", V.moved_where(10, 20, d))
+    d = V.col_offset(TS.parse_was("move:100 200 300 200 0 6000|fs:96"), None, "100,200,500,200,500,4000")
+    check("带时刻的 \\move（原来在动的按 was 的 move 起点算位移）：时刻照抄",
+          V.moved_where(10, 20, d) == "\\move(10,20,410,20,500,4000)", V.moved_where(10, 20, d))
+    check("cut_seg：运动的一段从中间切开，起点按时间插值、止点不变；不动的段只改起点",
+          TS.cut_seg((0, 4_000_000, (1500, 100), (1100, 100)), 2_000_000) == (2_000_000, 4_000_000, (1300.0, 100.0), (1100, 100))
+          and TS.cut_seg((0, 4_000_000, None, None), 1_000_000) == (1_000_000, 4_000_000, None, None))
+    check("shift_move：不带时刻的 \\move 从 a 毫秒切开 → 时刻 (−a, 时长−a)（libass 照算进度，ffmpeg 渲帧核过）；这一段之前已走完的换成终点的 \\pos",
+          TS.shift_move("\\move(0,100,300,100)", 2000, 6000) == "\\move(0,100,300,100,-2000,4000)"
+          and TS.shift_move("\\move(0,100,300,100,0,1000)", 2000, 6000) == "\\pos(300,100)")
+
+
+def _moves(text: str, kind: str = "plate") -> list[tuple[str, str, list[float]]]:
+    """生成的底板（`kind=plate`）或字行的 (起, 止, 位置 tag 的数)。"""
+    out = []
+    for ln in text.splitlines():
+        if not ln.startswith("Dialogue:") or ",fo-fx" not in ln or ((",fo-fx|plate," in ln) != (kind == "plate")):
+            continue
+        m = re.search(r"\\(?:pos|move)\(([^)]*)\)", ln)
+        f = ln.split(",", 9)
+        out.append((f[1], f[2], [float(v) for v in m[1].split(",")]))
+    return out
+
+
+def t_vertical_paths() -> None:
+    """`col` 行在 `emit` 里的几条路端到端走一遍：在动的行 + 晚出现的列、人写的 \\move + 晚出现的列、人写的 \\k、dim、横竖混排阶段 3 → 4、
+    空译文、写不下（最后一列出画面 + 提示）；横排块贴着画面右沿；N 类小改（提示只在人分过列时打、非 col 行的 flow 提示、dev 区域号的出现时刻）。"""
+    print("竖排列：在动、人挪过、\\k、dim、混排、空译文、写不下、贴边")
+    from dataclasses import replace
+
+    from flowocr.output import export, layout
+    from flowocr.output import script as SC
+    from flowocr.typeset import vertical as V
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        typed = _vcol_script([_vcol_items(typed=True)], d)
+        # 1. 在动的 col 行（path）+ 第二列晚 2 s 出现：那块底板从 2 s 起，起点是轨迹在 2 s 时的位置（cut_seg 插值）。
+        #    阶段 3 不给在动的条目写 rowt（`script.row_times`），这里手加（人在字幕稿里也能写；按 tw 逐字显出时晚出现的列走同一条路）
+        path = [(0, list(_VCOL_A)), (4_000_000, [_VCOL_A[0] - 400, _VCOL_A[1], _VCOL_A[2] - 400, _VCOL_A[3]])]
+        moving = _vcol_script([replace(_vcol_items(typed=True), boxes=path)], d).replace(";plate;", ";plate;rowt=0+1500|2000+3500;", 1)
+        moving = _vcol_run(moving, plate="src")
+        still = {tuple(r[:2]) for r, _ in _plates_of(_vcol_run(typed, plate="src"))}
+        late = [m for m in _moves(moving) if m[0] == "0:00:02.00"]
+        bx, by = next((x, y) for x, y in still if x < 1400)
+        check("在动 + 晚出现的列：第二列底板从 2 s 切开，\\move 沿用整段的端点（0 → −400 px）、时刻是 −2000 到 2000 ms（切开时正走到 −200 px，和第一列同一条插值）",
+              len(late) == 1 and late[0][1] == "0:00:04.00" and late[0][2] == [bx, by, bx - 400, by, -2000, 2000], (late, still))
+        odd = [(33_333, list(_VCOL_A)), (4_000_000, [_VCOL_A[0] - 400, _VCOL_A[1], _VCOL_A[2] - 400, _VCOL_A[3]])]
+        moving_odd = _vcol_run(_vcol_script([replace(_vcol_items(typed=True), boxes=odd)], d)
+                               .replace(";plate;", ";plate;rowt=0+1500|2000+3500;", 1), plate="src")
+        late_odd = [m for m in _moves(moving_odd) if m[0] == "0:00:02.00"]
+        check("轨迹段从 33.333 ms 起（写成 0.04 s）、第二列 2 s 出现：\\move 按写出来的起点差 1960 ms 平移（不是 1966 ms）",
+              len(late_odd) == 1 and late_odd[0][2][4:] == [-1960, 2006], late_odd)
+        check("在动 + 晚出现的列：第一列底板 0–4 s 走、4–6 s 停在终点，第二列 2–4 s 走、4–6 s 停",
+              sorted((a, b) for a, b, _ in _moves(moving)) == [("0:00:00.00", "0:00:04.00"), ("0:00:02.00", "0:00:04.00"),
+                                                              ("0:00:04.00", "0:00:06.00"), ("0:00:04.00", "0:00:06.00")], _moves(moving))
+
+        # 2. 人写的 \move（不带时刻）+ 晚出现的列：盖译文的底板跟着 \move 走，晚出现那块的 \move 时刻换成 (−2000, 4000)
+        given = _with_text(typed, "甲乙丙\\N丁戊己")
+        line = next(ln for ln in given.splitlines() if ";col;" in ln)
+        px, py = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", line).groups())
+        mv = given.replace(line, line.replace(re.search(r"\\pos\([^)]*\)", line)[0], "\\move(%g,%g,%g,%g)" % (px + 100, py, px + 300, py), 1))
+        base = {m[0]: m[2] for m in _moves(_vcol_run(given, plate="text"))}
+        got = _moves(_vcol_run(mv, plate="text"))
+        lp = [m for m in got if m[0] == "0:00:02.00"]
+        ep = [m for m in got if m[0] == "0:00:00.00"]
+        b2, b1 = base.get("0:00:02.00"), base.get("0:00:00.00")
+        check("人写的 \\move + 晚出现的列：第二列的译文底板从 2 s 起，\\move 起止点 = 原位置 +100 / +300 px，时刻 (−2000, 4000)",
+              b2 is not None and len(lp) == 1 and lp[0][2] == [b2[0] + 100, b2[1], b2[0] + 300, b2[1], -2000, 4000], (lp, b2))
+        check("人写的 \\move：从 0 起的第一列底板和各个字的 \\move 不带时刻（整条）",
+              b1 is not None and len(ep) == 1 and ep[0][2] == [b1[0] + 100, b1[1], b1[0] + 300, b1[1]]
+              and all(len(v) == 4 for _, _, v in _moves(_vcol_run(mv, plate="text"), "text")), (ep, b1))
+
+        # 3a. 人写的 \k：tw / rowt 作废，按 \k 逐字显出；译文列的底板从这一列最早的字起
+        k = _vcol_run(_with_text(typed, "{\\k30}甲乙丙{\\k30}丁戊己\\N{\\k30}庚辛壬"), plate="text")
+        times = {g: int(m[1]) for *_, g, ln in _glyphs_of(k) if (m := re.search(r"\\t\((\d+),", ln))}
+        check("人写的 \\k：第 1、2、3 个音节在 0 / 300 / 600 ms 出现（不按 rowt 的 2000 ms）",
+              [times.get(c) for c in "甲丁庚"] == [0, 300, 600], times)
+        check("人写的 \\k：第二列的译文底板从这一列最早的字（600 ms）起",
+              sorted(a for a, _, _ in _moves(k)) == ["0:00:00.00", "0:00:00.60"], _moves(k))
+        # 3b. dim：列在首字前全透明、全字前半透明
+        dim = {g: ln.split(",", 9)[9].split("}", 1)[1] for *_, g, ln in _glyphs_of(_vcol_run(given, typewriter="dim"))}
+        check("dim：第一列整列半透明到 1500 ms，第二列 2000 ms 前全透明、3500 ms 前半透明",
+              dim.get("甲", "").startswith("{\\alpha&H80&\\t(1500,1501,\\alpha&H00&)}")
+              and dim.get("丁", "").startswith("{\\alpha&HFF&\\t(2000,2001,\\alpha&H80&)\\t(3500,3501,\\alpha&H00&)}"), dim)
+        # 3c. 横竖混排的条目阶段 3 → 4：横排那条照普通行画，竖排那条逐字画、第二列 2 s 起
+        mixed = _vcol_script([_vcol_items(mixed=True, typed=True)], d)
+        out = _vcol_run(mixed)
+        gs = _glyphs_of(out)
+        hz = [g for *_, g, _ in gs if "横" in g]
+        vt = {g: ln for *_, g, ln in gs if len(g) == 1}
+        check("横竖混排阶段 3 → 4：横排一行一条（整行的字）、竖排 12 个字各一条，第二列首字 2000 ms 出现",
+              len(hz) == 1 and hz[0] == "横排的字幕" and len(vt) == 12 and "\\t(2000,2001," in vt.get("き", ""), (hz, len(vt)))
+
+        # 5. 空译文：只有盖原文的底板，没有字，不报错、不打 rowt 对不上的提示
+        for flow in ("auto", "v"):
+            notes: list = []
+            e = _vcol_run(_with_text(typed, ""), notes, flow=flow)
+            pl = [r for r, _ in _plates_of(e)]
+            check(f"空译文（flow={flow}）：没有字，底板盖全原文两列，不打 rowt 的提示",
+                  not _glyphs_of(e) and pl and all(_covered(c, pl) for c in (_VCOL_A, _VCOL_B)) and not any("rowt" in m for m in notes),
+                  (pl, notes))
+        notes = []
+        _vcol_run(_with_text(typed, "甲乙丙丁戊己庚辛\\N壬癸子丑寅卯辰巳\\N午未申酉戌亥天地人"), notes)
+        auto_notes: list = []
+        _vcol_run(_with_text(typed, "甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地人"), auto_notes)
+        check("人用 \\N 分了 3 段（原文 2 列）打 rowt 对不上的提示；一段译文自动分成 3 列不打",
+              any("译文 3 列" in m for m in notes) and not any("rowt" in m for m in auto_notes), (notes, auto_notes))
+
+        # 6. 一列原文 + 很长的译文：往左加列到画面左沿，还写不下就最后一列出画面 + 提示
+        one = _vcol_script([SC.part(_vcol_items(typed=True), [0])], d)
+        notes = []
+        far = _vcol_run(_with_text(one, "甲乙丙丁戊己庚辛壬癸" * 80), notes)
+        xs = sorted({x for x, *_ in _glyphs_of(far)})
+        check("一列原文 + 800 字译文：往左加列直到左沿（最左一列不出画面），写不下打提示",
+              xs and xs[0] - (_VCOL_A[2] - _VCOL_A[0]) / 2 >= layout.EDGE_PAD and any("写不下" in m for m in notes), (xs[:2], notes))
+        w = fake_widths([("f", x) for x in (*layout.COL_INK_KEYS, *layout.EM_KEYS)])
+        cells = V.cells_of([("ch", c, None) for c in "甲乙丙丁戊己庚辛壬癸" * 80], "f", w)
+        src = [list(_VCOL_A)]
+        size, cols, sl, ok = V.fit_columns(cells, None, src, 96, False, 1080, "f", w)
+        lens = [sum(V.cell_len(c, size, "f", w) for c in col) for col in cols]
+        check("fit_columns 写不下：最小字号、能加的列都加了（再加一列就出左沿）、前几列在列长内、最后一列超出列长",
+              not ok and size == V.min_size(96) and len(cols) == len(sl) and V.slots(src, 1080, True, len(sl)) is None
+              and all(n <= s.cap + 0.5 for n, s in zip(lens[:-1], sl)) and lens[-1] > sl[-1].cap, (size, len(cols), lens[-2:]))
+
+        # N 类：非 col 行的 flow 打提示；dev 的区域号和最早出现的那块底板一起出现
+        notes = []
+        _vcol_run("\n".join(ln.replace("fo:", "fo:flow=v;", 1) if ln.startswith("Dialogue:") and ";col;" not in ln else ln
+                            for ln in mixed.splitlines()) + "\n", notes)
+        check("flow 写在不是 col 的行上：打提示", any("flow 只管" in m for m in notes), notes)
+        lateall = _vcol_run(typed.replace("rowt=0+1500|2000+3500", "rowt=1000+1500|2000+3500"), label=True)
+        lab = [ln.split(",")[1] for ln in lateall.splitlines() if ln.startswith("Dialogue:") and "\\an9" in ln and "\\bord1" in ln]
+        check("dev 的区域号：col 行最早的列 1 s 才出现时，区域号也从 1 s 起", lab == ["0:00:01.00"], lab)
+
+    # 4. 横排块贴着画面右沿、英文很长：每行按步进宽（墨迹 + 两侧留白）居中画出来的墨迹都在 [EDGE_PAD, W − EDGE_PAD] 里
+    words_s = "Unbelievably extraordinary circumstances surrounded everybody yesterday afternoon downtown".split()
+    wd = {("f", t): 0.5 * len(t) for t in words_s}
+    wd.update({(export.SIDE, "f", t): (0.06, 0.06) for t in words_s})
+    wd.update({("f", "xx"): 1.0, ("f", V.SPACE_KEYS[1]): 3.5})
+    words = [[("ch", c, None) for c in t] for t in words_s]
+    W = 1920
+    size = 60
+    lines, centers, rect, _rows = V.block(words, [[1790, 100, 1900, 400]], size, "f", wd, W, 1080)
+    sp = V.space_unit("f", wd) * size
+    ink = []
+    for ln, (cx, _) in zip(lines, centers):
+        ts_ = [V.word_text(x) for x in ln]
+        adv = sum((wd[("f", t)] + sum(wd[(export.SIDE, "f", t)])) * size for t in ts_) + sp * (len(ts_) - 1)
+        ink.append((cx - adv / 2 + wd[(export.SIDE, "f", ts_[0])][0] * size, cx + adv / 2 - wd[(export.SIDE, "f", ts_[-1])][1] * size))
+    check("横排块贴着右沿：块的矩形和每行按步进宽画出来的墨迹都在 [EDGE_PAD, W − EDGE_PAD] 里（只按墨迹宽估时冲出右沿）",
+          len(lines) > 1 and layout.EDGE_PAD - 1e-6 <= rect[0] and rect[2] <= W - layout.EDGE_PAD + 1e-6
+          and all(layout.EDGE_PAD - 0.5 <= a and b <= W - layout.EDGE_PAD + 0.5 for a, b in ink), (rect, ink))
+
+
+def _tried(fn):
+    """`fn()` 的结果；抛了就是异常本身（守卫要在改之前也跑得完、报 FAIL 而不是中断）。"""
+    try:
+        return fn()
+    except Exception as e:      # noqa: BLE001
+        return e
+
+
+def t_vertical_edits() -> None:
+    """人在字幕稿里改过的 `col` 行（验收第 2 轮）：手写 `\\k` 时原文列的底板和擦除仍从各列首字起；手写 `\\move` + 晚出现的列 + 底板取色
+    （负的 `\\move` 时刻）能读能重画；删掉 `\\pos` 回按原列摆、坐标坏了报带行号的错；改译文 `\\fs` 不扩大擦除矩形；
+    同时在屏的横排块最长单词放不下时一组一起缩、仍同一字号。"""
+    print("竖排列：人改过的 \\k、\\move、\\pos、\\fs，横排块同组字号")
+    from flowocr.burn import plates as BP
+    from flowocr.output import layout
+    from flowocr.typeset import platecolor as PC
+    from flowocr.typeset import vertical as V
+    pd = layout.plate_pad(96)
+
+    def pad(r):
+        return tuple(round(v) for v in (r[0] - pd, r[1] - pd, r[2] + pd, r[3] + pd))
+    cols = [pad(c) for c in (_VCOL_A, _VCOL_B)]
+    with tempfile.TemporaryDirectory() as td:
+        typed = _vcol_script([_vcol_items(typed=True)], Path(td))
+        line = next(ln for ln in typed.splitlines() if ";col;" in ln)
+        pos = re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", line)
+
+        # B1：手写 \k 让 rowt 不再管译文的节奏，但原文列的底板、src 擦除仍从各列首字（rowt）起
+        for name, body in (("竖排", "{\\k30}甲乙丙\\N{\\k30}丁戊己"), ("横排", "{\\k30}peel \\N{\\k30}just one")):
+            out = _tried(lambda: _vcol_run(_with_text(typed, body), plate="src"))
+            starts = sorted(ln.split(",")[1] for _, ln in _plates_of(out)) if isinstance(out, str) else out
+            P = BP.load(out, (1920, 1080))[0] if isinstance(out, str) else None
+            er = [P.at(t)[1] for t in (1.0, 2.0 - BP.LEAD - 0.01, 3.0)] if P else []    # `at` 的时刻只增不减
+            check(f"手写 \\k（{name}）+ src：两列原文的底板从 0 / 2 s 起，擦除到 2 s − LEAD 之前只有第一列、3 s 时两列（阶段 5 照底板行的起点 − LEAD）",
+                  starts == ["0:00:00.00", "0:00:02.00"] and er[:2] == [cols[:1]] * 2 and sorted(er[2]) == sorted(cols), (starts, er))
+        k = _vcol_run(_with_text(typed, "{\\k30}甲乙丙\\N{\\k30}丁戊己"), plate="rows")
+        times = {g: int(m[1]) for *_, g, ln in _glyphs_of(k) if (m := re.search(r"\\t\((\d+),", ln))}
+        check("手写 \\k + rows：译文仍按 \\k 出（甲 0、丁 300 ms），第二列那块底板从译文首字 300 ms 起（早于原文列的 2 s）",
+              times.get("甲") == 0 and times.get("丁") == 300 and sorted(ln.split(",")[1] for _, ln in _plates_of(k)) == ["0:00:00.00", "0:00:00.30"],
+              (times, [ln.split(",")[1] for _, ln in _plates_of(k)]))
+
+        # 普通横排行写了 \k、rowt 又被人改坏：rowt 不用也不解析，整份稿照常生成（只有 col 行要它定原文列的起点）
+        mixed = _vcol_script([_vcol_items(mixed=True, typed=True)], Path(td))
+        hz = next(ln for ln in mixed.splitlines() if ln.startswith("Dialogue:") and ";col;" not in ln)
+        head, body = hz.split(",", 9)[:9], hz.split(",", 9)[9]
+        eff = re.sub(r";rowt=[^;,]*", "", head[8]) + ";rowt=0+|2000+3500"
+        bad = ",".join(head[:8] + [eff]) + "," + body[:body.index("}") + 1] + "{\\k30}横排{\\k30}的字幕"
+        got = _tried(lambda: _vcol_run(mixed.replace(hz, bad)))
+        check("普通横排行：手写 \\k + 人改坏的 rowt（0+|2000+3500）照常生成，不报错", isinstance(got, str) and "横排" in got, got if not isinstance(got, str) else "")
+
+        # B2：手写 \move + 晚出现的列：切段后的 \move 时刻是负的，取色器 / 阶段 5 读得出、重画小格时照抄
+        given = _with_text(typed, "甲乙丙\\N丁戊己")
+        gl = next(ln for ln in given.splitlines() if ";col;" in ln)
+        px, py = (float(v) for v in re.search(r"\\pos\(([-\d.]+),([-\d.]+)\)", gl).groups())
+        mv = given.replace(gl, gl.replace(re.search(r"\\pos\([^)]*\)", gl)[0], "\\move(%g,%g,%g,%g)" % (px + 100, py, px + 300, py), 1))
+        evs = [PC.parse(ln) for ln in _vcol_run(mv, plate="text").splitlines() if ",fo-fx|plate," in ln]
+        late = next((e for e in evs if e.start == 2.0), None)
+        at = _tried(lambda: late.rect_at(2.0)) if late else None
+        mv_args = [float(v) for v in re.search(r"\\move\(([^)]*)\)", late.text)[1].split(",")] if late else []
+        want = mv_args[0] + (mv_args[2] - mv_args[0]) * 2000 / 6000 if len(mv_args) == 6 else None
+        check("手写 \\move + 晚出现的列：底板行的 \\move(…,−2000,4000) 读得出，2 s（行首）时在起止点之间 1/3 处",
+              isinstance(at, tuple) and want is not None and abs(at[0] - want) < 1e-6 and mv_args[4:] == [-2000, 4000], (at, mv_args))
+        cell = _tried(lambda: PC.cell_text(late, 10, 20, 30, 40, "\\1c&H808080&")) if late else None
+        check("底板取色重画小格：负的 \\move 时刻照抄、起止点一起平移", isinstance(cell, str) and ",-2000,4000)" in cell, cell)
+        P = _tried(lambda: BP.load(_vcol_run(mv, plate="text"), (1920, 1080))[0].at(3.0))
+        check("阶段 5 读手写 \\move 的底板（负时刻）不报错", isinstance(P, tuple), P)
+
+        # B3：删掉 col 行的 \pos：回按原列摆（同没挪过），坐标坏了报带行号的错
+        notes: list = []
+        gone = _tried(lambda: _vcol_run(typed.replace(pos[0], "", 1), notes))
+        check("删掉 col 行的 \\pos：按原列摆（和没改时的字、底板相同），打提示",
+              isinstance(gone, str) and _glyphs_of(gone) == _glyphs_of(_vcol_run(typed))
+              and _plates_of(gone) == _plates_of(_vcol_run(typed)) and any("没有 \\pos" in m for m in notes), (gone, notes))
+        for bad in ("\\pos(100)", "\\move(1,2,3)"):
+            e = _tried(lambda: _vcol_run(typed.replace(pos[0], bad, 1)))
+            check(f"col 行的 {bad} 坐标不全：报 ValueError，指明源行号", isinstance(e, ValueError) and "第 " in str(e) and "行" in str(e), e)
+
+        # S1：改译文的 \fs 不扩大原文的擦除（边距按原文的字号）
+        big = _tried(lambda: _vcol_run(typed.replace("\\fs96", "\\fs180", 1), plate="src"))
+        er = BP.load(big, (1920, 1080))[0].at(3.0)[1] if isinstance(big, str) else big
+        check("译文 \\fs96 → 180：src 擦除矩形还是按原文字号外扩的原列", isinstance(er, list) and sorted(er) == sorted(cols), er)
+
+    # S2：同组字号先按每块最长单词的上限压，组内一定同一字号；到下限还放不下的逐块标出
+    for name, sizes, caps, want in (("中位数不超过各块最长单词的上限（60 / 60、上限 inf / 50.4 → 50，两块都放得下）", [60, 60], [float("inf"), 50.4], (50, [True, True])),
+                                     ("上限低于中位数的 75% 时停在 75%（60 → 45），放不下的那块标 False", [60, 64, 40], [float("inf"), 30.0, 100.0], (45, [True, False, True])),
+                                     ("上限都够时就是中位数", [50, 52, 70], [1e9] * 3, (52, [True] * 3))):
+        got = _tried(lambda: V.shared_size(sizes, caps))
+        check("同组字号：" + name, got == want, got)
+    with tempfile.TemporaryDirectory() as td:
+        pair = _vcol_item([([1500, 100, 1600, 700], "あいうえおか", 0), ([60, 100, 160, 640], "きくけこさし", 0)])
+        ps = _vcol_script([pair], Path(td))
+        bodies = iter(["Dog person", "Pneumonoultramicroscopicsilicovolcanoconiosis"])
+        en = "\n".join((ln.split("}", 1)[0] + "}" + next(bodies)) if ln.startswith("Dialogue:") and ";col" in ln else ln
+                       for ln in ps.splitlines()) + "\n"
+        got: dict[bool, set[int]] = {True: set(), False: set()}
+        notes: list = []
+        for _, _, g, ln in _glyphs_of(_vcol_run(en, notes)):
+            got["Pneumono" in g].add(int(re.search(r"\\fs(\d+)", ln)[1]))
+        check("横排：同时在屏的两块里一块有长单词要缩字号，两块一起缩、仍同一字号；到最小字号还放不下的那块打提示（只那一块）",
+              len(got[True]) == 1 and got[True] == got[False] and sum("最长的词" in m for m in notes) == 1, (got, notes))

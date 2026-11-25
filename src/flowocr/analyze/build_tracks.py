@@ -28,6 +28,7 @@ from pathlib import Path
 from flowocr.artifacts import evalkit          # noqa: E402
 from flowocr.artifacts import obsio            # noqa: E402
 from flowocr.artifacts import srtio            # noqa: E402
+from flowocr.artifacts import textdir          # noqa: E402
 from flowocr.artifacts import tracksio  # noqa: E402
 from flowocr.analyze import align  # noqa: E402
 from flowocr.analyze import uigate  # noqa: E402
@@ -648,40 +649,67 @@ def build_runs(obs: list[dict], frame_us: int, iou_thr: float, sim_thr: float,
 
 # ---------- 阶段二/三：空间聚类 ----------
 
+def vertical_run(r: Run) -> bool:
+    """run 是一列竖排字（`tracksio.vertical_line`）。单个窄字、乱码的竖条框照横排聚，
+    横排素材因此基本不受影响（竖条框只占 0.1%–0.6%，多是单个窄字）。"""
+    return tracksio.vertical_line(r.box, r.text)
+
+
+def char_h(r: Run) -> float:
+    """字高：横排是框高，竖排的一列是列宽（`vertical_run`）。"""
+    return r.w if vertical_run(r) else r.h
+
+
+def line_geom(r: Run, W: int, H: int) -> tuple[float, float, float, tuple[float, float], int, int]:
+    """一行字的几何，按行的方向转好：(垂直于行的中心, 顺着行的中心, 字高, 顺着行的范围, 垂直方向的画面长, 顺着方向的画面长)。
+    横排是 (cy, cx, h, (x0, x1), H, W)；竖排一列转置成 (cx, cy, w, (y0, y1), W, H)。"""
+    if vertical_run(r):
+        return r.cx, r.cy, char_h(r), (r.box[1], r.box[3]), W, H
+    return r.cy, r.cx, char_h(r), (r.box[0], r.box[2]), H, W
+
+
+def span_ratio(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """两段一维范围重叠占较短那段多少（`x_overlap_ratio` 的一维版）。"""
+    return x_overlap_ratio([a[0], 0, a[1], 1], [b[0], 0, b[1], 1])
+
+
 def build_tracks(runs: list[Run], W: int, H: int) -> list[list[int]]:
     """行级聚类：按"到轨道质心的距离"分配，而不是并查集。
 
     并查集在这里会**串联**——滚动的评论墙里每条 run 都和上下相邻的那条挨得够近，
     一路 union 下去就把整面墙合成一条"行"（实测 ja-title 出现过 y 跨度 0.29H 的单轨）。
     质心法不会传染：新 run 只跟轨道当前的中位位置比。
+
+    竖排的一列（`vertical_run`）只进竖排的轨，几何转置着比（`line_geom`）：列宽当字高、cx 当 cy。
     """
     order = sorted(range(len(runs)), key=lambda i: (runs[i].cy, runs[i].cx))
+    vert = [vertical_run(r) for r in runs]
+    geo = [line_geom(r, W, H) for r in runs]
     tracks: list[list[int]] = []
-    cent: list[tuple[float, float, float]] = []      # cy, cx, h 的中位数
+    cent: list[tuple[bool, float, float, float]] = []      # 是否竖排，垂直于行的中心、顺着行的中心、字高的中位数
     for i in order:
-        r = runs[i]
+        v = vert[i]
+        c, a, h, span, cdim, adim = geo[i]
         best, best_d = -1, None
-        for k, (cy, cx, h) in enumerate(cent):
-            if max(r.h, h) / max(1.0, min(r.h, h)) > 1.6:
+        for k, (kv, kc, ka, kh) in enumerate(cent):
+            if kv != v or max(h, kh) / max(1.0, min(h, kh)) > 1.6:
                 continue
-            dy = abs(r.cy - cy)
-            if dy > max(0.4 * min(r.h, h), 0.010 * H):
+            d = abs(c - kc)
+            if d > max(0.4 * min(h, kh), 0.010 * cdim):
                 continue
-            members = [runs[j] for j in tracks[k]]
-            if (max(x_overlap_ratio(r.box, m.box) for m in members) < 0.30
-                    and abs(r.cx - cx) > 0.05 * W):
+            if (max(span_ratio(span, geo[j][3]) for j in tracks[k]) < 0.30
+                    and abs(a - ka) > 0.05 * adim):
                 continue
-            if best_d is None or dy < best_d:
-                best, best_d = k, dy
+            if best_d is None or d < best_d:
+                best, best_d = k, d
         if best < 0:
             tracks.append([i])
-            cent.append((r.cy, r.cx, r.h))
+            cent.append((v, c, a, h))
         else:
             tracks[best].append(i)
-            ms = [runs[j] for j in tracks[best]]
-            cent[best] = (statistics.median(m.cy for m in ms),
-                          statistics.median(m.cx for m in ms),
-                          statistics.median(m.h for m in ms))
+            gs = [geo[j] for j in tracks[best]]
+            cent[best] = (v, statistics.median(g[0] for g in gs), statistics.median(g[1] for g in gs),
+                          statistics.median(g[2] for g in gs))
     return tracks
 
 
@@ -726,6 +754,7 @@ def build_regions(runs: list[Run], tracks: list[list[int]], W: int, H: int,
                   mutual_x: bool = False, time_gate: int = 0,
                   h_ratio: float = REGION_H_RATIO) -> list[list[int]]:
     """把行级 track 再并成块：x 方向重叠、字号相近（`h_ratio`，0 = 不看字号）、y 相邻。
+    两条都是竖排的列时按列判（`textdir.columns_adjacent`，传列轨上沿、下沿、cx、列宽各自的中位数，宽比门也是 `h_ratio`）；一竖一横照横排判。
 
     `time_gate > 0` 再加一道**时间**门（默认 0 = 关）：两条轨要么同屏过，要么时段交错
     ≥`time_gate` 次，才连边。它针对的是窗内并查集把**从不同屏的两块**串成一块
@@ -740,23 +769,33 @@ def build_regions(runs: list[Run], tracks: list[list[int]], W: int, H: int,
                 statistics.median(r.cy for r in rs), statistics.median(r.h for r in rs),
                 statistics.median(r.cx for r in rs))
 
+    def vstat(tr: list[int]) -> tuple[float, float, float, float]:
+        rs = [runs[i] for i in tr]
+        return (statistics.median(r.box[1] for r in rs), statistics.median(r.box[3] for r in rs),
+                statistics.median(r.cx for r in rs), statistics.median(r.w for r in rs))
+
     st = [stat(t) for t in tracks]
+    vt = [vstat(t) if vertical_run(runs[t[0]]) else None for t in tracks]   # 行级轨不混方向（build_tracks）
     iv = ([uigate.merge_intervals(sorted((runs[i].t_start, runs[i].t_end) for i in t)) for t in tracks]
           if time_gate else None)
     ds = DisjointSet(len(tracks))
     for i in range(len(tracks)):
         for j in range(i + 1, len(tracks)):
             (ax0, ax1, acy, ah, acx), (bx0, bx1, bcy, bh, bcx) = st[i], st[j]
-            if h_ratio and max(ah, bh) / max(1.0, min(ah, bh)) > h_ratio:
-                continue
-            if (x_overlap_ratio([ax0, 0, ax1, 1], [bx0, 0, bx1, 1], mutual_x) < 0.45
-                    and abs(acx - bcx) > 0.05 * W):
-                continue
-            # 邻接按**较小**的那个行高判，不能按较大的：否则一个大字号的框
-            # （zh-news 里有 h=173px 的画中画标题）能允许 Δcy 到 0.35H，
-            # 并查集顺着它把整屏从 cy 0.0 串到 0.9，串成一个假的"字幕区"。
-            if abs(acy - bcy) > 2.2 * min(ah, bh):
-                continue
+            if vt[i] and vt[j]:
+                if not textdir.columns_adjacent(vt[i], vt[j], h_ratio):
+                    continue
+            else:
+                if h_ratio and max(ah, bh) / max(1.0, min(ah, bh)) > h_ratio:
+                    continue
+                if (x_overlap_ratio([ax0, 0, ax1, 1], [bx0, 0, bx1, 1], mutual_x) < 0.45
+                        and abs(acx - bcx) > 0.05 * W):
+                    continue
+                # 邻接按**较小**的那个行高判，不能按较大的：否则一个大字号的框
+                # （zh-news 里有 h=173px 的画中画标题）能允许 Δcy 到 0.35H，
+                # 并查集顺着它把整屏从 cy 0.0 串到 0.9，串成一个假的"字幕区"。
+                if abs(acy - bcy) > 2.2 * min(ah, bh):
+                    continue
             if iv is not None and not (cooccur(iv[i], iv[j])
                                        or alternations(iv[i], iv[j]) >= time_gate):
                 continue
@@ -822,8 +861,16 @@ def pct(vals: list[float], q: float) -> float:
     return v[min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))] if v else 0.0
 
 
-def region_geom(runs: list[Run], run_ids: list[int]) -> tuple[float, float, float, float, float, float]:
-    """区域的几何签名：(cx, x0, x1, y0, y1, h)。
+def region_geom(runs: list[Run], run_ids: list[int]) -> tuple[float, float, float, float, float, float, float, float]:
+    """区域的几何签名：(cx, x0, x1, y0, y1, h, ch, v)。两个尺度分开，`v` 定用哪个：
+    - `ch` 是字号（`char_h`：竖排的列量列宽）。**字高比门**（`SLOT_H_RATIO`）只看它：竖排一列的框高是列长、随句子长短变，
+      拿它比字号的话同一处竖排说明字在长句多的窗和短句多的窗之间过不了门。
+    - `h` 是框高的中位数。两边都是竖排的列时它是 **y 方向的空间尺度**（跨窗缝合的共边容差、跨度比的下限）：
+      拿列宽当共边容差太紧（宽 20 px、长 200 px 的列在两窗错开 40 px 就缝不上，Codex 验收第二轮）。
+      有一边是横排时空间尺度仍是字号 `ch`：列长当容差会把共边、跨度比两道门一起放空，
+      横排字幕带就缝进了同一片高度上的竖排说明字（片段 2：字幕带 y 788–1036、字高 156，竖排槽位 y 71–1005、列长 718）。
+    - `v` 是竖排的列（`vertical_run`）占 run 的比例，过半算"列"。
+    纯横排的区域 h = ch、v = 0。
 
     **端点用 2%/98% 分位，不用 min/max。** 这是 predet 里踩过的同一个坑
     （predet 报告）：min/max 会被离群框撑大，成员越多包围盒越大，
@@ -833,7 +880,8 @@ def region_geom(runs: list[Run], run_ids: list[int]) -> tuple[float, float, floa
     return (statistics.median(r.cx for r in rs),
             pct([r.box[0] for r in rs], 0.02), pct([r.box[2] for r in rs], 0.98),
             pct([r.box[1] for r in rs], 0.02), pct([r.box[3] for r in rs], 0.98),
-            statistics.median(r.h for r in rs))
+            statistics.median(r.box[3] - r.box[1] for r in rs), statistics.median(char_h(r) for r in rs),
+            sum(map(vertical_run, rs)) / len(rs))
 
 
 def span_overlap(a0: float, a1: float, b0: float, b1: float, floor: float) -> float:
@@ -856,13 +904,13 @@ SLOT_H_RATIO = 1.7
 和 `REGION_H_RATIO` 同一个来历（手设、没标定），分开成两个旋钮是为了分层量。"""
 
 
-def slot_fits(a: tuple[float, float, float, float, float, float],
-              b: tuple[float, float, float, float, float, float],
+def slot_fits(a: tuple[float, float, float, float, float, float, float, float],
+              b: tuple[float, float, float, float, float, float, float, float],
               W: int, anchor: bool, mutual_x: bool = False,
               span_ratio: float = SLOT_SPAN_RATIO, h_ratio: float = SLOT_H_RATIO) -> float | None:
     """两个区域/槽位的几何签名能不能算同一个版式槽位。返回 y 重叠度，不匹配返回 None。
 
-    签名是 region_geom 的 (cx, x0, x1, y0, y1, h)。判据见 stitch_slots 的说明。
+    签名是 region_geom 的 (cx, x0, x1, y0, y1, h, ch, v)。判据见 stitch_slots 的说明。
 
     `mutual_x`（`--slot-mutual-x`，默认关）把 x 判据从"除以较窄的"换成"除以较宽的"，
     也就是 `build_regions` 的 `--mutual-x` 在**缝合层**的对应物。
@@ -871,8 +919,8 @@ def slot_fits(a: tuple[float, float, float, float, float, float],
     return slot_fits_why(a, b, W, anchor, mutual_x, span_ratio, h_ratio)[0]
 
 
-def slot_fits_why(a: tuple[float, float, float, float, float, float],
-                  b: tuple[float, float, float, float, float, float],
+def slot_fits_why(a: tuple[float, float, float, float, float, float, float, float],
+                  b: tuple[float, float, float, float, float, float, float, float],
                   W: int, anchor: bool, mutual_x: bool = False,
                   span_ratio: float = SLOT_SPAN_RATIO, h_ratio: float = SLOT_H_RATIO) -> tuple[float | None, str]:
     """`slot_fits` 的可解释版：返回 `(y 重叠度或 None, 是哪一条拦下的)`。
@@ -883,8 +931,10 @@ def slot_fits_why(a: tuple[float, float, float, float, float, float],
     "**卡在哪一条**"才是决定要不要允许拆分/重分配的设计输入。
     同 `nameplate.explain()` 的做法。
     """
-    (cx, x0, x1, y0, y1, h), (scx, sx0, sx1, sy0, sy1, sh) = a, b
-    if h_ratio and max(h, sh) / max(1.0, min(h, sh)) > h_ratio:
+    (cx, x0, x1, y0, y1, h, ch, v), (scx, sx0, sx1, sy0, sy1, sh, sch, sv) = a, b
+    if not (v > 0.5 and sv > 0.5):      # y 方向的空间尺度：两边都是竖排的列才按框高（列长），否则按字号（region_geom）
+        h, sh = ch, sch
+    if h_ratio and max(ch, sch) / max(1.0, min(ch, sch)) > h_ratio:
         return None, f"字高比>{h_ratio:g}"
     if (x_overlap_ratio([x0, 0, x1, 1], [sx0, 0, sx1, 1], mutual_x) < 0.30
             and abs(cx - scx) > 0.08 * W):
@@ -917,7 +967,7 @@ def slot_geom_median(runs: list[Run], win_regions: list[dict], members: list[int
     别再走第二遍；要走通得先治"贪心依赖顺序"本身。
     """
     gs = [region_geom(runs, win_regions[w]["runs"]) for w in members]
-    return tuple(statistics.median(g[k] for g in gs) for k in range(6))
+    return tuple(statistics.median(g[k] for g in gs) for k in range(8))
 
 
 def moving_share(runs: list[Run], ids: list[int]) -> float:
@@ -981,19 +1031,19 @@ def stitch_slots(runs: list[Run], win_regions: list[dict], W: int, H: int,
                    key=lambda i: (mv[i] >= move_seed_last if move_seed_last > 0 else False,
                                   -len(win_regions[i]["runs"])))
     slots: list[list[int]] = []
-    cent: list[tuple[float, float, float, float, float, float]] = []
+    cent: list[tuple[float, float, float, float, float, float, float, float]] = []
     for i in order:
-        cx, x0, x1, y0, y1, h = region_geom(runs, win_regions[i]["runs"])
+        g = region_geom(runs, win_regions[i]["runs"])
         best, best_d = -1, None
         for k, sig in enumerate(cent):
-            yo = slot_fits((cx, x0, x1, y0, y1, h), sig, W, anchor, mutual_x, span_ratio, h_ratio)
+            yo = slot_fits(g, sig, W, anchor, mutual_x, span_ratio, h_ratio)
             if yo is None:
                 continue
             if best_d is None or 1 - yo < best_d:
                 best, best_d = k, 1 - yo
         if best < 0:
             slots.append([i])
-            cent.append((cx, x0, x1, y0, y1, h))
+            cent.append(g)
         else:
             slots[best].append(i)
             cent[best] = sig_of(slots[best])
@@ -1543,13 +1593,13 @@ srt_ts = srtio.fmt_ts_us
 
 
 def row_order(rs: list[Run]) -> list[Run]:
-    """段里 run 的导出行序：先分行（`tracksio.row_index`），行从上往下，行内按左沿从左往右。
+    """段里 run 的导出行序：先分行（`tracksio.row_index`），行从上往下，行内按左沿从左往右；竖排的列从右往左、列内从上往下（`tracksio.reading_key`）。
     同一行被破折号之类断成两个框时，按 `(cy, cx)` 排会让纵向中心略高的后半截排到前面
     （2026-10-05 魔裁：「大魔女を——ユキを殺す【犯人】は、」排成两行、还颠倒）。
     先按 `(cy, cx, t_start, text)` 定一个确定的初序：`segment_runs` 拿 id 列表判"内容没变"，同一组 run 每次都要排成一样。"""
     rs = sorted(rs, key=lambda r: (r.cy, r.cx, r.t_start, r.text))
-    row = tracksio.row_index([r.box for r in rs])
-    return [r for _, _, _, r in sorted((row[i], r.box[0], i, r) for i, r in enumerate(rs))]
+    row = tracksio.row_index([r.box for r in rs], [r.text for r in rs])
+    return [r for _, _, _, r in sorted((row[i], tracksio.reading_key(r.box, r.text), i, r) for i, r in enumerate(rs))]
 
 
 def segment_runs(rs: list[Run]) -> list[tuple[int, int, list[Run]]]:
@@ -1628,10 +1678,9 @@ def head_similar(a: str, b: str) -> bool:
 
 
 def x_overlapped(r: Run, q: Run) -> bool:
-    """横向重叠至少是较窄那个的一半：同一行上的"同一处字"（打字机从同一个左沿往右长、居中的往两边长都满足）；
-    同一高度、横向离得远的两处同样的字（两个头像下的 `Lv.90`）不满足。"""
-    ov = min(r.box[2], q.box[2]) - max(r.box[0], q.box[0])
-    return ov >= 0.5 * max(1e-9, min(r.box[2] - r.box[0], q.box[2] - q.box[0]))
+    """顺着行的方向重叠至少是较短那个的一半（`tracksio.along_overlap`，竖排的列按上下比）：同一行上的"同一处字"
+    （打字机从同一个左沿往右长、居中的往两边长都满足）；同一高度、横向离得远的两处同样的字（两个头像下的 `Lv.90`）不满足。"""
+    return tracksio.along_overlap(r.box, q.box, r.text, q.text) >= 0.5
 
 
 def continues(r: Run, q: Run, tol: int) -> bool:
@@ -1640,7 +1689,7 @@ def continues(r: Run, q: Run, tol: int) -> bool:
     同句合并认"接上"、`seg_hide` 认半截行都用它（同一个容差）。"""
     if q is r:
         return True
-    if r.moving or q.moving or not tracksio.same_row(r.box, q.box) or not x_overlapped(r, q) or abs(q.t_start - r.t_end) > tol:
+    if r.moving or q.moving or not tracksio.same_row(r.box, q.box, r.text, q.text) or not x_overlapped(r, q) or abs(q.t_start - r.t_end) > tol:
         return False
     a = _sq(r.text)
     return head_similar(r.text, q.text) or (bool(a) and evalkit.content_len(a) < BODY_MIN_CHARS and _sq(q.text).startswith(a))
@@ -1653,7 +1702,7 @@ FRAGMENT_COVER = 0.9
 def fragment_of(r: Run, q: Run) -> bool:
     """`r` 是 `q` 的碎片：同一行、`r` 的框 ≥ `FRAGMENT_COVER` 落在 `q` 的框里、文本是 `q` 的一段（det 偶尔在一两个采样点
     把一行切出一块，星铁 `ずばり地脈共鳴！この` 是 `でもご心配なく、…ずばり地脈共鳴！この` 的后半截）。"""
-    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box):
+    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box, r.text, q.text):
         return False
     a, b = _sq(r.text), _sq(q.text)
     if not a or len(a) >= len(b) or a not in b:
@@ -1666,7 +1715,7 @@ def same_line_text(r: Run, q: Run, tol: int) -> bool:
     """`r` 和 `q` 是同一处的同一行字（对称）：都不在动、同一行、横向重叠过半，而且文本是一回事——相同、一方是另一方的开头
     （`head_similar`，OCR 抖动容 15%），或一方是打字机首帧的 1–2 字碎片、正好在另一方出现时消失（`continues`）。
     `seg_hide` 在这样的两条里按同一个全序留一条（`seg_hide`），所以谁顶替谁和选代表不会打架。"""
-    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box) or not x_overlapped(r, q):
+    if q is r or r.moving or q.moving or not tracksio.same_row(r.box, q.box, r.text, q.text) or not x_overlapped(r, q):
         return False
     a, b = _sq(r.text), _sq(q.text)
     if a == b or head_similar(r.text, q.text) or head_similar(q.text, r.text):
@@ -1733,7 +1782,7 @@ def can_join(prev: tuple[int, int, list[Run]], cur: tuple[int, int, list[Run]], 
                 return False
         else:
             names_p = [r for r in at_cut if is_name(r)]
-            return bool(names_p) and all(any(q is r or (tracksio.same_row(r.box, q.box) and text_sim(r.text, q.text) >= NAME_CHANGE_SIM)
+            return bool(names_p) and all(any(q is r or (tracksio.same_row(r.box, q.box, r.text, q.text) and text_sim(r.text, q.text) >= NAME_CHANGE_SIM)
                                              for q in cr if is_name(q)) for r in names_p)
         held = []
     typed = [q for q in cb for r in at_cut if q is not r and continues(r, q, tol)]
@@ -1787,14 +1836,14 @@ def seg_hide(s: int, e: int, rs: list[Run], tol: int) -> tuple[set[int], set[int
     hit = _HIDE_CACHE.get(key)
     if hit is not None and all(a is b for a, b in zip(hit[0], rs)):
         return hit[1]
-    row = dict(zip((id(r) for r in rs), tracksio.row_index([r.box for r in rs])))
+    row = dict(zip((id(r) for r in rs), tracksio.row_index([r.box for r in rs], [r.text for r in rs])))
     frag = {id(r) for r in rs if not r.moving and any(fragment_of(r, q) for q in rs)}
     rep: list[Run] = []
     partial: set[int] = set()
     for r in sorted(rs, key=lambda r: (id(r) in frag, -r.t_end, -(r.t_end - r.t_start), r.t_start, r.text)):
         # 碎片的宿主自己被藏了（代表是抖动版、子串不成立）：同一处有看得见的代表就照样藏，不让半行露出来
         if any(same_line_text(r, q, tol) or fragment_of(r, q)
-               or (id(r) in frag and tracksio.same_row(r.box, q.box) and x_overlapped(r, q)) for q in rep):
+               or (id(r) in frag and tracksio.same_row(r.box, q.box, r.text, q.text) and x_overlapped(r, q)) for q in rep):
             partial.add(id(r))
         else:
             rep.append(r)
@@ -2378,7 +2427,7 @@ def ui_footprints(runs: list[Run], frame_us: int, args, observable=None) -> set[
         if (m["share"] < args.ui_fp_share or m["wvar"] > args.ui_fp_wvar
                 or uigate.is_nameplate(m) or m.get("in_band")):
             continue
-        static_ui = m["churn"] <= args.ui_fp_churn and m["clen"] <= args.ui_fp_clen
+        static_ui = m["churn"] <= args.ui_fp_churn and m["clen"] <= args.ui_fp_clen and m["top_share"] >= args.ui_fp_top
         dyn_hud = m["dig"] >= 0.3 and m["clen"] <= 6
         if static_ui or dyn_hud:
             out |= {it.key for it in f.items if uigate.np_window(it.t0, t_lo, win_us) not in np_wins}
@@ -2479,7 +2528,7 @@ def defaults_fingerprint(ap: argparse.ArgumentParser) -> tuple[str, str]:
 # `DIRTY_PATHS` / `git_head` / 指纹的实现 2026-09-21 搬进了 `flowocr.provenance`（文件头讲了为什么并成一份）；
 # 这里只留带默认表的入口，`gamescript` / `scriptmatch` / `refine_boundaries` 仍借 `bt.code_fp` / `bt.git_head` 用。
 
-CODE_FP_FILES = ("src/flowocr/analyze/build_tracks.py", "src/flowocr/artifacts/evalkit.py", "src/flowocr/artifacts/obsio.py", "src/flowocr/artifacts/srtio.py", "src/flowocr/artifacts/tracksio.py",
+CODE_FP_FILES = ("src/flowocr/analyze/build_tracks.py", "src/flowocr/artifacts/evalkit.py", "src/flowocr/artifacts/obsio.py", "src/flowocr/artifacts/srtio.py", "src/flowocr/artifacts/tracksio.py", "src/flowocr/artifacts/textdir.py",
                  "src/flowocr/analyze/uigate.py", "src/flowocr/analyze/align.py", "src/flowocr/output/run_srt.py",
                  "src/flowocr/provenance.py", "src/flowocr/textfold.py",
                  # ⚠ 下面三个是**函数里懒 import** 的（自选范围的切点 / 可观察时长；`--cluster learned` / `lines`），同样决定产物——
@@ -2593,6 +2642,7 @@ def apply_matcher_patch(ap: argparse.ArgumentParser, argv: list[str] | None = No
         k, v = kv.split("=", 1)
         ctx[k] = v
     mod = extensions.load(args.matcher, "matcher")
+    extensions.warn_unknown_keys(mod, args.matcher, "--matcher-ctx", {kv.split("=", 1)[0] for kv in args.matcher_ctx})
     patch = dict(getattr(mod, "cluster_patch", lambda *_a, **_k: {})(ctx, None) or {})
     known = {a.dest for a in ap._actions if a.option_strings}
     unknown = sorted(set(patch) - known)
@@ -2767,6 +2817,8 @@ def make_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ui-fp-wvar", type=float, default=0.13, help="框位门：框宽离散上限")
     ap.add_argument("--ui-fp-churn", type=float, default=0.06, help="框位门：文本翻动上限")
     ap.add_argument("--ui-fp-clen", type=int, default=13, help="框位门：内容字中位上限")
+    ap.add_argument("--ui-fp-top", type=float, default=uigate.TOP_SHARE,
+                    help="框位门：静态 UI 里最常见那句至少占框位在屏时长的比例（同一处轮换的说明字不算 UI；0 = 不看）")
     ap.add_argument("--no-nameplate-mark", dest="nameplate_mark", action="store_false",
                     help="不给 run 打名牌标（默认打）。判据在 flowocr.analyze.uigate.pick_nameplates："
                          "在正文带上方一档 + 时长 >= 台词 × 比例 + 词表小，按时间分窗")
@@ -2822,17 +2874,21 @@ def settle_refine(doc: dict, obs_path: Path, tag: str, salvage_end: bool = REFIN
         print("回抠（--refine auto）：obs 里没有在线回抠的证据（旧 obs 或 --refine-aux noop），产物停在采样级；"
               "要帧级时刻和打字机效果，用默认设置重跑阶段 1（run_ocr2 默认在线量证据），再建轨")
         return False
+    if meta.get("frame_key") != "t_us":
+        # 帧身份 2026-11-23 改成按帧自己的时间戳（frame-pts 计划）：旧 obs 的证据按帧号记，结算不了；`--refine off` 照读（只用 t_us）
+        raise SystemExit(f"回抠（--refine auto）：{obs_path} 的帧身份是旧的帧号，重跑阶段 1"
+                         f"（要采样级的产物就加 --refine off）")
     fps = float(meta["src_fps"])
     print("回抠（--refine auto，读 obs 里的证据，不开视频）：", flush=True)
     try:
-        st = RB.refine_tracks(doc, decoder="obs", fps=fps, obs=obs_path, obs_code_fp=meta.get("code_fp", ""),
+        st = RB.refine_tracks(doc, fps=fps, obs=obs_path, obs_code_fp=meta.get("code_fp", ""),
                               salvage_stale_end=salvage_end)
     except (SystemExit, Exception) as exc:
         # 有证据却结算不了（一条都认领不到 = obs 和轨对不上；或证据行坏了抛 KeyError / ValueError）：tracks.json 还没写，
         # 不会留下被驱动当缓存复用的采样级产物（2026-09-25 / 26 复查）
         raise SystemExit(f"回抠（--refine auto）结算失败：{exc}\n  没写 {tag}-tracks.json（目录里的区域 SRT 是采样级的，"
                          f"别单独拿去用）。要采样级的产物就加 --refine off 重跑建轨") from None
-    for line in RB.summary_lines(tag, st, doc, fps, "obs"):
+    for line in RB.summary_lines(tag, st, doc, fps):
         print(line)
     return True
 
@@ -3023,7 +3079,7 @@ def main() -> int:
     if args.ui_gate != "text":
         print(f"常驻 UI（框位门）：{len(ui_fp)} / {len(runs)} 条 run"
               f"（占比 ≥{args.ui_fp_share:.0%}、框宽离散 ≤{args.ui_fp_wvar}、"
-              f"翻动 ≤{args.ui_fp_churn}、内容字 ≤{args.ui_fp_clen}；分母是**时间**不是 cue 数）")
+              f"翻动 ≤{args.ui_fp_churn}、内容字 ≤{args.ui_fp_clen}、最常见那句占 ≥{args.ui_fp_top:.0%}；分母是**时间**不是 cue 数）")
     # 振り仮名：全局按几何标（`ruby_runs`），和框位 UI 一样在剔 UI 的导出里剔（`tracksio.cue_lines`）
     ruby = ruby_runs(runs) if args.ruby_mark else set()
     if ruby:

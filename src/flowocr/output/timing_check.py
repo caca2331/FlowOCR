@@ -159,13 +159,14 @@ def chars(evs: list[dict], step: int, pool: list[dict] | None = None) -> int:
 
 
 def _same_place(a: S.Item, b: S.Item) -> str | None:
-    """两条在不在同一处：各取成员拼成的行，有一对行同一行、横向相交就在。不在返回 None；在的话返回 `"short"`（重叠的
+    """两条在不在同一处：各取成员拼成的行，有一对行同一行、顺着行相交（`tracksio.along_overlap`：竖排的列比上下）就在。不在返回 None；在的话返回 `"short"`（重叠的
     只是两边各一行 `A1_SHORT_ROW` 字以内的短行）或 `"long"`。短行照报、只是标出来：多是一直挂着的名字、标签
     （zzz / hsr 的 tracks 里名牌没单独成轨时，「リン」在连续几句里一直挂着；复核抽样的没错 14 条里 13 条是这种），
     但排除掉会丢真错（OCR 噪声被画出来的「1階 2階」「5」之类，调参抽样里 4 条），疑点工具宁可多报（owner 2026-10-07）。"""
     rows_a, rows_b = tracksio.rows_of_events(list(a.events)), tracksio.rows_of_events(list(b.events))
     pairs = [(ra, rb) for ra in rows_a for rb in rows_b
-             if tracksio.same_row(ra["box"], rb["box"]) and min(ra["box"][2], rb["box"][2]) > max(ra["box"][0], rb["box"][0])]
+             if tracksio.same_row(ra["box"], rb["box"], ra["text"], rb["text"])
+             and tracksio.along_overlap(ra["box"], rb["box"], ra["text"], rb["text"]) > 0]
     if not pairs:
         return None
     return "short" if all(max(len(textfold.bare(ra["text"])), len(textfold.bare(rb["text"]))) <= A1_SHORT_ROW
@@ -353,7 +354,7 @@ def rule_b1(items: list[S.Item], doc: dict, ctx: Context) -> list[Suspect]:
         if len(ms) < 2:
             continue
         first = ms[0]
-        rest = [e for e in ms[1:] if not tracksio.same_row(e["box"], first["box"])]
+        rest = [e for e in ms[1:] if not tracksio.same_row(e["box"], first["box"], e["text"], first["text"])]
         if not rest:
             continue
         full = first.get("t_full") or first.get("t_full_sampled") or first["t_start"]

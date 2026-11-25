@@ -105,7 +105,7 @@ def sample(L, n: int, seed: int) -> list[dict]:
         return rnd.choices(c, [weight[j] for j in c])[0] if c else None
 
     def near(i: int) -> int | None:
-        _, x0, x1, y0, y1, h = geom[i]
+        _, x0, x1, y0, y1, h, _, _ = geom[i]     # h 是框高（空间尺度）
         c = [j for j in idx if weight[j] and arms[BASE][j] != arms[BASE][i] and wr[j]["win"] != wr[i]["win"]
              and bt.span_overlap(y0, y1, geom[j][3], geom[j][4], min(h, geom[j][5])) >= 0.5
              and min(x1, geom[j][2]) > max(x0, geom[j][1])]

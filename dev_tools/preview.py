@@ -40,7 +40,7 @@ from pathlib import Path
 
 from flowocr import extensions
 from flowocr.artifacts import matchedio, tracksio
-from flowocr.output import render
+from flowocr.output import export, render
 from flowocr.output.presets import _overlay
 from flowocr.typeset import core
 from flowocr.provenance import local
@@ -269,7 +269,7 @@ def cut_clip(video: Path, ass: Path, out: Path, start: float, duration: float,
         if mode == "burn":
             shutil.copyfile(ass, Path(d) / "overlay.ass")
             cmd += ["-copyts"]
-            graph = "[0:v]subtitles=overlay.ass,setpts=PTS-STARTPTS[v]"
+            graph = f"[0:v]{export.sub_filter('overlay.ass')},setpts=PTS-STARTPTS[v]"
         else:
             shifted = shift_ass(ass.read_text(encoding="utf-8-sig"), seek + t0, duration)
             (Path(d) / "overlay.ass").write_text(slice_ass(shifted), encoding="utf-8")   # 切段：见 slice_ass（VLC 3）

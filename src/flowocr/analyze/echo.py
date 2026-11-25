@@ -25,12 +25,13 @@ SRT 一类预设默认不出 `same_time` / `log`（`matchedio.SRT_DROP_ECHOES`�
 from __future__ import annotations
 
 import bisect
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
 from flowocr.artifacts import matchedio
-from flowocr.extract.framegrid import TimeGrid
+from flowocr.extract.framegrid import DELTA_US
 
 NEAR = 2.0
 """同一次出现：同一行的两次认领时段重叠或相隔不超过这么多秒（同 `scriptmatch.MERGE_GAP`）。"""
@@ -99,32 +100,35 @@ def occurrences(cs: list[Claim]) -> list[list[Claim]]:
     return out
 
 
+LATE_MARGIN = 0.001
+"""格号的回退量 c = 一个源帧 − 这么多秒（`grid_of`）。它比 δ（1000.5 µs）小半微秒：桶里最晚的采样帧（早于 `T_k − δ + 一个源帧`）
+减去 c 之后仍比目标点 `T_k` 早半微秒，落回自己那一格。"""
+
 Grid = tuple[Callable[[float], int], int]
 """(起点秒 -> 它被采到的那一格的格号, `LOG_WINDOW` 折成几格)，`grid_of` 给，"这一刻"按格号比。"""
 
 
 def grid_of(doc: dict) -> Grid | None:
-    """tracks 的采样网格（`Grid`）：网格取 obs 带进 `meta` 的 `sample_grid`，旧产物退到等距的 `stride`，再退到 `src_fps` / `sample_fps`；
-    都没有（只有 SRT 的、很旧的产物）返回 None，"这一刻"照原来按秒比。
-    格号是起点所在帧往后取的最近一格：采样级的起点就在格上；回抠过的起点落在它被采到的那一格之前不到一个间隔（融合把首字夹在
-    [采样起点 − 一个间隔, 采样起点]），往后取回到的正是那一格。
-    两处会差一格：融合把首字恰好放在下界（前一格那一帧，gi1 事件 2680 从 673.5 s 回抠到 673.0 s）时还原成前一格——那是融合估计字在那一帧已经出现（估计，不是逐帧证实），按估计的出现时刻算前一格也说得通；
-    时刻按名义帧率换成帧号（`round(t × src_fps)`，同网格的帧号约定），pts 和名义帧率差出半帧以上的素材上落在边界的起点也会差一格。
-    要分毫不差得在产物里留回抠前的采样起点，没做：前一种按估计的出现时刻归格本身说得通，后一种要素材的时钟本来就偏。"""
+    """tracks 的采样格（`Grid`）：用 meta 的 `sample_fps`（没有的话——只有 SRT 的、很旧的产物——返回 None，"这一刻"照原来按秒比），
+    `src_fps` 只作参考帧率（frame-pts 计划第 9 节）。
+
+    格号是 `ceil((t − c) · sample_fps)`，c = max(δ, 一个源帧 − 1 ms)（δ 同取帧的桶号，`framegrid.DELTA_US`；缺 `src_fps` 时 c = δ）。
+    为什么不是 c = δ：采样帧是每个桶的第一帧，比目标点最多晚不到一个源帧；采样帧率和源帧率不整除时（29.97 fps 按 2 fps 采，竖屏素材大多是）
+    桶里晚到的采样帧会被 `ceil((t − δ)·f)` 映射到下一格、和下一格里准点的采样帧撞成"同一刻"。
+    * 恒定帧率素材上：采样帧 t 早于 `T_k − δ + 一个源帧`，所以 `t − c < T_k`，采样级的起点都映射回自己那一格（60 fps 按 2 fps 采时和
+      旧的帧网格规则逐个相同）。回抠过的起点（融合把首字夹在 [上一个采样帧, 本采样帧]、吸附到辅助流的目标点）只要严格晚于上一个采样帧，
+      就至少晚它一个源帧，`t − c` 越过上一个目标点、映射回本格；正好等于上一个采样帧时还原成前一格（同旧行为）。
+    * 差一格的情形：帧间隔比名义间隔长（pts 按毫秒取整的抖动、VFR、缺口）时，晚到将近一个间隔的采样帧仍可能映射到下一格；
+      辅助流的目标点不落在真实帧上的素材（名义帧率不可信的 VFR）上，紧跟上一个采样帧的回抠起点可能还原成前一格。
+      两者都只在"同一次面板打开"的判断边上差一格，对它无害。"""
     m = doc.get("meta") or {}
-    fps = m.get("src_fps")
+    fps = m.get("sample_fps")
     if not fps:
         return None
-    if m.get("sample_grid"):
-        g = TimeGrid(*m["sample_grid"])
-    elif m.get("stride"):
-        g = TimeGrid.every(int(m["stride"]))
-    elif m.get("sample_fps"):
-        g = TimeGrid.for_rate(float(fps), float(m["sample_fps"]))
-    else:
-        return None
     fps = float(fps)
-    return (lambda t: g.index(g.ceil(round(t * fps)))), round(LOG_WINDOW * 1e6 / g.interval_us(fps))
+    src = m.get("src_fps")
+    c = max(DELTA_US / 1e6, 1.0 / float(src) - LATE_MARGIN) if src else DELTA_US / 1e6
+    return (lambda t: math.ceil((t - c) * fps)), round(LOG_WINDOW * fps)
 
 
 def in_window(keys: list, x, half) -> tuple[int, int]:

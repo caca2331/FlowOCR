@@ -14,7 +14,7 @@
   每个事件只画一次。一条里各行出现得不一样早时，阶段 3 写逐行时刻 `rowt`，阶段 4 按行显字（`row_times`）；
 * `project_items`：一个匹配条目一条，译文照剧本换行分行（`wrap_lines`），正文按原文整块摆行（`layout.place_rows`）。
 
-一条条目写成字幕稿里的一行（源行）：Style 按角色、Actor 是区域号、Effect 是阶段 4 要的其余参数 `fo:…`
+一条条目写成字幕稿里的一行（源行；画原文的条目里有竖排的列时，相邻的列一块单独写成一行 `col` 行，`export_script`）：Style 按角色、Actor 是区域号、Effect 是阶段 4 要的其余参数 `fo:…`
 （原文框、打字机时长、轨迹、`was`…，格式见 artifacts.md 的字幕稿一节）；正文是一个 tag 块（`\\an` `\\pos` `\\fs` `\\fad`）+ 纯文字，
 剧本带样式（`style=on`，默认）时字中间另有剧本的粗体 / 斜体 / 下划线 / 删除线 / 字色标签（`flowocr.richtext`），
 带 Ruby（`ruby=on`，默认）时另有 Ruby 的注释块 `{ruby:读音}正文{/ruby}`（渲染器不画；阶段 4 把它画成正文上方的小字，`flowocr.typeset.ruby`）。
@@ -37,7 +37,7 @@ from flowocr import provenance
 from flowocr import richtext
 from flowocr import textfold
 from flowocr.analyze import textbox as tbox     # 只用它的字对行（`align` / `ROW_IN_LINE`），和匹配器认整块的行同一把尺；analyze 不 import 阶段 3
-from flowocr.artifacts import matchedio, tracksio
+from flowocr.artifacts import matchedio, textdir, tracksio
 from flowocr.output import export, layout
 from flowocr.typeset import assfile
 
@@ -303,7 +303,7 @@ def tracks_items(doc: dict, keep: str, per_event: bool = False) -> list[Item]:
             rows = tracksio.rows_of_events(group)
             # 半截行只在它正好在这一行出现时消失（± 一个采样间隔）才算这一行的首字：隔了几秒才打出来的（wuwa 广告横幅），
             # 拿半截行的起点会把这一行的首字往前拉、把整句的打字机节奏拖长
-            row_leads = [[ld for ld in leads if tracksio.same_row(ld["box"], r["box"])
+            row_leads = [[ld for ld in leads if tracksio.same_row(ld["box"], r["box"], ld["text"], r["text"])
                           and abs(min(e["t_start"] for e in r["events"]) - ld["t_end"]) <= doc["frame_us"]] for r in rows]
             # 没挂到任何一行上的半截行（回抠之后和后续之间隔开了：绝区零 244 s 打到一半黑场 0.8 s 再整句出来），
             # 它是真在屏上单独显示过的一段，照原样单独画，不藏
@@ -312,7 +312,7 @@ def tracks_items(doc: dict, keep: str, per_event: bool = False) -> list[Item]:
                 if id(ld) not in used and ld["id"] not in done:
                     # 只画到同一处的那行出现之前：同文本的重复读数（长的被藏、短的当代表）后半段和代表重叠，画两遍底板会叠深
                     later = [min(e["t_start"] for e in r["events"]) for r in rows
-                             if tracksio.same_row(ld["box"], r["box"]) and min(e["t_start"] for e in r["events"]) > ld["t_start"]]
+                             if tracksio.same_row(ld["box"], r["box"], ld["text"], r["text"]) and min(e["t_start"] for e in r["events"]) > ld["t_start"]]
                     it = single(ld, False, cue["id"])
                     if later:
                         it = replace(it, end_us=min(it.end_us, min(later)))
@@ -431,7 +431,7 @@ def block_leads(it: dict, doc: dict, block: list[list[float]], leads: dict[int, 
     for k, (b, src) in enumerate(zip(block, srcs)):
         texts = [lines[k]] if len(lines) == len(block) else lines
         row = [doc["events"][int(src[6:])]] if src.startswith("event:") else []
-        row += [doc["events"][i] for i in cand if tracksio.same_row(doc["events"][i]["box"], b)
+        row += [doc["events"][i] for i in cand if tracksio.same_row(doc["events"][i]["box"], b, doc["events"][i]["text"], "".join(texts))
                 and any(tbox.align(doc["events"][i]["text"], t)[0] >= tbox.ROW_IN_LINE for t in texts)]
         out.append(row)
     return out
@@ -896,6 +896,82 @@ def draft_line(it: Item, size: int, W: int, H: int, widths: dict, tw_us: int, fi
     return f"Dialogue: 0,{t0},{t1},{style_of(it)},{actor},0,0,0,{assfile.encode_fo(fo)},{head}{body}"
 
 
+def columns(it: Item) -> list[bool] | None:
+    """画原文的条目（`not translated`：tracks 的条目、matched 退回画的 OCR 原文）逐行判是不是竖排的一列（`textdir.vertical`），
+    不论条目是句条目还是单个事件；一列都没有、或是译文 / 面板的条目是 None（照原样写一条）。matched 的译文条目不判：`rows` 是原文整块、正文是译文。"""
+    if it.translated or it.kind == "block":
+        return None
+    flags = [textdir.vertical(r, ln) for r, ln in zip(it.rows, it.lines)]
+    return flags if any(flags) else None
+
+
+def part(it: Item, keep: list[int]) -> Item:
+    """条目里 `keep` 这几行组成的半条（拆横竖混排的条目用）：框、正文、逐行的事件跟着取，`events` 是这几行的事件（写 `ev` 用）。"""
+    def pick(xs):
+        return [xs[i] for i in keep] if len(xs) == len(it.rows) else xs
+    events = [e for i in keep for e in it.row_events[i]] if len(it.row_events) == len(it.rows) else it.events
+    return replace(it, rows=pick(it.rows), lines=pick(it.lines), events=events,
+                   row_events=pick(it.row_events), row_leads=pick(it.row_leads))
+
+
+def segs_of(segs: list | None, keep: list[int], n: int) -> list | None:
+    """逐行的几段（`rowt` / `grow`，条目有 `n` 行）里 `keep` 这几行的；段数和行数对不上的原样返回。"""
+    return [segs[i] for i in keep] if segs is not None and len(segs) == n else segs
+
+
+def col_ratio(doc: dict) -> float:
+    """拆 `col` 行用的列宽比门：建轨时并区用的那个（`--region-h-ratio`，记在 tracks 的 `provenance.args` 里），没记时 `textdir.COL_W_RATIO`。"""
+    v = ((doc.get("provenance") or {}).get("args") or {}).get("region_h_ratio")
+    return textdir.COL_W_RATIO if v is None else float(v)
+
+
+def col_groups(rows: list[list[float]], flags: list[bool], ratio: float) -> list[list[int]]:
+    """条目里竖排的列（`flags` 为真的行，条目里的顺序就是从右往左）按建轨的相邻判据（`textdir.columns_adjacent`，传各列自己的框 `textdir.col_geom`）连成块：
+    返回各块的行下标，块内保持原来的顺序，块按各自第一列的先后排。一个条目里离得远的几列（地图上的小标签和一整列说明字）由此各成一块。"""
+    idx = [i for i, v in enumerate(flags) if v]
+    geo = [textdir.col_geom(rows[i]) for i in idx]
+    root = list(range(len(idx)))
+
+    def find(i: int) -> int:
+        while root[i] != i:
+            root[i] = root[root[i]]
+            i = root[i]
+        return i
+    for i in range(len(idx)):
+        for j in range(i + 1, len(idx)):
+            if textdir.columns_adjacent(geo[i], geo[j], ratio):
+                root[find(j)] = find(i)
+    groups: dict[int, list[int]] = {}
+    for k in range(len(idx)):
+        groups.setdefault(find(k), []).append(idx[k])
+    return sorted(groups.values(), key=lambda g: g[0])
+
+
+def draft_col(it: Item, size: int, tw_us: int, fin: int, fout: int, why: str | None,
+              rowt: list[tuple[int, int]] | None = None) -> str:
+    """竖排的几列 → 字幕稿里一行带 `col` 的源行：`box` 是从右往左的列，正文按列 `\\N` 分开（第 i 段对第 i 列），
+    阶段 4 按译文内容选竖排原位或横排（`flowocr.typeset.vertical`）。预览不画竖排：整块 `\\an5\\pos` 在各列并集的中心，字号按原文的字距（`layout.col_size`；`was` 里记的这个字号也是阶段 4 自动定字号的起点）。
+    一行只装相邻的一块列（`col_groups`）；效果（`tw`、`\\fad`）是整个条目算的，`rowt` 是这几列的那几段；不写 `grow`（阶段 4 的底板不跟着竖排的字长）。"""
+    t0, t1 = export.ass_time(it.start_us, True), export.ass_time(it.end_us, False)
+    actor = f"r{it.region}" if it.region >= 0 else ""
+    ev = list(dict.fromkeys(e["id"] for e in it.events if "id" in e))
+    u = layout.union(it.rows)
+    x, y = (u[0] + u[2]) / 2, (u[1] + u[3]) / 2
+    if it.boxes:
+        where = layout.pos_tag(x, y, (it.start_us, it.end_us, tuple(it.boxes[0][1][:2]), tuple(it.boxes[-1][1][:2])),
+                               (it.rows[0][0], it.rows[0][1]))
+    else:
+        where = "\\pos(%.0f,%.0f)" % (x, y)
+    owned = where[1:].replace("(", ":", 1).rstrip(")").replace(",", " ")
+    fo = {"ev": " ".join(map(str, ev)) or None, "key": it.key, "box": rows_param(it.rows), "col": True, "fit": "src", "plate": True,
+          "path": path_param(it.boxes) if it.boxes else None, "tw": tw_us // 1000 or None, "rowt": grow_param(rowt),
+          "off": not it.main, "why": why, "was": f"{owned}|fs:{size}|an:5"}
+    fad = "\\fad(%d,%d)" % (fin // 1000, fout // 1000) if fin or fout else ""
+    head = "{\\an5%s\\fs%d%s%s}" % (where, size, bord(size), fad)
+    body = "\\N".join(export.ass_text(ln.replace("\n", "")) for ln in it.lines)      # 一列一段：列里的换行不算分列
+    return f"Dialogue: 0,{t0},{t1},{style_of(it)},{actor},0,0,0,{assfile.encode_fo(fo)},{head}{body}"
+
+
 def styled_lines(it: Item, lines: list[str]) -> list[str] | None:
     """把条目带样式的原句投回 `lines`（纯文字的行，`wrap_lines` 分好的）：每行插进规范写法的标签，
     样式的标签跨行时各行不成对（整条一起转成 ASS），Ruby 不跨行（`wrap_lines` 不拆它）。没有样式、或行里的字和原句对不上（用户扩展改过行）是 None，照纯文字写。"""
@@ -938,11 +1014,15 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
     * 位置：单行就是阶段 4 的位置；多行是整组的锚轴和几行的竖直中心（阶段 4 逐行摆，正文译文按 `view_rows` 摆出的行，预览里行距是字体的）；
       在动的写一个首点到末点的 `\\move` 供预览，精确轨迹在 `fo` 的 `path`；
     * 效果见 `effect_times`，打字机记成 `fo` 的 `tw`（正文保持纯文字）、淡入淡出写成 `\\fad`；
+    * 竖排的列（`columns`）：条目里的列按建轨的相邻判据连成块（`col_groups`），每块写成一行 `col` 行（`draft_col`）；横排的行另写一行（和没有列时一样）——
+      效果按整个条目算一次（起止、淡入淡出、`tw`），逐行的 `rowt` 分给各行、和各自的 `box` 一行对一行（`grow` 只给横排那行）；
+      横排那行的字号按它自己那几行算，每行 `col` 按它那几列原文自己的字距（`layout.col_size`，原文照原样一定放得回原列）。条目本身不拆（SRT、时间疑点不变）；
     * `fills`：样式的主色（`name_fills`，匹配器判过的名牌色），没给的样式是白字。"""
     W, H = doc["size"]
     frame_us = native_frame_us(doc)
     font = export.FONT_CN
-    widths = export.ink_widths([(font, k) for k in layout.EM_KEYS] + [(font, "\n".join(layout.width_keys(it.lines, it.kind == "block"))) for it in items])
+    widths = export.ink_widths([(font, k) for k in (*layout.EM_KEYS, *layout.COL_INK_KEYS)]
+                               + [(font, "\n".join(layout.width_keys(it.lines, it.kind == "block"))) for it in items])
 
     def size_of(it: Item) -> int:
         if it.kind == "block":
@@ -951,16 +1031,23 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
             tb = it.textbox or {}
             return layout.body_size(view_rows(it, H), it.lines, font, widths, tb.get("em"), tb.get("box_w"), W, it.le)
         return layout.fit_line(it.rows, it.lines, font, widths, it.translated, W)
-    sizes = [size_of(it) for it in items]
-    choice = [i for i, it in enumerate(items) if style_of(it) in ("Choice", "Offmain")]   # 按样式选：阶段 4 按样式推种类（`KIND_OF_STYLE`），两边一致
+    # 竖排的列单独成行（只动字幕稿，条目不变，SRT 和时间疑点照旧）：列按相邻连成块、一块一行 `col` 行，横排的行另成一行
+    dirs = [columns(it) for it in items]
+    flat = [it if d is None else part(it, [i for i, v in enumerate(d) if not v]) if not all(d) else None for it, d in zip(items, dirs)]
+    ratio = col_ratio(doc)
+    groups = [col_groups(it.rows, d, ratio) if d is not None else [] for it, d in zip(items, dirs)]
+    sizes = [size_of(h) if h is not None else 0 for h in flat]          # 横排那半条的字号；字号在拆分之后按半条算
+    csizes = [[layout.col_size([it.rows[i] for i in g], [it.lines[i] for i in g], font, widths) for g in gs] for it, gs in zip(items, groups)]
+    choice = [i for i, it in enumerate(items) if style_of(it) in ("Choice", "Offmain") and dirs[i] is None]   # 按样式选：阶段 4 按样式推种类（`KIND_OF_STYLE`），两边一致
     for i, s in zip(choice, layout.same_size([(items[i].start_us, items[i].end_us, items[i].rows[0]) for i in choice],
                                              [sizes[i] for i in choice])):
         sizes[i] = s
-    axes = layout.stacked_axes([(it.start_us, it.end_us, it.rows[0]) if stacks(it) else None for it in items],
-                               [max((layout.line_width(font, ln, widths) * sz for ln in it.lines), default=0.0) if stacks(it) else 0.0
-                                for it, sz in zip(items, sizes)], W)
+    stack = [stacks(it) and d is None for it, d in zip(items, dirs)]
+    axes = layout.stacked_axes([(it.start_us, it.end_us, it.rows[0]) if st else None for it, st in zip(items, stack)],
+                               [max((layout.line_width(font, ln, widths) * sz for ln in it.lines), default=0.0) if st else 0.0
+                                for it, sz, st in zip(items, sizes, stack)], W)
     lines_out, n = [], Counter()
-    for it, size, axis in zip(items, sizes, axes):
+    for it, size, axis, d, hz, gs, csize in zip(items, sizes, axes, dirs, flat, groups, csizes):
         n[it.kind] += 1
         got = "\n".join(styled_lines(it, it.lines) or ()) if it.kind != "block" else ""
         n["styled"] += richtext.select(got, ruby=False) != richtext.plain(got)
@@ -977,8 +1064,18 @@ def export_script(path: Path, items: list[Item], doc: dict, typewriter: bool = T
                            tw_us if rowt is None else max(1, it.end_us - it.start_us))
                 if it.kind != "block" else None)
         n["stacked"] += axis is not None
-        lines_out.append(draft_line(it, size, W, H, widths, tw_us, fin, fout,
-                                    effect_why(it, doc, tw_us, fin, fout) if why else None, font, grow, rowt, axis))
+        reason = effect_why(it, doc, tw_us, fin, fout) if why else None
+        if d is None:
+            lines_out.append(draft_line(it, size, W, H, widths, tw_us, fin, fout, reason, font, grow, rowt, axis))
+            continue
+        # 效果按整个条目算了一次（起止、淡入淡出、tw），逐行的 rowt 分给各行、和各自的 box 一行对一行；grow 只给横排那行
+        n["col"] += 1
+        if hz is not None:
+            keep = [i for i, v in enumerate(d) if not v]
+            lines_out.append(draft_line(hz, size, W, H, widths, tw_us, fin, fout, reason, font,
+                                        segs_of(grow, keep, len(d)), segs_of(rowt, keep, len(d))))
+        for g, cs in zip(gs, csize):
+            lines_out.append(draft_col(part(it, g), cs, tw_us, fin, fout, reason, segs_of(rowt, g, len(d))))
     head = {"FlowOCR Script": FORMAT_VERSION, **(info or {})}
     Path(path).write_text(export.ass_doc(W, H, style_lines(font, fills), lines_out, info=head), encoding="utf-8")
     return n, widths

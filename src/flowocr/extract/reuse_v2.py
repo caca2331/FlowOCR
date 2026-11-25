@@ -26,8 +26,6 @@ import time
 
 import numpy as np
 
-from flowocr.extract import framesource          # `pts_frame`：obs 的 `frame` 认 pts（判据只有那一份）
-
 _PUNCT = re.compile(r"[\W_]+")
 
 
@@ -118,7 +116,7 @@ class RecoverTask:
 
 class Chain:
     __slots__ =("box", "text", "conf", "age", "last_seq", "pending", "cache_bytes", "ended_at", "uid", "last_row",
-                 "last_idx", "inflight", "confirmed", "read_w", "severed")
+                 "last_us", "inflight", "confirmed", "read_w", "severed")
 
     def __init__(self, box, text, conf, seq):
         self.box, self.text, self.conf, self.age, self.last_seq = box, text, conf, 0, seq
@@ -127,7 +125,7 @@ class Chain:
         self.ended_at: int | None = None
         self.uid = next(_UID)                  # 两遍合一遍（edge_refine）按它认链：id() 会被回收复用
         self.last_row: dict | None = None
-        self.last_idx = -1
+        self.last_us = -1          # 末次观测那个采样帧的 t_us（链断时交给回抠：结尾窗的模板帧）
         self.inflight = 0
         """这条链上**还没结算的真读**有几个（`--rec-window` 的窗口里才会大于 0）。见 `text_pending`。
 
@@ -155,7 +153,6 @@ class Chain:
 
 class ReuseV2:
     def __init__(self, args, corr_fn, estimate_shift_fn, rec_one):
-        self.src_fps = 0.0        # run_ocr2 起完就填（obs 的 `frame` 认 pts 要用）
         self.a = args
         self.corr, self.estimate_shift = corr_fn, estimate_shift_fn
         self.rec_one = rec_one                 # crop -> (text, conf)，回补用；调用方自己数 rec
@@ -401,15 +398,15 @@ class ReuseV2:
     # stage1 = 和"读回来的文本"无关的那一半（建行骨架、更新 box/age、占缓存、算哪些链结束）；
     # stage2 = 要文本的那一半（回填行、回补、给 edge 事件定 changed/same、推落盘水位）。
     # **判据只有一份**：`commit` 就是 stage1 + 马上 stage2，窗口模式只是把 stage2 推迟到窗口结算。
-    def commit(self, seq: int, idx: int, t_us: int, boxes, polys, decided, read_set: set[int],
+    def commit(self, seq: int, t_us: int, boxes, polys, decided, read_set: set[int],
                assign: dict, rec_crop, corr_of: dict, record_corr: bool, fh) -> int:
         """decided 含沿用的和真读的（真读的 age=0）。read_set = 真送进 rec 且拿到结果的框。返回这一次收尾的回补读数（同步时就是这一帧的）。"""
-        st = self.commit_stage1(seq, idx, t_us, boxes, polys, decided, read_set, assign,
+        st = self.commit_stage1(seq, t_us, boxes, polys, decided, read_set, assign,
                                 rec_crop, corr_of, record_corr)
         texts = {i: (text, score) for i, text, score, _age in decided if i in read_set}
         return self.commit_stage2(st, texts, fh)
 
-    def commit_stage1(self, seq: int, idx: int, t_us: int, boxes, polys, decided,
+    def commit_stage1(self, seq: int, t_us: int, boxes, polys, decided,
                       read_set: set[int], assign: dict, rec_crop, corr_of: dict,
                       record_corr: bool) -> dict:
         """不需要"读回来的文本"的那一半。返回一个 state，交给 `commit_stage2`。
@@ -430,9 +427,8 @@ class ReuseV2:
             b = boxes[i]
             reused = i not in read_set
             chain, link = assign.get(i, (None, None))
-            # ⚠ **写 obs 的第二处**（主路在 run_ocr2）。`frame` 认 pts，判据只有 framesource 那一份——
-            # 2026-09-20 第一版只改了主路，缺口之后一半的行还是旧编号，而没有任何一层报错。
-            row = {"frame": framesource.pts_frame(t_us, idx, self.src_fps), "t_us": t_us, "box": b,
+            # ⚠ **写 obs 的第二处**（主路在 run_ocr2）：两处的行字段要一致。帧身份就是 `t_us`（frame-pts 计划，obs 行不再有 `frame`）
+            row = {"t_us": t_us, "box": b,
                    "poly": [[round(float(p[0])), round(float(p[1]))] for p in polys[i]],
                    "text": text, "conf": round(score, 4)}
             if reused:
@@ -447,7 +443,7 @@ class ReuseV2:
                 ev = [chain.uid, row, b, text, "new" if link in ("gap1", "memory") else "same"]
                 events.append(ev)
                 inherit.append((row, chain, ev))
-                chain.last_row, chain.last_idx = row, idx
+                chain.last_row, chain.last_us = row, t_us
                 # 缓存裁剪给回补用。预算已经在 decide 里**预留**过（`crop_bytes` 是上界），所以这里必然放得下；
                 # `cache_overrun` 是"上界算错了"的报警，守卫钉着它必须是 0——绝不能再走回"放不下就不缓存、
                 # 行却仍是 reused"那条路（那等于承诺了可回补又偷偷收回）
@@ -478,7 +474,7 @@ class ReuseV2:
             if chain is not None and link in ("prev", "moved"):
                 chain.read_w = b[2] - b[0]
                 chain.box, chain.last_seq, chain.age = b, seq, 0
-                chain.last_row, chain.last_idx = row, idx
+                chain.last_row, chain.last_us = row, t_us
                 chain.inflight += 1            # 策略 B：文本没回来之前，这条链的像素门走严格门
                 if id(chain) not in touched:
                     new_live.append(chain)
@@ -487,7 +483,7 @@ class ReuseV2:
                 # 没链、或跨空档链接被门拦下 / 到期：都当新链，不回补旧链
                 nc = Chain(b, "", 0.0, seq)
                 nc.read_w = b[2] - b[0]
-                nc.last_row, nc.last_idx = row, idx
+                nc.last_row, nc.last_us = row, t_us
                 nc.inflight = 1
                 new_live.append(nc)
                 deferred[-1]["new_chain"] = nc
@@ -506,12 +502,12 @@ class ReuseV2:
                 if c.last_row is not None:
                     # 文本**不在这里抄**：异步窗口下这条链最后几次真读可能还在途，此刻的 c.text 是旧的；
                     # stage2（按帧序、那些读都已结算）再取——见 commit_stage2 里交给回抠的那一处
-                    ended_now.append((c.uid, c.last_row, c.box, c, c.last_idx))
+                    ended_now.append((c.uid, c.last_row, c.box, c, c.last_us))
         self.ended = [c for c in self.ended if id(c) not in alive and seq - c.last_seq <= a.reuse_mem + 1]
         self.live = new_live
         self.buf[seq] = rows
         self.sec["rows"] += time.perf_counter() - t_r
-        return {"seq": seq, "idx": idx, "t_us": t_us, "rows": rows, "events": events,
+        return {"seq": seq, "t_us": t_us, "rows": rows, "events": events,
                 "ended_now": ended_now, "deferred": deferred, "inherit": inherit}
 
     def commit_stage2(self, st: dict, texts: dict, fh) -> int:
@@ -652,7 +648,7 @@ class ReuseV2:
                     self.stats["edge_stale"] += 1
             if self.edge is not None:
                 t_e = time.perf_counter()
-                self.edge.sample(st["seq"], st["idx"], st["t_us"], [tuple(e) for e in st["events"]],
+                self.edge.sample(st["seq"], st["t_us"], [tuple(e) for e in st["events"]],
                                  b["ended"], stale)
                 self.sec["edge"] += time.perf_counter() - t_e
 

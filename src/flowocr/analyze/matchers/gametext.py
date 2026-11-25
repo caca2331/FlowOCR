@@ -33,6 +33,10 @@ PATCHES: dict[str, dict] = {
 }
 """游戏 -> build_tracks 的参数覆盖。键是参数名（`region_time_gate`），不是 CLI 旗标。"""
 
+CONTEXT_KEYS = ("ref", "game", "tag", "layout", "viewport")
+OPTION_KEYS = ("feed", "feed_panel", "fuzzy", "merge_gap", "overlay", "readables", "obs")
+"""认哪些 `--ctx` / `--opt` 键（`extensions.warn_unknown_keys`，别的键打警告）；`match` / `cluster_patch` 多读一个键要加在这里。"""
+
 
 def _flag(v) -> bool:
     """`options` 的值可能是命令行来的**字符串**（`--opt overlay=0`）——`bool("0")` 是 True，

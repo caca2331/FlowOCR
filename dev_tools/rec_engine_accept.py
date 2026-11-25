@@ -49,7 +49,7 @@ def rows(p: Path) -> tuple[dict, dict]:
             if "_meta" in o:
                 meta = o["_meta"]
                 continue
-            out[(o["frame"], tuple(o["box"]))] = o
+            out[(o["t_us"], tuple(o["box"]))] = o
     return meta, out
 
 

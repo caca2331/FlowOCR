@@ -316,23 +316,22 @@ class MaskedSource:
         return self._closed[key]
 
     def __iter__(self):
-        for idx, t_sec, frame in self._src:
-            yield idx, t_sec, apply_mask(frame, self._g.mask_at(t_sec))
+        for f in self._src:
+            yield f._replace(image=apply_mask(f.image, self._g.mask_at(f.t)))
 
     def __getattr__(self, k):
         return getattr(self._src, k)
 
 
-def aux_masker(group: RegionGroup, Ws: int, Hs: int, src_fps: float):
-    """辅助流（缩小的灰度帧，edge_refine 的帧环）用的遮罩：同一个范围按比例缩到辅助流尺寸（最近邻），按帧号换算时间。
-    ⚠ 辅助流只有帧号没有逐帧 pts（edge_refine 文件头），时间按 `帧号 / 名义帧率` 算——切点附近可能差一帧。
+def aux_masker(group: RegionGroup, Ws: int, Hs: int):
+    """辅助流（缩小的灰度帧，edge_refine 的帧环）用的遮罩：同一个范围按比例缩到辅助流尺寸（最近邻），时刻就是帧的键（`t_us`）。
     辅助流的帧可能是只读的（`np.frombuffer`），要涂就先拷。"""
     ry = np.minimum((np.arange(Hs) * group.H) // Hs, group.H - 1)       # 最近邻取样（不依赖 cv2）
     rx = np.minimum((np.arange(Ws) * group.W) // Ws, group.W - 1)
     cache: dict[tuple, np.ndarray | None] = {}
 
-    def pre(idx: int, frame: np.ndarray) -> np.ndarray:
-        key = group.key_at(idx / src_fps)
+    def pre(t_us: int, frame: np.ndarray) -> np.ndarray:
+        key = group.key_at(t_us / 1e6)
         if key not in cache:
             m = group.mask_for(key)
             cache[key] = None if m is None else m[ry][:, rx]

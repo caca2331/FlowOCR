@@ -13,8 +13,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", default="", help="默认 x.script.ass -> x.ass，其余 x.ass -> x.fx.ass；--restore 时 -> x.script.ass")
     ap.add_argument("--preset", default="default", choices=list(core.LOOKS), help="长什么样")
     ap.add_argument("--opt", action="append", default=[], metavar="K=V",
-                    help="plate（box / rows / text / src）、plate_alpha（如 0x20，只管近黑底板）、plate_color（on / off：底板颜色取自画面，要读源视频）、"
-                         "typewriter（on / dim / off）、fade（on / off）、unknown（error / ignore：不认识的 fo 参数）")
+                    help="plate（box / rows / text / textbox / src）、plate_alpha（如 0x20，只管近黑底板）、plate_color（on / off：底板颜色取自画面，要读源视频）、"
+                         "typewriter（on / dim / off）、fade（on / off）、flow（auto / v / h：竖排列的摆法，auto 按译文有没有中日韩字选）、"
+                         "latin_font（竖排列横排时的拉丁字体，默认跟着样式；字体文件不在系统字体目录里时设 FLOWOCR_FONTS）、"
+                         "unknown（error / ignore：不认识的 fo 参数）")
     ap.add_argument("--video", default="", help="底板取色读的源视频（默认按字幕稿 [Script Info] 的 FlowOCR Video）")
     ap.add_argument("--fx", action="append", default=[], metavar="模块",
                     help="扩展效果：内置名 / 模块名 / .py 路径，可多次（见 flowocr.typeset.fx）")

@@ -34,7 +34,7 @@ flowocr-match out\v\v-tracks.json --matcher gametext --ctx ref=out\v\v-ref.json 
 flowocr-render out\v\v-matched.json --preset script --opt lang=cn           # 只写字幕稿 v-cn-main.script.ass：在 Aegisub 里校对，再跑第 4 步
 ```
 
-- 三种 `键=值` 参数：建轨的 `--matcher-ctx` 记下这是哪款游戏，匹配时自动带上；匹配的 `--ctx`、`--opt` 都交给匹配器，各自收哪些键照本手册写的抄：写到另一边的键多半不报错、只是不起作用；第 3 步 `flowocr-render` 的 `--opt` 是输出预设的选项（见[输出预设](reference.md#输出预设)），第 4 步 `flowocr-typeset` 的 `--opt` 是出特效的选项（如 `plate=src`，见[改完出特效](script.md#改完出特效)）。
+- 三种 `键=值` 参数：建轨的 `--matcher-ctx` 记下这是哪款游戏，匹配时自动带上；匹配的 `--ctx`、`--opt` 都交给匹配器，各自收哪些键照本手册写的抄：键名写错或写到另一边，内置匹配器会打一行 ⚠ 警告（列出它认的键），但照样跑完，这个键不起作用；第 3 步 `flowocr-render` 的 `--opt` 是输出预设的选项（见[输出预设](reference.md#输出预设)），第 4 步 `flowocr-typeset` 的 `--opt` 是出特效的选项（如 `plate=src`，见[改完出特效](script.md#改完出特效)）。
 - `--opt lang=` 选画哪种文字：`cn` 中文译文、`en` 英文译文、`jp` 日文原文（不给就是 `jp`）。文件名里带着它（`v-cn-…`）。
 - 推荐先只出字幕稿、在 Aegisub 里校对（文字、时间、位置）再出特效：`flowocr-typeset out\v\v-cn-main.script.ass --preset default` 写 `v-cn-main.ass`，
   要先抹原文再烧就加 `--opt plate=src`（见[改完出特效](script.md#改完出特效)）。不校对就直接 `--preset default --opt lang=cn`，一次写出字幕稿和叠加 ASS（`v-cn-default…`）。

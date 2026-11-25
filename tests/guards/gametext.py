@@ -213,7 +213,7 @@ def t_miss_detect() -> None:
         d = Path(td)
         rp, tp, op, mp = d / "m-ref.json", d / "m-tracks.json", d / "m.jsonl", d / "matched.json"
         op.write_text("\n".join(_json.dumps(x, ensure_ascii=False) for x in
-                                [{"_meta": {"height": 1080}}] + [{"frame": i, "t_us": t, "box": b, "text": x}
+                                [{"_meta": {"height": 1080}}] + [{"t_us": t, "box": b, "text": x}
                                                                  for i, (t, b, x) in enumerate(rows)]), encoding="utf-8")
         refdoc = {"schema": GS.SCHEMA, "provenance": {"obs": str(op), "game": "syn", "code_fp": "x", "params": {"qmin": 8}},
                   "speakers": {"カチーナ": "卡齐娜"},
@@ -2440,7 +2440,7 @@ def t_echo() -> None:
              [rec(k, t, 402, c) for k, t, c in zip(("k1", "k2", "k3"), starts, (5, 6, 7))]
         EC.mark(rs, [c[0] for c in cue], [c[1] for c in cue], [c[2] for c in cue], {"k1": 10.0}, grid=grid)
         return [r["echo"] for r in rs[3:]]
-    g60 = EC.grid_of({"meta": {"src_fps": 60.0, "stride": 30}})          # 60 fps 按 2 fps 采，等距
+    g60 = EC.grid_of({"meta": {"src_fps": 60.0, "sample_fps": 2.0}})    # 60 fps 按 2 fps 采
     fr, fr0, ong, onl = (batch((400.0, 398.72, 398.75), g60), batch((400.0, 398.72, 398.75), None),
                          batch((400.0, 398.5, 398.5), g60), batch((400.0, 398.5, 398.5), None))
     check("成批旧行的「这一刻」按采样格号比：回抠后邻行起点差 1.28 s（采样级差 2 格）仍算同一刻（log）；没有网格照原来的 ±1 s（other）；"
@@ -2448,15 +2448,40 @@ def t_echo() -> None:
           fr == ["log", "log", "log"] and fr0 == ["other", "other", "other"] and ong == onl == ["other", "other", "other"],
           (fr, fr0, ong, onl))
     import math
-    g22 = EC.grid_of({"meta": {"src_fps": 60.0, "sample_fps": 2.2}})     # 60 fps 按 2.2 fps 采：间隔 27 / 28 帧交替
-    real = [math.ceil(k * 60 / 2.2) / 60 for k in range(40)]
-    keys = [g22[0](t) for t in real]
+    # 格号 = ceil((t − c) · sample_fps)，c = max(δ, 一个源帧 − 1 ms)（frame-pts 计划第 9 节）。真实时刻按取帧层的口径造：
+    # 恒定帧率的帧 n / src（整数 µs），采样帧 = 每个桶的第一帧（不早于 T_k − δ 的第一帧），回抠起点吸附到辅助流的目标点（帧时刻）
+    def frames(src_num, src_den, sec):
+        return [round(n * src_den * 1_000_000 / src_num) / 1e6 for n in range(int(sec * src_num / src_den) + 2)]
+
+    def sampled(fr, fps, n):
+        return [next(t for t in fr if t >= k / fps - 0.0010005) for k in range(n)]
+    f2997, f60, f25 = frames(30000, 1001, 40), frames(60, 1, 32), frames(25, 1, 32)
+    s2997 = sampled(f2997, 2.0, 70)              # 晚到量每格涨 0.5 ms，第 65 格回到准点
+    g2997 = EC.grid_of({"meta": {"src_fps": 30000 / 1001, "sample_fps": 2.0}})
+    old2997 = EC.grid_of({"meta": {"sample_fps": 2.0}})                 # 缺 src_fps：c = δ（上一版的规则）
+    k2997 = [g2997[0](t) for t in s2997]
+    check("29.97 fps 按 2 fps 采：每个采样帧映射回自己那一格、相邻两个不撞格（c = δ 时桶里晚到的采样帧进位到下一格、和下一格撞）",
+          k2997 == list(range(70)) and len({old2997[0](t) for t in s2997}) < 70, k2997)
+    g60 = EC.grid_of({"meta": {"src_fps": 60.0, "sample_fps": 2.0}})
+    old60 = [math.ceil(round(t * 60) / 30) for t in f60]                  # 旧规则：帧号 round(t·src_fps) 往后取最近的格（每 30 帧一格）
+    check("60 fps 按 2 fps 采：每一帧时刻的格号和旧规则（帧网格上的 ceil）逐个相同",
+          [g60[0](t) for t in f60] == old60, [(t, g60[0](t), o) for t, o in zip(f60, old60) if g60[0](t) != o][:5])
+    g25 = EC.grid_of({"meta": {"src_fps": 25.0, "sample_fps": 2.0}})
+    g22 = EC.grid_of({"meta": {"src_fps": 60.0, "sample_fps": 2.2}})
+    bad = []
+    for name, g, fr, fps in (("29.97/2", g2997, f2997, 2.0), ("60/2", g60, f60, 2.0), ("25/2", g25, f25, 2.0), ("60/2.2", g22, f60, 2.2)):
+        ss = sampled(fr, fps, 60)
+        for k in range(1, 60):
+            bad += [(name, k, t, g[0](t)) for t in fr if ss[k - 1] < t <= ss[k] and g[0](t) != k]
+            bad += [(name, k - 1, ss[k - 1], g[0](ss[k - 1]))] if g[0](ss[k - 1]) != k - 1 else []
+    check("回抠起点落在 (上一个采样帧, 本采样帧] 映射到本格、正好等于上一个采样帧的还原成前一格（29.97 / 60 / 25 按 2 fps、60 按 2.2 fps）",
+          not bad, bad[:5])
+    keys = [g22[0](t) for t in sampled(f60, 2.2, 40)]
     spans = [EC.in_window(keys, keys[i], g22[1]) for i in range(5, 35)]
-    g25 = EC.grid_of({"meta": {"src_fps": 25.0, "sample_fps": 2.0}})     # 25 fps 按 2 fps 采：间隔 12 / 13 帧交替
     b25 = [g25[0](t) for t in (100.04, 101.52, 100.52, 102.0)]          # 回抠后 100.04（采样级 100.52）对 101.52；采样级 100.52 对 102.0（差 3 格）
-    check("「这一刻」在不等距的网格上：60 fps 按 2.2 fps 采时采样级起点差 2 格都算同一刻、差 3 格都不算（最近的 3 格只差 1.35 s）；"
+    check("「这一刻」在不整除的采样上：60 fps 按 2.2 fps 采时采样级起点差 2 格都算同一刻、差 3 格都不算（最近的 3 格只差 1.35 s）；"
           "25 fps 按 2 fps 采时回抠后差 1.48 s 的两行（采样级差 2 格）算，采样级差 3 格、同样差 1.48 s 的不算",
-          spans == [(i - 2, i + 3) for i in range(5, 35)] and b25[1] - b25[0] == 2 and b25[3] - b25[2] == 3 and g25[1] == 2,
+          spans == [(i - 2, i + 3) for i in range(5, 35)] and b25 == [201, 203, 201, 204] and g25[1] == 2,
           ([(i, sp) for i, sp in zip(range(5, 35), spans) if sp != (i - 2, i + 3)], b25, g25[1]))
     recs6 = [rec("s1", 10, 12, 0), rec("s1", 400, 402, 2), rec("s2", 50, 52, 0), rec("s2", 400, 402, 5),
              rec("s3", 51, 53, 0), rec("s3", 400.5, 402, 6)]

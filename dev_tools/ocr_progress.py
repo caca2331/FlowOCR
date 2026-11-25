@@ -45,8 +45,8 @@ def _duration_sec(video: str) -> float | None:
         return None
 
 
-def _last_frame(path: Path) -> int | None:
-    """从文件尾部往回找最后一条带 `frame` 的记录。
+def _last_t_us(path: Path) -> int | None:
+    """从文件尾部往回找最后一条带 `t_us` 的记录（帧身份就是它，frame-pts 计划）。
 
     不整文件读：产物是几十上百 MB，而且**正在被写**——最后一行很可能是半行。
     半行直接丢掉，不要试图补全。
@@ -62,8 +62,8 @@ def _last_frame(path: Path) -> int | None:
             rec = json.loads(ln)
         except Exception:
             continue          # 半行 / 非 JSON
-        if "frame" in rec:
-            return int(rec["frame"])
+        if "t_us" in rec:
+            return int(rec["t_us"])
     return None
 
 
@@ -79,12 +79,12 @@ def report(path: Path) -> None:
         meta = json.loads(head).get("_meta", {})
     except Exception:
         meta = {}
-    video, fps = meta.get("video"), meta.get("src_fps")
-    frame = _last_frame(path)
+    video = meta.get("video")
+    t_us = _last_t_us(path)
 
     bits = [f"{path.name}: {size/1e6:.1f} MB"]
-    if frame is not None and fps:
-        done = frame / fps
+    if t_us is not None:
+        done = t_us / 1e6
         total = _duration_sec(str(provenance.local(video))) if video else None
         if total:
             pct = 100 * done / total

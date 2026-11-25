@@ -37,7 +37,7 @@ def rows(p: str) -> dict:
             fh.seek(0)
         for ln in fh:
             o = json.loads(ln)
-            out[(o["frame"], tuple(o["box"]))] = o
+            out[(o["t_us"], tuple(o["box"]))] = o
     return out
 
 

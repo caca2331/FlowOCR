@@ -45,9 +45,11 @@ class Plates:
     """按帧序取在屏的底板：事件按"开始 − 提前量"排好，`at(t)` 只往前滑（t 不减），不每帧扫全部底板。
     给出的顺序是稿里的行序（修补器的分组按顺序合并，顺序不同结果可能不同）。"""
 
-    def __init__(self, evs: list[platecolor.Ev], scale: tuple[float, float] = (1.0, 1.0), lead: float = LEAD, mode: str | None = None):
+    def __init__(self, evs: list[platecolor.Ev], scale: tuple[float, float] = (1.0, 1.0), lead: float = LEAD,
+                 modes: frozenset[str] = frozenset()):
         self.evs, self.sx, self.sy, self.lead = evs, scale[0], scale[1], lead
-        self.mode = mode                        # 阶段 4 的底板模式（`[Script Info]` 的 FlowOCR Typeset 里的 plate=…）；读不到是 None
+        # 阶段 4 画了哪几种底板（`[Script Info]` 的 FlowOCR Typeset：行上另写了样式时是 plates_used=…，否则是整份的 plate=…）；读不到是空
+        self.modes = modes
         self.sweep = platecolor.Sweep([((ev.start - lead, ev.end + lead), (i, ev)) for i, ev in enumerate(evs)])
 
     def px(self, r) -> tuple[int, int, int, int]:
@@ -69,7 +71,9 @@ def load(text: str, size: tuple[int, int], lead: float = LEAD) -> tuple[Plates, 
            for k in ("PlayResX", "PlayResY") if ln.startswith(k + ":")}
     pw, ph = res.get("PlayResX", 1920), res.get("PlayResY", 1080)          # 没写时按阶段 4 的口径（libass 自己的默认是 384×288；阶段 4 总会写）
     ts = next((ln.split(":", 1)[1] for ln in (info.lines if info is not None else []) if ln.startswith(core.INFO_KEY + ":")), "")
-    mode = next((w[6:] for w in ts.split() if w.startswith("plate=")), None)
+    words = dict(w.split("=", 1) for w in ts.split() if "=" in w)
+    used = words.get("plates_used") or words.get("plate")
+    modes = frozenset(used.split(",")) if used else frozenset()
     evs, rest, drawn = [], [], 0
     for ln in text.splitlines():
         ev = platecolor.parse(ln)
@@ -82,4 +86,4 @@ def load(text: str, size: tuple[int, int], lead: float = LEAD) -> tuple[Plates, 
         evs.append(ev)
     if not evs and drawn:
         raise ValueError(f"叠加 ASS 里没有打了标（Effect {core.EFFECT_PLATE}）的底板，却有 {drawn} 条绘图：多半是旧版阶段 4 出的，用现在的阶段 4 重出")
-    return Plates(evs, (size[0] / pw, size[1] / ph), lead, mode), rest
+    return Plates(evs, (size[0] / pw, size[1] / ph), lead, modes), rest

@@ -19,10 +19,11 @@ flowocr-burn out\v\v-cn-main.ass --start 60 --end 90 # 先试烧一段看效果
 - **先抹原文**（`--inpaint`）：先用 LaMa 模型把底板盖住的地方补成背景（原文没了），再烧译文；底板本身不画，译文是白字黑边。涂抹跟着打字机逐字展开，比底板略早开始、略晚收起，盖住比底板早出、晚消的原文。
   - 只抹第 4 步自己画的底板：[扩展效果](reference.md#扩展匹配器输出预设与特效)画的框不算。
   - 两档：`--inpaint`（default，快）和 `--inpaint hq`（补得细一些，慢约七成）。镜头、人物在动时，补过的地方看得出和周围画面略微错开。
+    底板沿用到期时，内部没有明显变化就继续用上次的补丁：静止的画面不再按最长时间隔反复重补，补丁不会无故跳动。
   - **第 4 步就要为它准备**：出叠加 ASS 时加 `--opt plate=src`、不要取色（为什么见[改完出特效](script.md#改完出特效)）。
-    没加 `plate=src` 也能烧，只是译文伸出原文的部分也被抹掉，会打一行提示；取过色的稿、0.3.0 之前的第 4 步出的稿读不出底板，会报错，按提示重出。
+    没加 `plate=src` 也能烧，抹的是底板实际盖着的地方：`rows` / `box` 通常连译文伸出原文的部分也抹，`text` / `textbox` 通常只抹译文底下、原文可能没抹干净，都会打一行提示；取过色的稿、0.3.0 之前的第 4 步出的稿读不出底板，会报错，按提示重出。
   - `--inpaint` 写在 ASS 后面（`flowocr-burn x.ass --inpaint`）：写在前面时 ASS 会被当成档名，报 `invalid choice`。
-  - 设备：装了 TensorRT（见[TensorRT](reference.md#tensorrt可选gpu-上再快一些)）就用它，每档第一次用先建引擎（约 1 分钟，之后读缓存）；没装用 CUDA，打一行提示；没有 N 卡用 CPU。
+  - 设备：装了 TensorRT（见[TensorRT](reference.md#tensorrt可选gpu-上再快一些)）就用它，每档第一次用先建引擎（约 1 分钟，之后读缓存）；没装用 CUDA，打一行提示；没有 N 卡用 CPU；`--device cpu` 在有 N 卡时也用 CPU。
     原神一段 3 分钟的 1080p60 录像、default 档，在 RTX 5070 Ti 上：TensorRT 约 100 秒，CUDA 约 230 秒；CPU 上每秒视频约 10 秒（前 5 秒用了 51 秒）。
     显存约 0.8 GB（CUDA 约 1.5 GB），内存约 2 GB（含解码、编码两个 ffmpeg）。
 
@@ -35,9 +36,10 @@ GitHub Release 的模型包不含 LaMa。离线使用时，先在联网机器上
 
 - 分辨率、帧率按源，音轨照拷（mp4 装不下的编码重编成 AAC）。`--size 宽x高`、`--fps` 改。
 - 编码器 `--codec auto`（默认）按先后挑第一个能用的：H.265 硬件编码（如 NVIDIA 的 `hevc_nvenc`）→ H.264 硬件编码 → libx264（CPU）。也可以直接写编码器名，如 `--codec libx265`。
+- `--device cpu`：整个阶段 5 不用 GPU——编码器只从 CPU 编码的 libx264 / libx265 里挑（`--codec auto` 时是 libx264，指定硬件编码器报错），inpainting 的推理也走 CPU。只想编码走 CPU、推理照样上 GPU，就只写 `--codec libx264`。
 - 质量 `--quality <n>`：硬件编码器的恒定质量值 / libx264 的 CRF，越大文件越小。不给时：
   - 不到 30 分钟的视频用保守的默认值（硬件 26、libx264 14），画质和源接近，文件往往比源大；
   - 30 分钟以上先在源视频上抽样试压，找画质分数（VMAF）刚到 95 的质量值，约 2 分钟，换来的文件小一到三成。`--quality auto` 不论长短都找，`--target` 改目标分数。
-    要带 libvmaf 的 ffmpeg（gyan.dev 的 full 构建有）；没有时用默认值并提示。
+    要带 libvmaf 的 ffmpeg（gyan.dev 的 full 构建有）。没带时：没写 `--quality`、且这一段不少于 30 分钟，改用编码器的默认质量并提示；写了 `--quality auto` 则报错退出，改成 `--quality <n>`。
 - `--start` / `--end`（秒）只烧一段，先看效果用；字幕按原片的时间对上。源视频起始时间戳不为 0 时，整片烧录与截段烧录的字幕时刻可能不一致，先试烧一段核对。
 - 输出一律是 8 bit（yuv420p）；10 bit / HDR 的源没试过，会降成 8 bit。

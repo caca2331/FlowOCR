@@ -67,11 +67,9 @@ def serve() -> int:
         from flowocr.extract import regions
         g = regions.from_spec(cfg["regions"], cfg["W"], cfg["H"])
         if not g.unrestricted:
-            edge.ring.premask = regions.aux_masker(g, edge.Ws, edge.Hs, cfg["src_fps"])
+            edge.ring.premask = regions.aux_masker(g, edge.Ws, edge.Hs)
     pts_q: Queue = Queue()
-    aux = framesource.AuxReader(start_idx=cfg["start_idx"], n_frames=cfg["aux_n"], step=edge.grid.step,
-                                width=edge.Ws, height=edge.Hs, sink=edge.ring, pts_q=pts_q,
-                                src_fps=cfg["src_fps"]).start()
+    aux = framesource.AuxReader(width=edge.Ws, height=edge.Hs, sink=edge.ring, pts_q=pts_q).start()
     edge.on_done = lambda seq: send(("done", seq))
     progress_last = [time.monotonic()]
 
@@ -128,8 +126,8 @@ def serve() -> int:
             elif tag == "pe":
                 pts_q.put(framesource.QUEUE_SENTINEL)
             elif tag == "s":
-                _, seq, idx, t_us, items, ended, stale, live = msg
-                edge.sample(seq, idx, t_us, [(k, ref(rid), box, text, kind) for k, rid, box, text, kind in items],
+                _, seq, t_us, items, ended, stale, live = msg
+                edge.sample(seq, t_us, [(k, ref(rid), box, text, kind) for k, rid, box, text, kind in items],
                             [(k, ref(rid), box, text, li) for k, rid, box, text, li in ended], set(stale))
                 if live is not None:             # 替身表跟着管线进程那边的行号表剪（它隔一阵发来仍可能被写的行号）
                     keep = set(live)
@@ -139,7 +137,7 @@ def serve() -> int:
                 stats = edge.finish(msg[1])
                 aux.join()
                 stats.update({"aux_sent": aux.sent, "aux_stopped_early": aux.stopped_early, "aux_last_key": aux.last_key,
-                              "aux_cpu_sec": round(aux.cpu_sec, 2), "aux_shift": 0,
+                              "aux_cpu_sec": round(aux.cpu_sec, 2),
                               "ring_cap": edge.ring.cap, "proc": True})
                 if aux.misaligned:
                     stats["aux_misaligned"] = aux.misaligned
@@ -164,8 +162,7 @@ class EdgeProxy:
     它落后管线很多批时一直在做（CPU 上、或收尾时积压一大截），等得再久也不算卡；批号和窗内工作进度都这么久不动才算。
     原来是"这一批总共等了 300 s"，积压够长的正常收尾也会被判卡住，真卡住又要白等 5 分钟。"""
 
-    def __init__(self, *, edge_kwargs: dict, start_idx: int, end_idx: int, src_fps: float, width: int, height: int,
-                 regions_spec: dict | None = None, start_timeout: float = 120.0, stall_sec: float = STALL_SEC) -> None:
+    def __init__(self, *, edge_kwargs: dict, width: int, height: int, regions_spec: dict | None = None, start_timeout: float = 120.0, stall_sec: float = STALL_SEC) -> None:
         from types import SimpleNamespace
 
         from flowocr.extract import childproc
@@ -173,10 +170,7 @@ class EdgeProxy:
         self.child = childproc.Child("flowocr.extract.edge_proc", "回抠进程", timeout=start_timeout)
         self.proc = self.child.proc
         self.conn = self.child.conn                      # 限时等它连上（连不上就杀掉、抛）
-        from flowocr.extract.framegrid import AuxGrid
-
-        self.conn.send({"edge": edge_kwargs, "start_idx": start_idx, "src_fps": src_fps, "W": width, "H": height,
-                        "regions": regions_spec, "aux_n": AuxGrid.from_list(edge_kwargs["grid"]).n_frames(start_idx, end_idx)})
+        self.conn.send({"edge": edge_kwargs, "W": width, "H": height, "regions": regions_spec})
         hello = self.conn.recv()
         if hello[0] != "hello":
             raise RuntimeError(f"回抠进程握手失败：{hello!r}")
@@ -210,7 +204,7 @@ class EdgeProxy:
         except OSError:
             pass                                          # 那边已经退了：错误在 wait_batch / finish 里报
 
-    def sample(self, seq: int, idx: int, t_us: int, items: list[tuple], ended: list[tuple],
+    def sample(self, seq: int, t_us: int, items: list[tuple], ended: list[tuple],
                stale: set[int] | tuple = ()) -> None:
         its, ens = [], []
         for k, row, box, text, kind in items:
@@ -231,7 +225,7 @@ class EdgeProxy:
             for rid in [r for r, (_, s) in self.rows.items() if s < floor]:
                 del self.rows[rid]
             live = list(self.rows)
-        self._send(("s", seq, idx, t_us, its, ens, list(stale), live))
+        self._send(("s", seq, t_us, its, ens, list(stale), live))
 
     # ---------- 收 ----------
     def _recv(self) -> None:
@@ -312,8 +306,8 @@ class EdgeProxy:
     FINISH_SEC = 300.0
     """批号追到头之后还要算结尾窗、汇总统计；汇总不保证持续发进度，仍给固定收尾宽限。"""
 
-    def finish(self, last_idx: int) -> dict:
-        self._send(("f", last_idx))
+    def finish(self, last_us: int) -> dict:
+        self._send(("f", last_us))
         # 两段：先按进度等积压的批做完（和 wait_batch 同一个判据），再给收尾一段固定宽限
         self._wait(lambda: self.done_seq >= self.last_seq or self.stats is not None or not self.th.is_alive(),
                    "等回抠进程做完积压的批")

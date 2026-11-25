@@ -3,63 +3,28 @@
 放共享层是为了守卫够得着（audit-4 C8）。依据（fps-and-rec-budget 报告）：单进程时 GPU
 大半时间在等主线程的 CPU 活，N 个进程各跑一段能把空档填上——3 个 worker 在 quick 三段上 −26%~−47%。
 
-**切点对齐采样格**：切点帧号在采样网格上（`framegrid.TimeGrid`）。代价之一：每段开头没有"上一帧"，复用链从头开始、
+**切点在目标点上**（frame-pts 计划）：`framegrid.Window.split` 按桶号等分，子进程的 `--start` / `--end` 直接给 `T_k`；
+每段的起点都是桶边界，所以各段取到的帧和单进程是同一批（窗口那条论证，见 `Window.seek_sec`）。切点不经帧号换算，
+原来"平均帧率偏离名义帧率就拒开"的漂移门随之删掉。代价之一：每段开头没有"上一帧"，复用链从头开始、
 强制刷新换了相位——所以 `workers` 是**产物参数**（进 `_meta.config`），两种跑法的产物不混用。
 
-⚠ **有 pts 缺口 / 平均帧率偏离名义帧率的素材上不能开**（2026-09-10 审查）。子进程的起点是
-`切点帧号 / src_fps` 秒——和 `--start` 同一个"帧号 ÷ 平均帧率"的换算——而 `src_fps` 是容器的
-**平均**帧率。一段里若含丢帧缺口，它实际覆盖的时间比算出来的长，和下一段**重叠**（f3 实测 +4.65 s）；
-不含缺口时它比算出来的短，和下一段之间**漏一截**（f3 上按平均帧率推，每个切点可达数秒，没实测），
-而且 PTS 仍然递增、**段间递增判据拦不住**。所以两道门：
-父进程先按 `seam_drift_sec` 预估**整个文件**上的切点漂移，超过半个源帧就拒绝；
-拼的时候再逐个切点核首尾间隔（`seam_problems`），重叠和漏帧都判未完成。
-漂移**按整个文件**估、门限**半个源帧**（复审 2026-09-10）：按窗口长度估的话，f3 上 5 分钟窗口
-算出 0.109 s 会被放行，段与段之间静默差出好几个源帧——落在切点核对的容差里、拦不住。
-按整个文件估，有缺口的素材不论取哪段都拒；被放行的素材（f5 整片 0.001 s、游戏切片 0）
-切点漂移不到半帧，**采样帧和单进程逐帧相同**。
-`r_frame_rate` 当名义帧率在某些容器上可能是时基派生值、造成误拒；现有素材没撞上，报错里两个帧率都印着。
-根治要把窗口改成按 pts 定义（fps-and-rec-budget 报告第 1 条的待定项）。
+拼的时候逐个切点核（`seam_problems`）：下一段首帧的桶号必须大于上一段末帧的桶号（否则重叠）；中间隔了空桶时问源文件那几个桶里有没有帧，
+有 = 漏帧，没有 = 素材缺口放行。
 """
 from __future__ import annotations
 
-import json
-import subprocess
-
 from flowocr.extract import ocr_complete
 
-SUM_KEYS = ("frames_advanced", "frames_requested", "sampled_frames", "boxes", "rec_calls",
-            "rec_predict_calls", "reused_boxes", "dropped_dense", "dropped_tiny", "lost_rec", "grid_skipped")
+SUM_KEYS = ("advanced_us", "requested_us", "sampled_frames", "boxes", "rec_calls",
+            "rec_predict_calls", "reused_boxes", "dropped_dense", "dropped_tiny", "lost_rec", "cells_skipped")
 """各段相加就是整体的计数。"""
 
-DICT_SUM_KEYS = ("reuse_v2", "reuse_v2_sec", "edge", "stage_sec", "rec_spec", "grid_off")
+DICT_SUM_KEYS = ("reuse_v2", "reuse_v2_sec", "edge", "stage_sec", "rec_spec", "rec_vertical")
 """各段里是"计数字典"的键，逐键相加进整体（数值型的键才加；bool 不算）。"""
 
-DICT_MAX_KEYS = frozenset({"cache_peak", "aux_shift"})
-"""这些键**不是计数，是峰值 / 偏移**：取各段的最大值，不然 `--reuse-cache-mb 8` 的三个 worker
-会被加成 21 MB（2026-09-17 审计时从产物里发现的口径错）。"""
-
-SEAM_TOL = 0.5
-"""切点处相邻两段首尾的间隔，允许偏离一个采样间隔多少（倍）。正常就是恰好一个采样间隔。"""
-
-DRIFT_MAX_FRAMES = 0.5
-"""整个文件上预估的切点漂移不许超过几个**源帧**。半帧以内，切点落在哪一帧和单进程一致。
-f5 整片 0.001 s（0.06 帧）、游戏切片 0；f3 12.1 s、f4 6.1 s。"""
-
-
-def split_frames(start_idx: int, end_idx: int, grid, n: int) -> list[int]:
-    """`[start_idx, end_idx)` 等分成 n 段，返回 n−1 个**内部切点帧号**（在采样网格 `grid` 上、严格递增；`start_idx` 在格上）。
-
-    段太短切不开时抛——那种窗口本来就不值得并行。
-    """
-    if n < 2:
-        return []
-    span = end_idx - start_idx
-    k0 = grid.index(start_idx)
-    cuts = [grid.at(k0 + round(span * k / n * grid.p / grid.q)) for k in range(1, n)]   # 等距时就是 start + round(…/步长) × 步长
-    pts = [start_idx, *cuts, end_idx]
-    if any(b <= a for a, b in zip(pts, pts[1:])):
-        raise ValueError(f"窗口太短，切不成 {n} 段：{pts}")
-    return cuts
+DICT_MAX_KEYS = frozenset({"cache_peak", "aux_last_key"})
+"""这些键**不是计数，是峰值 / 位置**：取各段的最大值，不然 `--reuse-cache-mb 8` 的三个 worker
+会被加成 21 MB（2026-09-17 审计时从产物里发现的口径错）；`aux_last_key` 是辅助流最后一帧的 `t_us`。"""
 
 
 def strip_opts(argv: list[str], names: set[str]) -> list[str]:
@@ -77,49 +42,26 @@ def strip_opts(argv: list[str], names: set[str]) -> list[str]:
     return out
 
 
-def parse_rate(s: str) -> float | None:
-    """ffprobe 的 `60/1`、`60000/1001` → 浮点；`0/0`、`N/A`、空 → None。"""
-    try:
-        num, den = s.split("/") if "/" in s else (s, "1")
-        num, den = float(num), float(den)
-    except ValueError:
-        return None
-    return num / den if num > 0 and den > 0 else None
-
-
-def probe_rates(video: str) -> tuple[float | None, float | None]:
-    """`(名义帧率 r_frame_rate, 平均帧率 avg_frame_rate)`。探不到的给 None。"""
-    try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                              "stream=r_frame_rate,avg_frame_rate", "-of", "json", video],
-                             capture_output=True, text=True, timeout=60).stdout
-        st = json.loads(out)["streams"][0]
-    except Exception:
-        return None, None
-    return parse_rate(st.get("r_frame_rate", "")), parse_rate(st.get("avg_frame_rate", ""))
-
-
-def seam_drift_sec(span_frames: int, avg_fps: float, nominal_fps: float) -> float:
-    """按"帧号 ÷ 平均帧率"换算切点时，`span_frames` 帧上最多能漂出多少秒。
-    调用方传**整个文件**的帧数，门限才是素材的属性、不随窗口变。"""
-    return span_frames * abs(1.0 / avg_fps - 1.0 / nominal_fps)
-
-
-def seam_problems(metas: list[dict], interval: float, tol: float = SEAM_TOL) -> list[str]:
-    """逐个切点核：下一段的首帧 PTS − 上一段的末帧 PTS 应该恰好是一个采样间隔。
-    ≤ 0 是**重叠**，太大是**漏帧**——后者 PTS 仍递增，只有这里能拦。"""
+def seam_problems(metas: list[dict], gap_has_frames=None) -> list[str]:
+    """逐个切点核首末采样帧的桶号（`_meta.cell_first` / `cell_last`）：下一段首帧的桶号不大于上一段末帧的 = **重叠**；
+    中间隔了空桶时问 `gap_has_frames(上一段末帧的桶, 下一段首帧的桶)`（源文件里这两个桶之间有没有帧）：
+    有 = **漏帧**（PTS 仍递增，只有这里能拦），没有 = 素材缺口放行，探不出来（None）也报。没给 `gap_has_frames` 时空桶一律报。
+    原来"首尾间隔恰好一个采样间隔"的判法在 VFR 上会误报。
+    已知的保守处：某个中间段整段落在素材缺口里、一帧都没交时桶号缺失，照样报（整体判未完成，单进程会判完成）——要盖住整整一段的缺口，罕见、而且报得出来。"""
     out = []
     for k in range(len(metas) - 1):
-        a, b = metas[k].get("pts_last_sec"), metas[k + 1].get("pts_first_sec")
+        a, b = metas[k].get("cell_last"), metas[k + 1].get("cell_first")
         if a is None or b is None:
-            out.append(f"切点 {k}：段首 / 段尾 PTS 缺失")
+            out.append(f"切点 {k}：段首 / 段尾的桶号缺失")
             continue
-        d = b - a
-        if d <= 0:
-            out.append(f"切点 {k}：重叠 {-d:.3f} s（{a:.3f} → {b:.3f}）")
-        elif abs(d - interval) > tol * interval:
-            out.append(f"切点 {k}：间隔 {d:.3f} s，应为 {interval:.3f} s"
-                       + ("（漏帧）" if d > interval else ""))
+        if b <= a:
+            out.append(f"切点 {k}：重叠（上一段末帧在桶 {a}、下一段首帧在桶 {b}）")
+        elif b > a + 1:
+            got = gap_has_frames(a, b) if gap_has_frames is not None else None
+            if got is None:
+                out.append(f"切点 {k}：桶 {a} 和 {b} 之间有空桶，探不出源里有没有帧")
+            elif got:
+                out.append(f"切点 {k}：桶 {a} 和 {b} 之间源里有帧、两段都没交（漏帧）")
     return out
 
 
@@ -130,15 +72,15 @@ CHILD_ARGS = ["--workers", "1", "--decode-shards", "0"]
 
 
 def merge_metas(metas: list[dict], base: dict, *, wall: float, cuts_sec: list[float],
-                interval: float) -> dict:
+                gap_has_frames=None) -> dict:
     """各段的 `_meta` → 整体的 `_meta`。`base` 是父进程按同一组参数建的那份（video / config / 模型…）。
 
     **完成**按**整个窗口**判，和单进程同一把尺：
-    - 覆盖率：各段推进帧数之和 / 请求帧数之和过 `ocr_complete.is_complete`。
-      **不能要求每段各自过**——`end=0` 时容器多报的那 1% 帧数全压在最后一段上，
-      3 个 worker 时末段只有 97%，单进程是 99%（审查 2026-09-10）；
-    - **中间各段**必须各自完成（它们的请求帧数是切出来的，不含容器的虚报）；
-    - 没有坏 PTS，切点处首尾间隔恰好一个采样间隔（`seam_problems`）。
+    - 覆盖率：推进到的 = 前面各段的请求时长（切点之间整段）+ 末段推进到的，即"末段最后一个采样帧所在桶的结束 − 窗口起点"，
+      对请求时长之和过 `ocr_complete.is_complete`。**不逐段要求覆盖**：中间某段末尾紧跟素材缺口时它自己的覆盖率会不到 98%，
+      单进程跑同一窗口却算完成；`end=0` 时容器多报的那一截也全压在最后一段上（审查 2026-09-10）。
+      中间段提前断了、末尾漏了帧，由切点核对问源文件拦下（源里有帧 = 漏帧）；
+    - 没有坏 PTS、没有一段的辅助流没交够（`aux_incomplete`），切点处不重叠、不漏帧（`seam_problems`，`gap_has_frames` 问源文件）。
     """
     m = dict(base)
     for k in SUM_KEYS:
@@ -196,14 +138,17 @@ def merge_metas(metas: list[dict], base: dict, *, wall: float, cuts_sec: list[fl
             trt_ort[tag][k] = trt_ort[tag].get(k, 0) + v
     if any(trt_ort.values()):
         m["ort"] = {**(m.get("ort") or {}), **{t: v for t, v in trt_ort.items() if v}}
-    seams = seam_problems(metas, interval)
+    seams = seam_problems(metas, gap_has_frames)
     bad = next((x["bad_pts"] for x in metas if x.get("bad_pts")), None)
     overlap = [s for s in seams if "重叠" in s]
     if overlap and bad is None:
         bad = "段间 PTS 不递增：" + "；".join(overlap)
-    complete = (all(x.get("complete") for x in metas[:-1])
-                and ocr_complete.is_complete(m["frames_advanced"], m["frames_requested"])
-                and bad is None and not seams)
+    m["advanced_us"] = sum(x.get("requested_us", 0) or 0 for x in metas[:-1]) + (metas[-1].get("advanced_us", 0) or 0)
+    aux_bad = next((x["aux_incomplete"] for x in metas if x.get("aux_incomplete")), None)
+    if aux_bad:
+        m["aux_incomplete"] = aux_bad
+    complete = (ocr_complete.is_complete(m["advanced_us"], m["requested_us"])
+                and bad is None and aux_bad is None and not seams)
     firsts = [x.get("pts_first_sec") for x in metas]
     lasts = [x.get("pts_last_sec") for x in metas]
     m.update({
@@ -215,11 +160,12 @@ def merge_metas(metas: list[dict], base: dict, *, wall: float, cuts_sec: list[fl
         "wall_sec": round(wall, 2),
         "sec_per_frame": round(wall / max(m["sampled_frames"], 1), 3),
         "start_sec": metas[0].get("start_sec"),
-        "seek_rev": metas[0].get("seek_rev"),
         "end_sec": metas[-1].get("end_sec"),
         "timebase": "pts",
         "pts_first_sec": firsts[0],
         "pts_last_sec": lasts[-1],
+        "cell_first": metas[0].get("cell_first"),
+        "cell_last": metas[-1].get("cell_last"),
         "cuts_sec": cuts_sec,
         "part_wall_sec": [x.get("wall_sec") for x in metas],
     })

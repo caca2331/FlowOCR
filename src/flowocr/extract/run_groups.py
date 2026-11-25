@@ -61,8 +61,8 @@ def check_rest(rest: list[str]) -> None:
 
 
 def hub_wanted(args) -> str:
-    """该不该起广播解码：返回不起的原因（空 = 起）。**看 `resolve_split` 之后的值**（审核：`--decode-shards 0/1` / `--decoder cv2` /
-    `--frame-select index` 时各组根本不会去接广播进程，它就永远等不满订阅数、全体挂到超时）。纯函数，守卫直接测。"""
+    """该不该起广播解码：返回不起的原因（空 = 起）。**看 `resolve_split` 之后的值**（审核：`--decode-shards 0/1`、
+    分片被别的组合关掉时各组根本不会去接广播进程，它就永远等不满订阅数、全体挂到超时）。纯函数，守卫直接测。"""
     import contextlib
     import copy
     import io

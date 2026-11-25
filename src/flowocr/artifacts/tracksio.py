@@ -53,6 +53,8 @@ import json
 import math
 from pathlib import Path
 
+from flowocr.artifacts import textdir
+
 SCHEMA = "flowocr-tracks/1"
 
 ALIGNS = ("left", "center", "right")
@@ -95,13 +97,43 @@ SAMPLE_SLACK = 1.5
 `frame_us` 0.50018 s）卡在"一个间隔"的边上，它们也不是"被拉早"。时间疑点检测（`timing_check`）和正文块起点的修正（`scriptmatch.body_start`）共用。"""
 
 
-def same_row(a, b) -> bool:
-    """两个框（`[x0, y0, x1, y1]`）在不在同一行。"""
-    ha, hb = a[3] - a[1], b[3] - b[1]
+def vertical_line(b, text: str) -> bool:
+    """这个框（`[x0, y0, x1, y1]`）和它的字是不是一列竖排字（`textdir.vertical`：竖条、读数像竖排）。是的话"行"的几何对它转置——
+    列宽当字高、上下当左右。竖条框装着单个窄字（`Ⅱ`、数字）或乱码的照横排算：按列算它们会被排到所有横排行之后
+    （2026-11-23 wuwa 文字墙的 `Ⅱ`）。下面几个行几何的函数因此都要框和字一起给。"""
+    return textdir.vertical(b, text)
+
+
+def same_row(a, b, ta: str, tb: str) -> bool:
+    """两个框（`[x0, y0, x1, y1]`，字是 `ta` / `tb`）在不在同一行：字高（竖排是列宽）比不超过 `ROW_H_RATIO`、垂直于行的方向重叠过半。
+    两个都是竖排的列时（`vertical_line`）"行"是一列、比左右；**一竖一横的不算同一行**：同一行的成员要按同一个轴排、拼
+    （`reading_key`），混着的话横排按左沿、竖排按上沿，排出来没有意义（2026-11-23 全部 264 份 tracks 里同一条 cue 的一竖一横 33 对，原来判同一行的 1 对）。"""
+    va, vb = vertical_line(a, ta), vertical_line(b, tb)
+    if va != vb:
+        return False
+    if va:
+        a0, a1, b0, b1 = a[0], a[2], b[0], b[2]
+    else:
+        a0, a1, b0, b1 = a[1], a[3], b[1], b[3]
+    ha, hb = a1 - a0, b1 - b0
     lo, hi = min(ha, hb), max(ha, hb)
     if lo <= 0 or hi > ROW_H_RATIO * lo:
         return False
-    return min(a[3], b[3]) - max(a[1], b[1]) >= ROW_OVERLAP * lo
+    return min(a1, b1) - max(a0, b0) >= ROW_OVERLAP * lo
+
+
+def along_overlap(a, b, ta: str, tb: str) -> float:
+    """两个框顺着行的方向重叠了多少，占较短那个的比例（同一行上的"同一处字"）。两个都是竖排的列时按上下比，否则按左右比。"""
+    if vertical_line(a, ta) and vertical_line(b, tb):
+        a0, a1, b0, b1 = a[1], a[3], b[1], b[3]
+    else:
+        a0, a1, b0, b1 = a[0], a[2], b[0], b[2]
+    return (min(a1, b1) - max(a0, b0)) / max(1e-9, min(a1 - a0, b1 - b0))
+
+
+def reading_key(b, text: str) -> float:
+    """行内的先后：横排按左沿（从左往右），竖排的列按上沿（从上往下）。"""
+    return b[1] if vertical_line(b, text) else b[0]
 
 
 def boxes_cross(a, b) -> bool:
@@ -249,19 +281,28 @@ class EventIndex:
         return [e for e in self.window(t - self.span_us, t + slack) if e["t_end"] > t]
 
 
-def row_index(boxes: list) -> list[int]:
+def row_index(boxes: list, texts: list[str]) -> list[int]:
     """每个框归到第几行：按纵向中心从上往下贪心归行，一个框要和这一行的**每个**成员都 `same_row` 才进这一行，
     不做传递闭包——一个字高介于两行之间的框（称号、略大的一行）同时压着上下两行时，并查集会把两行串成一行，
-    拼行时横向间隙是负数、两行字被横着拼在一起。行按成员纵向中心的均值从上往下编号；结果只看几何，和输入顺序无关。"""
+    拼行时横向间隙是负数、两行字被横着拼在一起。结果只看几何，和输入顺序无关。
+
+    行号就是阅读顺序：横排的行按成员纵向中心的均值从上往下排在前，竖排的列（成员全是竖排的列的行，`vertical_line`）
+    按横向中心的均值**从右往左**排在后——日文竖排一列读完往左换列。横竖同在一条 cue 里的少见（同一处的说明字一般只有一种写法），
+    先横后竖只是定一个确定的顺序。"""
     n = len(boxes)
     groups: list[list[int]] = []
     for i in sorted(range(n), key=lambda i: ((boxes[i][1] + boxes[i][3]) / 2, boxes[i][0], i)):
-        g = next((g for g in groups if all(same_row(boxes[i], boxes[j]) for j in g)), None)
+        g = next((g for g in groups if all(same_row(boxes[i], boxes[j], texts[i], texts[j]) for j in g)), None)
         if g is None:
             groups.append([i])
         else:
             g.append(i)
-    order = sorted(groups, key=lambda m: (sum((boxes[i][1] + boxes[i][3]) / 2 for i in m) / len(m), min(m)))
+
+    def key(m):
+        if all(vertical_line(boxes[i], texts[i]) for i in m):
+            return (1, -sum((boxes[i][0] + boxes[i][2]) / 2 for i in m) / len(m), min(m))
+        return (0, sum((boxes[i][1] + boxes[i][3]) / 2 for i in m) / len(m), min(m))
+    order = sorted(groups, key=key)
     out = [0] * n
     for k, m in enumerate(order):
         for i in m:
@@ -422,20 +463,24 @@ def join_row_text(a: str, b: str) -> str:
 
 
 def rows_of_events(evs: list[dict]) -> list[dict]:
-    """一组事件按可见的行拼好：`row_index` 分行，行内从左到右，横向间隙 ≤ `ROW_JOIN_GAP` 倍行高的相邻两段拼成一行
-    （框取并集、文字按 `join_row_text` 相接），隔得更远的同一行各自成行。返回 `[{"events", "box", "text"}]`，按行从上往下、行内从左往右。"""
+    """一组事件按可见的行拼好：`row_index` 分行，行内从左到右（竖排的列从上到下，`reading_key`），顺着行的间隙
+    ≤ `ROW_JOIN_GAP` 倍行高（竖排是列宽）的相邻两段拼成一行（框取并集、文字按 `join_row_text` 相接），隔得更远的同一行各自成行。
+    返回 `[{"events", "box", "text"}]`，按 `row_index` 的阅读顺序（横排从上往下，竖排从右往左）。"""
     if not evs:
         return []
-    row = row_index([e["box"] for e in evs])
-    order = sorted(range(len(evs)), key=lambda i: (row[i], evs[i]["box"][0], i))
+    row = row_index([e["box"] for e in evs], [e["text"] for e in evs])
+    order = sorted(range(len(evs)), key=lambda i: (row[i], reading_key(evs[i]["box"], evs[i]["text"]), i))
     out: list[dict] = []
     for i in order:
         e = evs[i]
         b = list(e["box"])
         last = out[-1] if out else None
         if last is not None and last["row"] == row[i]:
-            h = max(b[3] - b[1], last["box"][3] - last["box"][1])
-            if b[0] - last["box"][2] <= ROW_JOIN_GAP * h:
+            if vertical_line(b, e["text"]) and vertical_line(last["box"], last["text"]):
+                h, gap = max(b[2] - b[0], last["box"][2] - last["box"][0]), b[1] - last["box"][3]
+            else:
+                h, gap = max(b[3] - b[1], last["box"][3] - last["box"][1]), b[0] - last["box"][2]
+            if gap <= ROW_JOIN_GAP * h:
                 last["events"].append(e)
                 last["box"] = [min(last["box"][0], b[0]), min(last["box"][1], b[1]), max(last["box"][2], b[2]), max(last["box"][3], b[3])]
                 last["text"] = join_row_text(last["text"], e["text"])

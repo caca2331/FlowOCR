@@ -17,7 +17,7 @@
 | 模块 | 做什么 | 现行说明 |
 | --- | --- | --- |
 | `flowocr.extract.run_ocr2` / `run_groups` | 解码、采样、det / rec、复用判据、在线回抠证据 -> obs | [pipeline.md](pipeline.md)（全流程）、[defaults.md](defaults.md)、下面三节 |
-| `flowocr.extract.framesource` / `framegrid` / `decode_*` / `supervisor` | 取帧（软硬解、pts、时间网格、分片、硬解失败的整体退回） | [帧身份与解码](#帧身份与解码) |
+| `flowocr.extract.framesource` / `framegrid` / `decode_*` / `supervisor` | 取帧（软硬解、pts、时间桶、分片、硬解失败的整体退回） | [帧身份与解码](#帧身份与解码) |
 | `flowocr.extract.ort_server` / `ortclient` / `recort` / `recpool` / `fast_det` / `detpost` | ORT 推理服务与 rec 组批；det 的前处理、配置与后处理 | [推理服务](#推理服务) |
 | `flowocr.extract.ocr_args` / `ocr_complete` | 参数解析（唯一一份）与 obs 复用判据 | [obs 复用判据](#obs-复用判据) |
 | `flowocr.analyze.build_tracks` / `uigate` / `nameplate` / `align` | run -> 区域 -> 槽位 -> 轨，常驻 UI 与名牌打标，区域的对齐方式 | [defaults.md](defaults.md)、[已知的坑](../dev-guide/pitfalls.md) |
@@ -65,20 +65,38 @@
 
 ## 帧身份与解码
 
-- **帧身份一律是 pts 帧号** `round(t × 名义帧率)`（`framesource.id_rate`）：采样帧、辅助流帧环的键、obs 的 `frame` 同一套。平均帧率在有缺口的文件上会撞号。
-- 两路 pts 从命名的 `showinfo@main` / `@aux` 分流，按 showinfo 的 `n` 逐帧核对：撞号 / 丢行当场报，绝不静默错位。
-- 采样和辅助流都按**时间网格**取帧（`extract/framegrid.py`）：`--fps` / `--aux-max-fps` 不要求整除，采样帧一定在辅助流里；不整除的采样要求最长间隔 < 1.5 个名义间隔；NTSC 帧率吸附成等距。依据见 [defaults.md](defaults.md) [§1.23](defaults.md#123-采样和辅助流都按时间网格取帧--fps----aux-max-fps-602026-09-24-owner-要的功能)。
-- 硬解（默认 `--hwaccel cuda`）：偏离格子才算交付错；缺格问 `source_has_frames`（源里有 = NVDEC 吞帧，没有 = 素材缺口、放行）。
-  有前摇的 av1 从文件头起解（`-ignore_editlist` + 整数刻度 `setpts` 平移，试解核像素）。开头 `hwaccel_blocker` 试解 4 格、不过就退回软解；
-  中途 `HwaccelMismatch` -> worker 退出码 75 -> 外层监督者按进程树收尾、确认清空之后再起软解那一趟（`_meta.hwaccel_fallback`）。
-- 硬解的回抠证据 `edge` 和软解不等价（缩放器不同），所以软硬解的 obs 互不复用；两种解码器（ffmpeg / cv2）的产物也不混用。
+- **帧身份是这一帧自己的时间戳** `t_us = round(pts_time × 1e6) − S`（整数微秒；S 是容器的 `format.start_time`，播放器和阶段 5 烧录用的也是这条时间轴）：
+  采样帧、辅助流帧环的键、obs 行、回抠证据里的时刻都是它，换算只在 `framegrid.frame_key` 一处；obs 行没有帧号字段。
+  不猜"帧身份用的帧率"，所以名义帧率报错的素材、VFR、有缺口的录像上都不会撞号。键必须严格递增（主路、辅路、分片合流各核一次），同一 pts 出现两次的坏文件当场报错。
+- **每个时间桶取第一帧**（`extract/framegrid.py`）：目标点 `T_k = k / f` 锚在 0 上，一帧的桶号是 `floor((t + δ) · f)`，δ = 1000.5 µs；
+  一帧入选 ⇔ 它的桶号和上一个输入帧的不同，也就是"在目标点取该时刻及之后的第一帧、取到同一帧只留一帧"。`--fps` 不要求整除素材帧率；素材缺口和 VFR 的稀处只是空桶（`_meta.cells_skipped` 记数）。
+  ffmpeg 的 `select` 和 Python 做同一串双精度运算（运算顺序同表达式），两边选同一批帧。
+  辅助流按"名义帧率 / k"（不超过 `--aux-max-fps`）分桶，辅助桶**或**采样桶换了就入选，所以采样帧一定在辅助流里。取值和依据见 [defaults.md](defaults.md) [§1.79](defaults.md#179-帧身份是帧自己的时间戳按时间桶取帧2026-11-23-owner-定帧身份计划)。
+- **窗口**：`--start` / `--end` 吸附到最近的目标点，窗口是整桶的并集；精确 seek 落在起点前 δ + 1 ms，所以窗口跑、`--workers N` 的各段和整片跑取到同一批帧。
+  窗口尾靠输入端 `-t` 加 `select` 的范围收口，各路一律读到 EOF，不按预计帧数读（VFR 上预计不了）。
+- **pts 怎么取**：取帧层一律 `-copyts`，交出的 pts 和 ffprobe 读的包 pts 是同一把尺；两路从命名的 `showinfo@main` / `@aux` 分流，按 showinfo 的 `n` 逐帧核对：撞号 / 丢行当场报，绝不静默错位。
+  桶号在解析 showinfo 时由整数 `pts` 算好、随帧走过分片的块和合流；开流时核前几帧 `pts × 时间基` 与 `pts_time` 到 µs 一致，滤镜链路换了时间基（桶号会算错）就报错。
+- **解码分片**（[defaults.md 1.18](defaults.md#118-解码分片--decode-shards-22026-09-24decode-buffer)）的块按关键帧切、块的范围按整数 pts `[关键帧, 下一个关键帧)` 写；
+  块的第一帧看不到它真正的上一帧、会被当成新桶选中，合流时它和合流里上一个交出的帧同格就丢掉（接缝去重，`decode_shards.seam_drop`）。
+  前提是容器逐帧带 pts、解码帧的 pts 等于包的 pts；裸 h264 / AVI 这类缺 pts 的容器上可能不成立，现有素材碰不到。
+- 硬解（默认 `--hwaccel cuda`）：被吞的帧会由同一桶的下一帧顶上、只晚一个源帧，看交出的帧本身查不出来，所以核对都问源文件（`framesource.PacketIndex`，按 60 s 一段批量取包 pts、缓存）：
+  - 开跑前 `hwaccel_blocker` 试解窗口起点之后 4 个采样桶，硬解和软解交出的 pts 列表逐个比，不一致就整段改软解（兜住 NVDEC 少交头 1–3 帧）；
+  - 中途两条：相邻采样帧之间隔了空桶，问那几个桶里源里有没有包；采样帧比它的桶起点晚了超过 1.5 个参考帧间隔，问 `[桶起点, 这一帧)` 里有没有包。源里有 = 解码器吞帧，没有 = 素材缺口、放行；
+  - 分片下这两条在块内做；块尾由合流方探到块终点，块交出的第一帧在硬解路上另补一道（`decode_shards.block_first_eaten`）。
+- 有前摇的 av1 硬解时从文件头起解（`-ignore_editlist` + 整数刻度 `setpts` 平移，试解再核像素）。
+  硬解中途 `HwaccelMismatch` -> worker 退出码 75 -> 外层监督者按进程树收尾、确认清空之后再起软解那一趟（`_meta.hwaccel_fallback`）。
+- **参考帧率** `_meta.src_fps`（`framesource.ref_rate`）：名义帧率（`r_frame_rate`，另记 `_meta.nominal_fps`）在 `[平均帧率 × 0.999, 平均帧率 × 2]` 里就取名义，否则取平均。
+  它只给下游算"一个源帧多长"的容差和上面那道 1.5 个参考帧间隔的门，不决定任何帧的身份；判错的后果只是容差差一点，不会撞号、丢帧或判未完成。
+- 硬解的回抠证据 `edge` 和软解不等价（缩放器不同），所以软硬解的 obs 互不复用。
 - 回抠：阶段 1 在线量证据（obs 行的 `edge`，`--refine-fused` 默认开），阶段 2 `build_tracks --refine auto` 只读这些证据结算、不开视频；空臂 `--refine-aux noop` 和 `_meta.edge.on = 0` 都不算有证据（产物停在采样级），有证据却一条都认领不到就非零退出。
-  开视频的离线测量（av1 走 ffmpeg 窗口解码、其余 cv2）只留在开发探针 `dev_tools/refine_offline_probe.py` 里核对在线证据。依据见 reuse-budget 计划。
+  帧环的键是 `t_us`、按时间取 `[lo, hi]` 里的帧，容量按时间算（跨度 ×（辅助帧率 + 采样帧率）+ 余量）。证据不存窗口里每帧的真实时刻，结算时把候选时刻吸附到辅助流的目标点上：
+  pts 精确的素材上和真实帧差不到 1 µs，pts 按毫秒取整的实测到 ±0.67 ms；证据里的逐帧候选也先吸附到这组目标点上再融合（混着比时零点几毫秒就能把融合判"同意"的两票拆开）。没有开视频的离线测量，在线证据的质量由打字机真值把关。
 - 辅助流是整条管线最大的搬运方（300 s 窗 540p 时 9.3 GB，采样流 1.87 GB），成本在搬运不在缩放。
 - 辅助写端在连接与认证前登记可取消的单一 socket 所有者；MP 适配器仅借用句柄，不负责关闭数字句柄。
   正常结束须排空并交付 PTS 结束标记；显式取消才可丢弃对应同伴的排队帧，不能伪造正常结束。
   广播同伴分别取消，全部离开才取消源；分片收尾串行登记清理错误、等待工作线程，清理失败通过错误消息交回调用方，并继续回收共享内存。
-- 契约测试：`dev_tools/aux_identity_check.py`（同号同画面）、`dev_tools/hw_retry_check.py`（重试前整棵树退干净）。实测与来历见 hw-decode-results 报告。
+- 契约测试：守卫里的选帧契约（`tests/guards/extract.py` 的 `t_select_contracts`，合成小视频现造：桶号对 ffmpeg `select`、`start_time` 非零时整片 / 窗口 / 两段拼、开放 GOP 的前导帧）；
+  `dev_tools/aux_identity_check.py`（同一个 `t_us` 同一张画面，环里的键正好是按时间桶模拟出的那一批）、`dev_tools/hw_retry_check.py`（重试前整棵树退干净）。
 
 ## 推理服务
 
@@ -138,7 +156,7 @@
 
 ## obs 复用判据
 
-驱动只复用"跑完了、pts 时间轴、当前默认解码器、同一窗口、同一组**生效**参数"的 obs（`flowocr.extract.ocr_complete`，参数按 `ocr_args` 解析后比，默认值翻了也拦）。
+驱动只复用"跑完了、pts 时间轴、帧身份是 `t_us`、同一窗口、同一组**生效**参数"的 obs（`flowocr.extract.ocr_complete`，参数按 `ocr_args` 解析后比，默认值翻了也拦）。
 参数按对复用的影响分四档，集合定义在 `src/flowocr/extract/ocr_args.py`：
 
 | 档 | 含义 | 进这一档的条件 |
@@ -152,5 +170,7 @@
 `rec_engine` / `det_engine` 已不是选项（2026-10 去掉 Paddle 之后只有 ORT），但照旧固定写进 config 当身份串：没有这两个键的旧 obs 按 `ADDED_NOOP` 记成 `paddle`，
 对现在的 `ort` 判差异，免得 Paddle 产的旧产物被当成 ORT 的复用。`det_engine` 按条件豁免（`NOISE_EQUIV_IF`，只限默认 det 模型 + 官方 ONNX 那一对：两种 det 的产物按噪音级复用）。改产物的旋钮一翻默认，磁盘上现成 obs 的 config 就对不上、驱动会一律重建——这是有意的。
 obs 头（`_meta`）里的参数只看 `config`（解析后的生效值），不记命令行原样（`argv`）；`video` 记成可移植的路径（数据根下相对、用户目录下 `~/…`），复用判据比之前两边都先换成这个形式。画面宽高是必需字段：缺宽高的是很早的 obs，建轨直接报错让重跑提取，不再开视频补探（2026-10-06）。
-代码指纹不进复用判据（改一下代码就重跑所有整片不划算，只提示）；所以改了"读哪一帧"的修复要自己认出受影响的旧产物、局部作废：
-精确 seek 退半帧（2026-09-26）之前的产物没有 `_meta.seek_rev`，其中窗口从片中起、记了缺格、首个采样点晚了一个采样间隔以上的——首格被丢的那个形状——重建，别的照旧复用（`ocr_complete.seek_dropped_first`）。
+代码指纹不进复用判据（改一下代码就重跑所有整片不划算，只提示）；所以改了"读哪一帧"的修复要自己认出受影响的旧产物、作废：
+帧身份是 `t_us`、按时间桶选帧（[帧身份与解码](#帧身份与解码)）的 obs 记 `_meta.frame_key = "t_us"`，没有这个标记的旧 obs 一律不复用（原因写"帧身份是旧的帧号，重跑阶段 1"）；
+建轨读到它且要回抠（`--refine auto`）时报同样的原因退出，`--refine off` 照读（那条路只用 `t_us`），旧的 `tracks.json` 下游照读。
+采样桶和辅助桶要结合素材的名义帧率才定得下来：`--aux-max-fps` 不按原值比（60 fps 素材上 60 和 120 是同一回事），而是和 `--fps` 一起按产物自己的 `_meta.nominal_fps` 算出生效值、和 `_meta.sample_clock` / `aux_clock` 比。

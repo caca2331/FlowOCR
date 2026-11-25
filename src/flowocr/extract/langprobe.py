@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         path = models.path(name)                         # 缺了当场取（断网就在这里报错，不悄悄退回默认）
         cli, used = client({"rec": path})
         try:
-            rec = recort.OrtRec(model=path, client=cli, pre="client")
+            rec = recort.OrtRec(model=path, client=cli, pre="client", vertical=args.rec_vertical)
             scores[lang] = score(rec.predict(crops, batch_size=16)) if crops else (0.0, 0)
         finally:
             cli.close()

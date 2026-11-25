@@ -92,107 +92,95 @@ def t_added_knobs() -> None:
     print("ocr_args.config_differs / ADDED_NOOP")
     from flowocr.extract import ocr_args
 
-    # 采样 / 辅助流按时间网格取帧（2026-09-24，framegrid）：生效网格 + 复用判据按生效网格比
-    from flowocr.extract.framegrid import AuxGrid, TimeGrid
-    _s = lambda src, fps=2.0, sel="pts": ocr_args.sample_grid(src, fps, sel)
-    check("采样网格：60 上 2 fps = 每 30 帧（等距）、59.94 上 2 fps 不等距（1001/30000）、60 上 8 fps 不等距（2/15）",
-          _s(60) == TimeGrid.every(30) and _s(60000 / 1001) == TimeGrid(1001, 30000) and _s(60, 8) == TimeGrid(2, 15)
-          and _s(60, 8).frames(0, 30) == [0, 8, 15, 23, 30])
-    check("采样网格：最长间隔不小于 1.5 个名义间隔 -> 报错（下游的容差盖不住）；整除的照样放行（60 上 30 / 60）",
-          raises(lambda: _s(60, 45), ValueError) and _s(60, 40) == TimeGrid(2, 3)
-          and _s(60, 30) == TimeGrid.every(2) and _s(60, 60) == TimeGrid.every(1))
-    _ntsc = 60000 / 1001
-    check("**NTSC 帧率吸附**（2026-09-24 审计）：59.94 素材上给 29.97 / 59.94、23.976 上给 23.976 都是等距；给 2 仍是真时间网格",
-          _s(_ntsc, 29.97) == TimeGrid.every(2) and _s(_ntsc, 59.94) == TimeGrid.every(1)
-          and _s(24000 / 1001, 23.976) == TimeGrid.every(1) and _s(_ntsc, 2) == TimeGrid(1001, 30000)
-          and ocr_args.aux_grid(_ntsc, 2, 59.94).key() == ("step", 1) and _s(_ntsc, 30) == TimeGrid(1001, 2000))
-    check("辅助流上限是上限：119.88 fps 素材给 60 -> 自己那部分隔帧（59.94，不为多出的 0.1% 走不等距网格；采样 2 fps 在那上面本身不整除，并集照样带上）；"
-          "60 给 25 / 144 给 60 仍是时间网格",
-          ocr_args.aux_grid(2 * _ntsc, 2, 60).own == TimeGrid.every(2) and ocr_args.aux_grid(120, 2, 60).key() == ("step", 2)
-          and not ocr_args.aux_grid(60, 2, 25).uniform and ocr_args.aux_grid(144, 2, 60).key() == (5, 12, 1, 72))
-    check("按帧号数的选法（index / cv2）退回最近的整数步长（加时间网格之前的行为）",
-          _s(60, 8, "index") == TimeGrid.every(8) and _s(60000 / 1001, 2, "index") == TimeGrid.every(30))
-    _g = lambda src, mx=60.0, fps=2.0: ocr_args.aux_grid(src, fps, mx)
-    check("辅助流生效网格：60 fps -> 每帧、120 -> 隔帧（等距）、59.94 -> 每帧、60 给 30 -> 隔帧、60 给 25 / 144 -> 不等距",
-          [_g(60).key(), _g(120).key(), _g(60000 / 1001).key(), _g(60, 30).key()] == [("step", 1), ("step", 2), ("step", 1), ("step", 2)]
-          and not _g(60, 25).uniform and not _g(144).uniform and _g(144).key() == (5, 12, 1, 72),
-          [_g(60).key(), _g(120).key(), _g(60000 / 1001).key(), _g(60, 25).key(), _g(144).key()])
-    check("辅助流上限比采样帧率还低 -> 报错（辅助流不能比采样还粗）", raises(lambda: _g(60, 1), ValueError))
-    # 选帧规则：时间网格 + 采样帧嵌套；等距时退化成"每 q 帧一帧"
-    _ng = AuxGrid(TimeGrid(5, 12), TimeGrid.every(72))
-    _mem = [i for i in range(0, 1440) if _ng.member(i)]            # 144 fps 上 10 秒
-    _gaps = {b - a for a, b in zip(_mem, _mem[1:])}
-    check("**嵌套**：采样帧全在辅助流里；不等距网格帧率 ≈ 上限（每秒 60 + 至多 2 帧采样）、间距 1~3 帧",
-          all(_ng.member(i) for i in range(0, 1440, 72)) and 600 <= len(_mem) <= 600 + 20 and _gaps <= {1, 2, 3},
-          (len(_mem), sorted(_gaps)))
-    _n8 = AuxGrid(TimeGrid(5, 12), TimeGrid(2, 15))                 # 采样也不等距（60 上 8 fps）
-    check("**嵌套**（采样也不等距）：采样网格上的帧全在辅助流里",
-          all(_n8.member(i) for i in TimeGrid(2, 15).frames(0, 3000)))
-    _ug = AuxGrid(TimeGrid.every(2), TimeGrid.every(30))
-    check("等距网格：frames / floor / ceil / prev / n_frames / cover_floor 都是原来的整除算术",
-          _ug.frames(21, 48) == list(range(22, 49, 2)) and _ug.floor(21) == 20 and _ug.ceil(21) == 22
-          and _ug.prev(48) == 46 and _ug.n_frames(60, 121) == 31 and _ug.cover_floor(90) == 89 and _ug.step == 2)
-    _tg = TimeGrid(1001, 30000)
-    check("TimeGrid 的闭式（第 k 格 = ceil(k·q/p)）和逐帧定义一致：member / floor / ceil / prev / next / frames",
-          all(_tg.member(i) == ((i * 1001) // 30000 != ((i - 1) * 1001) // 30000) for i in range(-60, 70000))
-          and all(_tg.floor(i) <= i <= _tg.ceil(i) and _tg.member(_tg.floor(i)) and _tg.member(_tg.ceil(i))
-                  and _tg.prev(i) < i < _tg.next(i) for i in range(1, 5000, 7))
-          and _tg.frames(0, 30000) == [i for i in range(0, 30001) if _tg.member(i)])
-    _g22 = TimeGrid(11, 300)                                          # 60 上 2.2 fps：格子 0 / 28 / 55 …
-    check("**nearest 按帧距取最近一格**（不等距时不能按格号四舍五入；一样近取前一格）；等距的逐位同原来的 round(x / q) * q",
-          _g22.nearest(13.7) == 0 and _g22.nearest(14.0) == 0 and _g22.nearest(14.1) == 28
-          and all(_g22.nearest(x + 0.3) == min(_g22.frames(0, 400), key=lambda m: (abs(m - x - 0.3), m)) for x in range(0, 360))
-          and [TimeGrid.every(30).nearest(x) for x in (44.9, 45.0, 75.0, 1234.5)]
-          == [int(round(x / 30)) * 30 for x in (44.9, 45.0, 75.0, 1234.5)])
-    check("不等距辅助网格：floor / ceil 落在网格上、prev 严格更小、frames 和 member 一致",
-          all(_ng.member(_ng.floor(i)) and _ng.floor(i) <= i and _ng.member(_ng.ceil(i)) and _ng.ceil(i) >= i
-              and _ng.prev(i) < i and _ng.member(_ng.prev(i)) for i in range(1, 300))
-          and _ng.frames(10, 40) == [i for i in range(10, 41) if _ng.member(i)] and _ng.step is None)
-    check("规范形：写法不同、帧集合相同就相等（旧产物的步长 = 等距网格；比值 ≥ 1 一律每帧）",
-          AuxGrid.from_spec({"step": 2}) == _ug and TimeGrid(3, 2) == TimeGrid.every(1)
-          and AuxGrid.from_spec({"grid": [5, 12, 1, 72]}) == _ng and _ng != AuxGrid(TimeGrid(5, 12), TimeGrid.every(36)))
-    # ffmpeg 表达式和 Python 的 member 选出同一批帧：拿 select 条件在 Python 里按 ffmpeg 的语义（double 运算）求值
-    import math as _m
+    # 采样 / 辅助流按时间桶取帧（frame-pts 计划，framegrid）：生效时间桶 + 复用判据按生效值比
+    from fractions import Fraction as _F
 
-    def _ev(cond, n):
-        c = cond.replace("\\,", ",")
-        return eval(c.replace("not(", "(0==").replace("mod(", "_mod(").replace("eq(", "_eq("),
-                    {"N": n, "_mod": lambda a, b: a - b * _m.floor(a / b), "_eq": lambda a, b: a == b, "floor": _m.floor})
-    _ns = list(range(0, 3000)) + list(range(1_296_000, 1_299_000))
-    check("**ffmpeg 选帧表达式和 Python 的 member 选出同一批帧**（辅助流 / 59.94 上的采样，6 小时帧号内抽查，double 精度不判错）",
-          all(bool(_ev(_ng.select("N"), n)) == _ng.member(n) for n in _ns)
-          and all(bool(_ev(_tg.select("N"), n)) == _tg.member(n) for n in _ns), _ng.select("N"))
-    check("等距网格生成的 ffmpeg 条件和时间网格之前逐字相同",
-          _ug.select("n") == "not(mod(n\\,2))" and AuxGrid(TimeGrid(1, 1), TimeGrid.every(30)).select("n") == ""
-          and TimeGrid.every(30).select("n") == "not(mod(n\\,30))")
+    from flowocr.extract.framegrid import AuxClock, Axis, Clock, SampleClock, Window
+    _ntsc = _F(60000, 1001)
+    _s = lambda nom, fps=2.0: ocr_args.sample_clock(nom, fps).rate
+    check("采样桶：就是 --fps；59.94 素材上 2 fps 不吸附（比值离 1/30 差 1e-3）、60 上 8 fps 照给（不再要求整除、不再拦最长间隔）",
+          _s(60) == 2 and _s(_ntsc) == 2 and _s(60, 8) == 8 and _s(60, 45) == 45 and _s(None, 2) == 2)
+    check("**NTSC 帧率吸附**（2026-09-24 审计）：59.94 素材上给 29.97 / 59.94、23.976 上给 23.976 吸附成名义帧率 × 简单分数",
+          _s(_ntsc, 29.97) == _F(30000, 1001) and _s(_ntsc, 59.94) == _ntsc and _s(_F(24000, 1001), 23.976) == _F(24000, 1001)
+          and _s("60000/1001", 29.97) == _F(30000, 1001))
+    _a = lambda nom, mx=60.0, fps=2.0: ocr_args.aux_clock(nom, fps, mx).own.rate
+    check("辅助桶 = 名义帧率 / k（不超过上限）：60 给 60 / 30 -> 60 / 30，120 -> 60（隔帧），119.88 -> 59.94，59.94 -> 59.94",
+          [_a(60), _a(60, 30), _a(120), _a(2 * _ntsc), _a(_ntsc)] == [60, 30, 60, _ntsc, _ntsc])
+    check("名义 / k 超上限时取上限本身：60 给 25、144 给 60；名义帧率是时间基推出来的（1000/1）按 k = 17 分桶（plan：接受约 2% 的辅助帧损失）",
+          _a(60, 25) == 25 and _a(144) == 60 and _a(1000) == _F(1000, 17) and _a(None, 30) == 30)
+    check("辅助流上限比采样帧率还低 -> 报错（辅助流不能比采样还粗）", raises(lambda: ocr_args.aux_clock(60, 2, 1), ValueError))
+    # 桶号：Python 逐位复刻 ffmpeg 的双精度；表达式的字面就是那串运算
+    import math as _m
+    _c60, _c2 = Clock(60), SampleClock(2)
+    _a0 = Axis((1, 60))
+    check("ffmpeg 表达式的字面：floor((t+0.0010005)*N/D)；换桶条件比的是上一个输入帧（prev_t）",
+          _c2.expr("t") == "floor((t+0.0010005)*2/1)"
+          and _c2.changed(_a0) == r"not(eq(floor((t+0.0010005)*2/1)\,floor((prev_t+0.0010005)*2/1)))"
+          and AuxClock(_c60, _c2).changed(_a0) == (r"not(eq(floor((t+0.0010005)*60/1)\,floor((prev_t+0.0010005)*60/1))"
+                                               r"*eq(floor((t+0.0010005)*2/1)\,floor((prev_t+0.0010005)*2/1)))"))
+    check("容器 start_time = S ≠ 0 时表达式在 t − S 上：S 写成整数 µs / 1e6（负的 S 写成加）",
+          _c2.changed(Axis((1, 60), 2_000_000))
+          == r"not(eq(floor(((t-2000000/1000000)+0.0010005)*2/1)\,floor(((prev_t-2000000/1000000)+0.0010005)*2/1)))"
+          and Axis((1, 60), -21_333).t_expr("t") == "(t+21333/1000000)")
+
+    def _ev(expr: str, t: float) -> int:          # 按 ffmpeg 的求值顺序（左结合、double）在 Python 里算表达式
+        return eval(expr.replace("floor", "_f"), {"_f": _m.floor, "t": t})
+    _tbs = [(1, 1000), (1, 16000), (1, 15360), (1, 24000), (1, 90000), (1, 10_000_000), (1001, 60000)]
+    _pts = [(tb, p) for tb in _tbs for p in range(0, 40 * tb[1] // tb[0], max(1, tb[1] // tb[0] // 997))]
+    _origins = (0, 2_000_000, 1_234_567, -21_333)    # 容器的 start_time（µs）
+    check("桶号的 Python 复刻 = 表达式按 double 求值（7 种时间基 × 4 种 start_time、0–40 s 抽查）；精确有理数只作参照、两者都落在同一桶的占绝大多数",
+          all(_c2.cell(p, Axis(tb, o)) == _ev(_c2.expr(Axis(tb, o).t_expr("t")), float(p) * (tb[0] / tb[1]))
+              for tb, p in _pts for o in _origins)
+          and sum(_c2.cell(p, Axis(tb)) != _c2.cell_exact(p, Axis(tb)) for tb, p in _pts) <= len(_pts) // 1000, len(_pts))
+    _b = 5_000_000 - 10_005                         # 1/10^7 时间基上正好落在第 1 个桶边界（T_1 − δ）上的帧
+    check("δ = 1000.5 µs：毫秒时间基上正好早 1 ms 的帧（499 ms）离边界 0.5 µs、算进目标点那个桶；早 2 ms 的算前一个桶",
+          _c2.cell(499, Axis((1, 1000))) == 1 and _c2.cell(498, Axis((1, 1000))) == 0
+          and _c2.cell(_b - 1, Axis((1, 10_000_000))) == 0 and _c2.cell(_b + 1, Axis((1, 10_000_000))) == 1
+          and _c2.cell(2499, Axis((1, 1000), 2_000_000)) == 1 and _c2.cell(2498, Axis((1, 1000), 2_000_000)) == 0)
+    check("目标点：辅助桶与采样桶的 T_k（整数 µs、升序去重、闭区间）",
+          AuxClock(Clock(30), _c2).targets_us(0, 100_000) == [0, 33333, 66667, 100000]
+          and AuxClock(Clock(_ntsc), _c2).targets_us(480_000, 520_000) == [483817, 500000, 500500, 517183]
+          and AuxClock(Clock(30), _c2).targets_us(1, 33_000) == [])
+    _w = Window.of(_c2, 14843.2, 14903.4)
+    check("窗口：起止吸附到最近的目标点、整桶的并集；精确 seek 落在 T_a − δ − 1 ms；-t 读到 T_b − δ 再多 1 s；--end 0 不设上限",
+          (_w.a, _w.b) == (29686, 29807) and abs(_w.seek_sec() - (14843.0 - 0.0020005)) < 1e-9
+          and abs(_w.read_sec(_w.seek_sec()) - (14903.5 - 0.0010005 - _w.seek_sec() + 1.0)) < 1e-9
+          and Window.of(_c2, 0, 0).b is None and Window.of(_c2, 0, 0).seek_sec() == 0.0
+          and Window.of(_c2, 0.0009, 0).seek_sec() == 0.0 and raises(lambda: Window.of(_c2, 10.1, 10.2), ValueError))
+    from flowocr.extract.framesource import select_range
+    check("窗口的 select 范围是采样桶号表达式（不另写 gte(t, …)）；负时刻的门在 t − S 上",
+          select_range(_w, _a0) == r"gte(t\,0)*gte(floor((t+0.0010005)*2/1)\,29686)*lt(floor((t+0.0010005)*2/1)\,29807)"
+          and select_range(Window(_c2, 0, None), _a0) == r"gte(t\,0)*gte(floor((t+0.0010005)*2/1)\,0)")
+    check("--workers 的切点按桶号等分（切点就是目标点）；--end 0 按容器时长折的桶号切；太短切不开",
+          Window(_c2, 29686, 29722).split(3, 0) == [29698, 29710] and Window(_c2, 0, None).split(2, 600) == [300]
+          and Window(_c2, 0, 100).split(1, 0) == [] and raises(lambda: Window(_c2, 0, 2).split(3, 0), ValueError))
     import json
-    from flowocr.extract import framesource as _fs, ocr_complete as _oc
+    from flowocr.extract import ocr_complete as _oc
     _argv = ["x.mp4", "--out", "y.jsonl"]
     with tempfile.TemporaryDirectory() as _d:
-        def _reusable(src_fps, meta_extra, argv_extra=(), cfg_extra=None):
+        def _reusable(meta_extra, argv_extra=(), drop=()):
             _p = Path(_d) / "o.jsonl"
-            _cfg = {k: v for k, v in ocr_args.config_of(_argv).items() if k != "aux_max_fps"}   # 加旋钮之前的产物没有这个键
-            _cfg.update(cfg_extra or {})
-            _p.write_text(json.dumps({"_meta": {"complete": True, "timebase": "pts", "decoder": _fs.DEFAULT_DECODER,
-                                                "config": _cfg, "src_fps": src_fps, "stride": round(src_fps / 2),
-                                                **meta_extra}}) + "\n", encoding="utf-8")
-            return _oc.obs_reusable(_p, [*_argv, *argv_extra])[0]
-        check("旧产物（没有 aux_max_fps、没记网格、config 里 refine_step 1）：60 fps 照样复用，120 fps 重建（旧的是每帧、现在隔帧）",
-              _reusable(60.0, {}, cfg_extra={"refine_step": 1}) and not _reusable(120.0, {}, cfg_extra={"refine_step": 1}))
-        check("加时间网格之前记了生效步长的产物：120 fps 隔帧的复用；要的上限改成 120 就对不上",
-              _reusable(120.0, {"aux_step_effective": 2})
-              and not _reusable(120.0, {"aux_step_effective": 2}, ["--aux-max-fps", "120"]))
-        check("新产物记生效网格：60 fps 给 25 的复用自己、和 30 的不混用",
-              _reusable(60.0, {"aux_grid": [5, 12, 1, 30]}, ["--aux-max-fps", "25"])
-              and not _reusable(60.0, {"aux_grid": [5, 12, 1, 30]}, ["--aux-max-fps", "30"])
-              and _reusable(60.0, {"aux_grid": [1, 2, 1, 30]}, ["--aux-max-fps", "30"]))
-        check("`--refine-step` 删了：旧产物记着 refine_step 2 的（60 fps）当成隔帧，要默认（每帧）就重建",
-              not _reusable(60.0, {}, cfg_extra={"refine_step": 2})
-              and _reusable(60.0, {}, ["--aux-max-fps", "30"], cfg_extra={"refine_step": 2}))
-        check("**采样网格按生效值比**：59.94 fps 的旧产物（每 30 帧一帧）要重建（现在按时间网格取）；新产物记 sample_grid 的复用",
-              not _reusable(60000 / 1001, {})
-              and _reusable(60000 / 1001, {"sample_grid": [1001, 30000], "aux_grid": [1, 1, 1001, 30000]})
-              and _reusable(60.0, {"sample_grid": [1, 30]}))
+            _m0 = {"complete": True, "timebase": "pts", "frame_key": "t_us", "config": ocr_args.config_of([*_argv, *argv_extra]),
+                   "nominal_fps": 60.0, "sample_clock": [2, 1], "aux_clock": [60, 1, 2, 1], **meta_extra}
+            for k in drop:
+                _m0.pop(k, None)
+            _p.write_text(json.dumps({"_meta": _m0}) + "\n", encoding="utf-8")
+            return _oc.obs_reusable(_p, [*_argv, *argv_extra])
+        check("复用判据拒收没有 `frame_key` 的旧 obs（帧身份是旧的帧号，重跑阶段 1）",
+              _reusable({}) == (True, "") and _reusable({}, drop=("frame_key",))[0] is False
+              and "帧身份是旧的帧号" in _reusable({}, drop=("frame_key",))[1]
+              and _reusable({"frame_key": "nominal"})[0] is False,
+              (_reusable({}), _reusable({}, drop=("frame_key",))))
+        check("sample_clock / aux_clock 按生效值比（守卫钉 high 档，辅助流 60）：60 fps 素材上 --aux-max-fps 60 和 25 不混用；120 fps 素材上 60 = 120（都是每帧都要）",
+              _reusable({"aux_clock": [25, 1, 2, 1]}, ["--aux-max-fps", "25"])[0]
+              and not _reusable({}, ["--aux-max-fps", "25"])[0]
+              and _reusable({"nominal_fps": 120.0, "aux_clock": [60, 1, 2, 1]}, ["--aux-max-fps", "60"])[0]
+              and _reusable({"nominal_fps": 60.0, "aux_clock": [60, 1, 2, 1]}, ["--aux-max-fps", "120"])[0])
+        check("采样桶按生效值比：59.94 素材上 --fps 29.97 吸附成 30000/1001，记的不一样就重建",
+              _reusable({"nominal_fps": float(_ntsc), "sample_clock": [30000, 1001], "aux_clock": [60000, 1001, 30000, 1001]},
+                        ["--fps", "29.97"])[0]
+              and not _reusable({"nominal_fps": float(_ntsc), "sample_clock": [2997, 100], "aux_clock": [60000, 1001, 2997, 100]},
+                                ["--fps", "29.97"])[0])
 
     base = ["x.mp4", "--out", "y.jsonl"]
     want = ocr_args.config_of(base)

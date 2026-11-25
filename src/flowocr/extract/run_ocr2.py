@@ -25,6 +25,7 @@ import functools
 import hashlib
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -49,7 +50,7 @@ import numpy as np
 from flowocr.extract import (  # noqa: E402
     edge_refine,     # 两遍合一遍：在线回抠的信号（--refine-fused）
     ffcheck,         # ffmpeg / ffprobe 够不够用；`_meta.runtime`（只追溯）
-    framesource,     # 采样帧从哪来（cv2 / ffmpeg 子进程 / 预取）
+    framesource,     # 采样帧从哪来（ffmpeg 子进程 / 预取）
     decode_proc,     # --decode-shards：只解码的子进程（模块顶层只有标准库）
     ocr_args,        # 参数定义：复用判据要用同一个解析器（见文件头）
     ocr_complete,    # 判据放在共享层，守卫才够得着（audit-4 C8 的教训）
@@ -60,7 +61,7 @@ from flowocr.extract import (  # noqa: E402
     regions,         # 自选 OCR 范围：遮罩、拆框、时间切点（--regions，ocr-regions 计划）
     reuse_v2,        # `--pregate` 要用它的 `_crop`（判据只有一份）；模块本身只依赖 numpy
 )
-from flowocr.extract.framegrid import TimeGrid  # noqa: E402    采样 / 辅助流的时间网格
+from flowocr.extract.framegrid import DELTA_US, SampleClock, Window  # noqa: E402    采样的时间桶、窗口
 from flowocr.extract.fast_det import FastDet  # noqa: E402
 from flowocr.extract.recpool import RecPool  # noqa: E402    组批第二步：rec 的异步消费者（--rec-async）
 
@@ -105,7 +106,7 @@ def pregate_of(gray, prev_gray, polys):
 def det_stream(source, fast_det, batch: int, pregate: bool = False, lookahead: int = 0):
     """取帧 + 检测（`pregate` 时顺手算灰度和静态相关系数）。`batch > 1` 时 det **先行**：
     攒 N 帧一批检测，再逐帧交出去——复用判断和 rec 依赖上一帧的结果，仍然严格逐帧；det 不依赖，所以可以先行。
-    取帧那一层每帧都是新数组（cv2 `read()` / ffmpeg 的 copy / cvtColor），攒着不会被覆盖。
+    取帧那一层每帧都是新数组（ffmpeg 管道的 copy / cvtColor），攒着不会被覆盖。
 
     `lookahead = 1`（`--det-lookahead`，2026-09-25）：下一批的**前处理 + 推理**在辅助线程上跑，这边同时做上一批的**后处理**。
     原来三段串在一个线程上（gi-s1：推理 10.9 s、后处理 3.7 s、前处理 1.5 s，det 线程忙 16.5 s / 主循环 18.1 s），
@@ -113,6 +114,7 @@ def det_stream(source, fast_det, batch: int, pregate: bool = False, lookahead: i
     只是解码头比 det 线程再多领先一批，帧环容量按它加（`edge_refine.ring_in_flight`）。"""
     prev_gray = None
     closed_at = getattr(source, "detection_closed_at", None)
+    frames = ((f.key, f.t, f.image) for f in source)     # 取帧层交 `framesource.Frame`；这里只要身份、时刻、画面
 
     def closed(chunk):
         # 只省整批：不压缩混合批，避免改变开放帧的批维 / 推理结果。
@@ -135,11 +137,11 @@ def det_stream(source, fast_det, batch: int, pregate: bool = False, lookahead: i
         return out
 
     if batch <= 1:
-        for idx, t_sec, frame in source:
+        for idx, t_sec, frame in frames:
             polys = [] if closed_at is not None and closed_at(t_sec) else fast_det.predict(frame)[0]
             yield idx, t_sec, frame, polys, pack(frame, polys)
         return
-    it = iter(source)
+    it = iter(frames)
     if lookahead and hasattr(fast_det, "infer_batch"):
         import concurrent.futures as _cf
         pool = _cf.ThreadPoolExecutor(1, thread_name_prefix="det-infer")
@@ -280,31 +282,19 @@ def start_ort_services(args, n: int, who: str = " worker") -> tuple[list, dict]:
     return srvs, env
 
 
-def run_parallel(args, meta: dict, src_fps: float, grid, start_idx: int,
-                 end_idx: int, total_frames: int) -> int:
+def run_parallel(args, meta: dict, vp: "VideoProbe") -> int:
     """`--workers N`：切成 N 段、N 个子进程同时跑，拼成一份观测。父进程不建模型。
 
     子进程的参数 = 父进程的 argv 去掉 `--out/--start/--end/--workers` 再补上各段的值，
-    所以**其余旋钮一个不漏**地传下去。拼好之前先写一份 `complete=false` 的占位，
-    父进程中途被杀也不会留下一份旧的"已完成"产物。
+    所以**其余旋钮一个不漏**地传下去。切点在目标点上（`Window.split`），子进程的 `--start` / `--end` 直接给 `T_k`。
+    拼好之前先写一份 `complete=false` 的占位，父进程中途被杀也不会留下一份旧的"已完成"产物。
     """
     import subprocess
 
     try:
-        cuts = ocr_parallel.split_frames(start_idx, end_idx, grid, args.workers)
+        cuts = vp.split(args.workers)
     except ValueError as exc:
         raise SystemExit(f"--workers {args.workers}：{exc}——窗口太短，用 --workers 1") from None
-    interval = grid.interval_us(src_fps) / 1e6
-    # 平均帧率偏离名义帧率的素材（有丢帧缺口，f3 / f4）上，"切点帧号 ÷ src_fps"换出来的起点会漂，
-    # 段与段重叠或漏帧（flowocr.extract.ocr_parallel 文件头）。**按整个文件**预估漂移，超过半个源帧就不开
-    nominal, avg = ocr_parallel.probe_rates(args.video)
-    if nominal and avg:
-        drift = ocr_parallel.seam_drift_sec(total_frames, avg, nominal)
-        if drift > ocr_parallel.DRIFT_MAX_FRAMES / nominal:
-            raise SystemExit(
-                f"--workers {args.workers}：这段素材的平均帧率 {avg:.4f} 和名义帧率 {nominal:.4f} "
-                f"对不上（有丢帧缺口），切点最多会漂 {drift:.2f} s——段与段会重叠或漏帧。"
-                f"用 --workers 1（根治要等窗口改成按 pts 定义）")
     out_path = Path(args.out)
     out_path.write_text(json.dumps({"_meta": {**meta, "complete": False}}, ensure_ascii=False)
                         + "\n", encoding="utf-8")
@@ -317,12 +307,12 @@ def run_parallel(args, meta: dict, src_fps: float, grid, start_idx: int,
     procs = []
     try:
         for k, part in enumerate(parts):
-            s = args.start if bounds[k] is None else bounds[k] / src_fps
-            e = args.end if bounds[k + 1] is None else bounds[k + 1] / src_fps
+            s = args.start if bounds[k] is None else float(vp.clock.start_sec(bounds[k]))
+            e = args.end if bounds[k + 1] is None else float(vp.clock.start_sec(bounds[k + 1]))
             cmd = [sys.executable, "-m", "flowocr.extract.run_ocr2", *base_argv,
                    "--out", str(part), "--start", repr(s), "--end", repr(e), *ocr_parallel.CHILD_ARGS]
             procs.append(subprocess.Popen(cmd, env=child_env(env)))
-        print(f"[并行] {args.workers} 段，切点 {[round(c / src_fps, 3) for c in cuts]} s", flush=True)
+        print(f"[并行] {args.workers} 段，切点 {[round(float(vp.clock.start_sec(c)), 3) for c in cuts]} s", flush=True)
         rcs = [p.wait() for p in procs]
     finally:
         # **服务是这一趟起的，跟着这一趟走**——`try/finally`，不是只管正常路径：
@@ -340,8 +330,14 @@ def run_parallel(args, meta: dict, src_fps: float, grid, start_idx: int,
     for part in parts:
         with part.open(encoding="utf-8") as fh:
             metas.append(json.loads(fh.readline())["_meta"])
-    merged = ocr_parallel.merge_metas(metas, meta, wall=wall,
-                                      cuts_sec=[c / src_fps for c in cuts], interval=interval)
+    packets = framesource.PacketIndex(args.video, vp.stream.axis)
+
+    def gap_has_frames(a: int, b: int) -> bool | None:
+        """源文件里桶 a、b 之间（不含两端）有没有帧（拼缝核对）。"""
+        got = packets.between(vp.clock.cell_start(a + 1), vp.clock.cell_start(b))
+        return None if got is None else any(a < vp.clock.cell(p, vp.stream.axis) < b for p in got)
+    merged = ocr_parallel.merge_metas(metas, meta, wall=wall, cuts_sec=[float(vp.clock.start_sec(c)) for c in cuts],
+                                      gap_has_frames=gap_has_frames)
     with out_path.open("w", encoding="utf-8") as out:
         out.write(json.dumps({"_meta": merged}, ensure_ascii=False) + "\n")
         for part in parts:
@@ -366,19 +362,12 @@ def run_parallel(args, meta: dict, src_fps: float, grid, start_idx: int,
     return 0 if merged["complete"] else 3
 
 
-def parallel_blocker(args, src_fps: float, grid, start_idx: int, end_idx: int,
-                     total_frames: int) -> str | None:
-    """`--workers N` 能不能开：不能就返回原因（同 run_parallel 开头那两道门，抽出来给退回单进程用）。"""
+def parallel_blocker(args, vp: "VideoProbe") -> str | None:
+    """`--workers N` 能不能开：不能就返回原因（同 run_parallel 开头那道门，抽出来给退回单进程用）。"""
     try:
-        ocr_parallel.split_frames(start_idx, end_idx, grid, args.workers)
+        vp.split(args.workers)
     except ValueError as exc:
         return f"{exc}——窗口太短"
-    nominal, avg = ocr_parallel.probe_rates(args.video)
-    if nominal and avg:
-        drift = ocr_parallel.seam_drift_sec(total_frames, avg, nominal)
-        if drift > ocr_parallel.DRIFT_MAX_FRAMES / nominal:
-            return (f"平均帧率 {avg:.4f} 和名义帧率 {nominal:.4f} 对不上（有丢帧缺口），"
-                    f"切点最多会漂 {drift:.2f} s")
     return None
 
 
@@ -583,7 +572,8 @@ def build_models(args, device: str, rec_start: RecWorkerStart | None = None):
                                           device=ort_device(device), extra_args=ort_server_args(args, device))
             print(f"[ort] det worker：{onnx_path(args, 'det', device)}", flush=True)
         rec = recort.OrtRec(model=onnx_path(args, "rec"),
-                            max_batch=max(1, args.rec_bucket or 1), client=ort_cli, pre=args.rec_pre)
+                            max_batch=max(1, args.rec_bucket or 1), client=ort_cli, pre=args.rec_pre,
+                            vertical=args.rec_vertical)
         if args.ort_batch_ladder:
             rec.ladder = tuple(sorted(int(x) for x in args.ort_batch_ladder.split(",")))
         # det 的前后处理配置和模型名读 ONNX 旁边的 inference.yml（FastDet.from_onnx），后处理是 detpost 照抄的那份
@@ -728,61 +718,61 @@ def corr(a: np.ndarray | None, b: np.ndarray | None) -> float:
 
 @dataclass
 class VideoProbe:
-    """`probe_video` 的结果：帧身份的帧率、画面尺寸、采样网格、窗口的起止帧号。"""
-    src_fps: float
-    avg_fps: float
-    W: int
-    H: int
-    total_frames: int
-    grid: TimeGrid
-    start_idx: int
-    end_idx: int
+    """`probe_video` 的结果：流的元数据（时间基、名义 / 平均帧率、时长、画面尺寸）、采样的时间桶、窗口。"""
+    stream: framesource.StreamInfo
+    clock: SampleClock
+    window: Window
+
+    @property
+    def src_fps(self) -> float:
+        """参考帧率（`framesource.ref_rate`）：下游拿它算"一个源帧多长"，不决定任何帧的身份。"""
+        return self.stream.ref_fps
+
+    @property
+    def W(self) -> int:
+        return self.stream.width
+
+    @property
+    def H(self) -> int:
+        return self.stream.height
+
+    def requested_us(self) -> int:
+        """要求的长度（µs）：窗口长；`--end 0` 时到容器时长（先 `stream=duration`、没有再 `format=duration`）。"""
+        w = self.window
+        if w.b is not None:
+            return w.span_us(w.b)
+        dur = self.stream.duration
+        return max(1, int(round(dur * 1e6)) - w.start_us) if dur else 1
+
+    def split(self, n: int) -> list[int]:
+        """`--workers N` 的切点（桶号）；`--end 0` 时按容器时长切。"""
+        dur = self.stream.duration
+        b_est = self.clock.nearest(dur) if dur else self.window.a + n
+        return self.window.split(n, b_est)
 
 
 def probe_video(args) -> VideoProbe:
-    """探视频的元数据、定采样网格和窗口（`main` 跑前准备的第一步）。探完就放掉 `cv2.VideoCapture`，真正的解码交给 framesource。"""
-    cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        raise SystemExit(f"无法打开 {args.video}")
+    """探视频的元数据（ffprobe）、定采样的时间桶和窗口（`main` 跑前准备的第一步）。"""
+    st = framesource.probe_stream(args.video)
+    if not (st.width and st.height):
+        raise SystemExit(f"读不出画面尺寸：{args.video}")
+    if not st.ref_fps:
+        raise SystemExit(f"读不出帧率（名义 / 平均都没有）：{args.video}")
+    clock = ocr_args.sample_clock(st.nominal, args.fps)
+    # 窗口起止吸附到最近的目标点（桶边界）：窗口跑和整片跑取到同一批帧（`Window.seek_sec`）
     try:
-        avg_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        # **帧身份的帧率**：ffmpeg 路径用容器的名义帧率（framesource.id_rate，复审第三轮 P1）——平均帧率在有缺口的文件上
-        # 偏低，`round(t × 平均帧率)` 会让相邻两帧撞号。cv2 路径维持平均帧率：它的 seek（`POS_FRAMES`）语义就是平均帧率
-        src_fps = avg_fps
-        if args.decoder == "ffmpeg":
-            src_fps = framesource.id_rate(ocr_parallel.probe_rates(args.video)[0], avg_fps)
-        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    finally:
-        cap.release()
-    # **采样网格**（`framegrid.TimeGrid`，2026-09-24）：按时间取 `--fps` 帧 / 秒，锚在帧号 0 上；整除时就是原来的每 stride 帧一帧。
-    # 按帧号 `n` 数的选法（cv2 / `--frame-select index`）编不出不等距的网格，退回最近的整数步长（加时间网格之前的行为）
-    try:
-        grid = ocr_args.sample_grid(src_fps, args.fps, args.frame_select)
+        window = Window.of(clock, args.start, args.end)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    if args.frame_select != "pts" and TimeGrid.for_rate(src_fps, args.fps) != grid:
-        print(f"[采样] --frame-select index 只能等距：{grid.describe(src_fps)}（{grid.fps(src_fps):.3f} fps，要的是 {args.fps:g}）",
-              flush=True)
-    # 窗口起点对齐到采样网格，采样点才和整片跑时落在同一批帧上
-    start_idx = grid.nearest(args.start * src_fps)
-    # `--end 0` 的窗口尾按**时长 × 帧率**算，不按帧的个数：名义帧率下有缺口的文件，最后一帧的帧号比帧数大
-    # （f3 大 728），按个数截会少跑最后约 12 秒。没缺口的文件两者相同
-    end_idx = (int(round(args.end * src_fps)) if args.end > 0
-               else int(-(-total_frames * src_fps // avg_fps)) if src_fps != avg_fps else total_frames)
-    return VideoProbe(src_fps, avg_fps, W, H, total_frames, grid, start_idx, end_idx)
+    return VideoProbe(st, clock, window)
 
 
 def check_args(args) -> None:
     """只看参数组合就能判的冲突，**在碰视频、建模型之前**一次报完（原来散在 `main` 里，有几条要等模型建完才报）。"""
     if (args.det_batch != "auto" and args.det_batch < 1) or args.workers < 1:
         raise SystemExit("--det-batch / --workers 至少是 1")
-    if args.refine_fused and (not args.reuse_v2 or args.decoder != "ffmpeg"):
-        raise SystemExit("--refine-fused 要 --reuse-v2（链事件从它来）和 --decoder ffmpeg（辅助流和采样流数同一批帧）")
-    if args.hwaccel and args.decoder != "ffmpeg":
-        # `--decoder cv2` 是显式回退，这里不自作主张退硬解——两个都显式给了就是自相矛盾，该报错
-        raise SystemExit("--hwaccel 要 --decoder ffmpeg（要软解就 --hwaccel=）")
+    if args.refine_fused and not args.reuse_v2:
+        raise SystemExit("--refine-fused 要 --reuse-v2（链事件从它来）")
     # ⚠ 2026-09-20 之前这里还拦着 `--hwaccel` + `--refine-fused --refine-aux shared`，
     # 于是开硬解就自动退回两遍回抠（35–105 s），把硬解省下的全吃回去还倒欠。
     # 现在辅路在显存里 `scale_cuda` 缩完再 `hwdownload`，同一个 ffmpeg 分两路仍然成立。
@@ -800,25 +790,19 @@ def check_args(args) -> None:
         raise SystemExit("--exclude-regions 需要同时给 --predet")
 
 
-def resolve_aux_grid(args, src_fps: float):
-    """辅助流取哪些帧（`--aux-max-fps` + 时间网格，flowocr.extract.framegrid）；没开两遍合一遍是 None。
-    120 fps 的片子默认也只收 60 fps、不要求整除、采样帧嵌套在里面。`config` 记的是请求值，
-    生效网格记 `_meta.aux_grid`，复用判据比生效网格（ocr_complete.obs_reusable）。"""
+def resolve_aux_clock(args, vp: VideoProbe):
+    """辅助流取哪些帧（`--aux-max-fps` + 时间桶，flowocr.extract.framegrid）；没开两遍合一遍是 None。
+    `config` 记的是请求值，生效值记 `_meta.aux_clock`，复用判据比生效值（ocr_complete.obs_reusable）。"""
     if not args.refine_fused:
         return None
     try:
-        aux_grid = ocr_args.aux_grid(src_fps, args.fps, args.aux_max_fps, args.frame_select)
+        return ocr_args.aux_clock(vp.stream.nominal, args.fps, args.aux_max_fps)
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
-    if not aux_grid.uniform and (args.frame_select != "pts" or args.refine_aux in ("nvdec", "cuvid")):
-        raise SystemExit(f"辅助流{aux_grid.describe(src_fps)}只配 --frame-select pts + --refine-aux shared / noop："
-                         f"按帧号 `n` 数的选法和单独一路的硬解辅助流都编不出绝对帧号")
-    return aux_grid
 
 
-def base_meta(args, config: dict, vp: VideoProbe, aux_grid) -> dict:
+def base_meta(args, config: dict, vp: VideoProbe, aux_clock) -> dict:
     """obs 头一行 `_meta` 的起始内容（跑的过程中和跑完还会往里补：设备、范围、pts 区间……）。"""
-    grid = vp.grid
     # `engine` 是没人读的历史身份串（det / rec 分离的那版管线最早跑在 PaddleOCR 上），不改
     # 路径记 `portable()`（同 `config["video"]`）；不记命令行 `argv`（owner 2026-10-06）：`config` 已是生效值，
     # 字面 argv 里的视频、`--out`、`--regions` 文件都是本机路径，逐个改要维护一张"哪些参数是路径"的表
@@ -837,12 +821,17 @@ def base_meta(args, config: dict, vp: VideoProbe, aux_grid) -> dict:
             "reuse": not args.no_reuse, "reuse_corr": args.reuse_corr,
             "refresh_every": args.refresh_every,
             "width": vp.W, "height": vp.H, "device": args.device,
-            "decoder": args.decoder, "pipe_pix": args.pipe_pix,
+            "pipe_pix": args.pipe_pix,
             "prefetch": args.prefetch,
-            "src_fps": vp.src_fps, "avg_fps": vp.avg_fps, "sample_fps": grid.fps(vp.src_fps),
-            # 等距时照旧记 `stride`（探针按它数）；不等距的只有 `sample_grid`
-            "sample_grid": grid.as_list(), **({"stride": grid.step} if grid.uniform else {}),
-            **({"aux_grid": aux_grid.as_list()} if aux_grid is not None else {}),
+            # **帧身份 = 这一帧自己的 pts**（`t_us`，frame-pts 计划）：复用判据认这个标记，没有它的旧产物整份重跑
+            "frame_key": "t_us",
+            # `src_fps` 只作参考帧率（下游算"一个源帧多长"的容差，`framesource.ref_rate`）；`nominal_fps` 是 `r_frame_rate`
+            "src_fps": vp.src_fps,
+            "avg_fps": float(vp.stream.avg) if vp.stream.avg else None,
+            "nominal_fps": float(vp.stream.nominal) if vp.stream.nominal else None,
+            "sample_fps": vp.clock.fps, "sample_clock": vp.clock.as_list(),
+            **({"aux_clock": aux_clock.as_list()} if aux_clock is not None else {}),
+            "cell_tol_us": DELTA_US,
             "quality": ocr_args.quality_of(args),
             **({"ocr_lang_probe": lang_probe(args)} if getattr(args, "ocr_lang", "zh") == "auto" else {}),
             # 头一行只是占位，跑完会连同 pts 区间一起重写（见文末的 `clock.meta()`）。
@@ -939,7 +928,8 @@ def make_rec_pool(args, device: str, rec, ort_cli):
     side_recs = []
     if side_clis:
         from flowocr.extract import recort
-        side_recs = [recort.OrtRec(model=rec.model, max_batch=rec.max_batch, grid=rec.grid, client=c, pre=args.rec_pre)
+        side_recs = [recort.OrtRec(model=rec.model, max_batch=rec.max_batch, grid=rec.grid, client=c, pre=args.rec_pre,
+                                   vertical=rec.vertical)
                      for c in side_clis]
         for r in side_recs:
             r.ladder = rec.ladder
@@ -948,7 +938,7 @@ def make_rec_pool(args, device: str, rec, ort_cli):
     return side_clis, pool
 
 
-def make_reuse(args, rec, pool, src_fps: float):
+def make_reuse(args, rec, pool):
     """复用判据第二版（`reuse_v2.ReuseV2`），回补的读接到池子上（有池子时）或直接调 rec。"""
     def rec_one(crop):
         # 回补用掉的 rec **不在这里记账**：commit_stage2 把这一批的次数当返回值交出去
@@ -970,7 +960,6 @@ def make_reuse(args, rec, pool, src_fps: float):
         return [got[r] if got[r] is not None else ("", 0.0) for r in ids]
 
     v2 = reuse_v2.ReuseV2(args, corr, estimate_shift, rec_one)
-    v2.src_fps = src_fps        # 它自己也写 obs 行，`frame` 认 pts 要用（framesource.pts_frame）
     if pool is not None:
         v2.rec_many = rec_many
         if args.recover_async:              # 回补异步（rec-reads 计划的 B）：二分交给池子推进，主线程不等
@@ -995,27 +984,24 @@ def load_dense(args) -> list[list[float]]:
     return dense
 
 
-def setup_edge(args, v2, meta: dict, grp, vp: VideoProbe, aux_grid):
-    """两遍合一遍：辅助流（缩、灰度、全帧率）进帧环，reuse_v2 的链事件驱动在线回抠（flowocr.extract.edge_refine）。
+def setup_edge(args, v2, meta: dict, grp, vp: VideoProbe, aux_clock):
+    """两遍合一遍：辅助流（缩、灰度、按辅助桶取帧）进帧环，reuse_v2 的链事件驱动在线回抠（flowocr.extract.edge_refine）。
     `--edge-proc`（默认）时回抠在自己的进程里、返回它的代理；否则进程内的 `EdgeRefiner`。挂到 `v2.edge` 上。"""
-    src_fps = vp.src_fps
-    edge_kw = dict(src_fps=src_fps, start_idx=vp.start_idx, width=vp.W, height=vp.H,
-                   scale=args.refine_scale, grid=aux_grid.as_list(), thr=args.refine_thr,
+    w = vp.window
+    edge_kw = dict(start_us=int(math.floor(w.clock.cell_start(w.a) * 1e6)), width=vp.W, height=vp.H,
+                   scale=args.refine_scale, clock=aux_clock.as_list(), ref_fps=vp.src_fps, thr=args.refine_thr,
                    noop=args.refine_aux == "noop",
-                   ring_cap=edge_refine.ring_capacity(
-                       vp.grid.max_gap, int(round(edge_refine.LEAD_US * src_fps / 1e6)),
-                       int(round(edge_refine.END_TAIL_US * src_fps / 1e6)),
-                       args.refine_ring, edge_refine.ring_in_flight(args), aux=aux_grid))
+                   ring_cap=edge_refine.ring_capacity(vp.clock.interval_us, aux_clock.fps, vp.clock.fps,
+                                                      args.refine_ring, edge_refine.ring_in_flight(args)))
     if args.edge_proc:
         # 回抠放进自己的进程（edge_proc）：辅助流直接连过去，这边只发链事件、收证据。范围遮罩那边自己按规格建
         from flowocr.extract import edge_proc
-        edge = edge_proc.EdgeProxy(edge_kwargs=edge_kw, start_idx=vp.start_idx, end_idx=vp.end_idx, src_fps=src_fps,
-                                   width=vp.W, height=vp.H,
+        edge = edge_proc.EdgeProxy(edge_kwargs=edge_kw, width=vp.W, height=vp.H,
                                    regions_spec=(meta["regions"] if grp is not None else None))
     else:
         edge = edge_refine.EdgeRefiner(**edge_kw)
         if grp is not None:                 # 辅助流也只看得见范围里的像素（在线回抠的信号不许读进被遮掉的东西）
-            edge.ring.premask = regions.aux_masker(grp, edge.Ws, edge.Hs, src_fps)
+            edge.ring.premask = regions.aux_masker(grp, edge.Ws, edge.Hs)
     v2.edge = edge
     # 延迟落盘要等"那一批开的段都停变了"（edge_refine.settled_by）；缓冲的采样点数不够长的话每次落盘都得等工作线程
     # 追平主线程，两个线程就串行了（--refresh-every 小的时候 horizon 只有二十几）
@@ -1025,8 +1011,8 @@ def setup_edge(args, v2, meta: dict, grp, vp: VideoProbe, aux_grid):
 
 def settle_hwaccel(args, hw_probe, hw_pool, meta: dict) -> None:
     """**硬解开不开得了，先试解几格**（同 `--workers` 的老规矩：开不了就退回去、打印原因、meta 记生效值）。
-    NVDEC 在有前摇的 av1 上少交付 1~3 帧；`gi-s2` 连 pts 0.000 都不交付，`--frame-select pts` 也选不出第 0 格。
-    进了默认就不能让这类素材整段跑不了。判据是 FfmpegSource 自己那道硬解格子核对，不另写一份。
+    NVDEC 在有前摇的 av1 上少交付 1~3 帧（`gi-s2` 连 pts 0.000 都不交付）；进了默认就不能让这类素材整段跑不了。
+    判据：试解窗口里硬解和软解交出的 pts 列表逐个比（`framesource.hwaccel_blocker`）。
     试解在起动时就在后台跑了（`hw_probe`，和建模型并行），这里取结论；开不了就把 `args.hwaccel` 置空。"""
     if args.hwaccel:
         why = hw_probe.result()
@@ -1039,13 +1025,11 @@ def settle_hwaccel(args, hw_probe, hw_pool, meta: dict) -> None:
         meta["hwaccel_fallback"] = os.environ[HW_RETRY_ENV]     # 硬解跑到一半交付不对、整段改软解重跑的原因
 
 
-def open_source(args, dec, edge, meta: dict, vp: VideoProbe, aux_grid):
+def open_source(args, dec, edge, meta: dict, vp: VideoProbe, aux_clock):
     """取帧层：`--decode-shards` 的只解码子进程（硬解开得了才分片），或 framesource 的一路解码；辅助流跟着接到回抠上。
     返回 `(source, dec)`——不分片时 `dec` 已关、是 None。"""
-    source_kw = dict(backend=args.decoder, grid=vp.grid, start_idx=vp.start_idx,
-                     end_idx=vp.end_idx, src_fps=vp.src_fps, width=vp.W, height=vp.H,
-                     prefetch=args.prefetch, pix=args.pipe_pix, hwaccel=args.hwaccel or None,
-                     select_by=args.frame_select)
+    source_kw = dict(stream=vp.stream, window=vp.window, width=vp.W, height=vp.H,
+                     prefetch=args.prefetch, pix=args.pipe_pix, hwaccel=args.hwaccel or None)
     lanes = None
     if dec is not None:
         # 硬解开得了才分片（试解不过 / 没 GPU 就走一路软解：owner 要每个操作都有能跑的 CPU 版，不求调度一样）
@@ -1063,15 +1047,15 @@ def open_source(args, dec, edge, meta: dict, vp: VideoProbe, aux_grid):
         dec.start({
             "video": args.video, "source_kw": source_kw, "W": vp.W, "H": vp.H,
             "slots": decode_proc.slots_for(args.det_batch, args.det_prefetch), "lanes": lanes, "block_sec": args.decode_block,
-            "aux": ({"url": edge.url, "pts_addr": edge.pts_addr, "grid": aux_grid.as_list(), "scale": args.refine_scale}
-                    if edge is not None and args.refine_aux in ("shared", "noop") else None)})
+            "aux": ({"url": edge.url, "pts_addr": edge.pts_addr, "clock": aux_clock.as_list(), "scale": args.refine_scale}
+                    if edge is not None else None)})
         meta["decode_shards"] = {"lanes": lanes, "block_sec": args.decode_block, "wait_start_sec": round(dec.wait_start_sec, 2)}
         return dec, dec
     source = framesource.make_source(
         args.video, **source_kw,
         aux=(({"remote": edge} if args.edge_proc else {"sink": edge.ring})
-             | {"grid": aux_grid.as_list(), "scale": args.refine_scale}
-             if edge is not None and args.refine_aux in ("shared", "noop") else None))
+             | {"clock": aux_clock.as_list(), "scale": args.refine_scale}
+             if edge is not None else None))
     return source, dec
 
 
@@ -1163,7 +1147,7 @@ class Loop:
         # 它**独立于覆盖率那道门**——坏 pts 出现在最后几帧时 `got/want` 照样过。
         self.bad_pts: str | None = None
         self.clock = ptsclock.PtsClock()
-        self.idx = vp.start_idx                 # 最后一个采样帧的帧号（交付序号空间；收尾时回抠和辅助流核对要它）
+        self.last_us: int | None = None         # 最后一个采样帧的 t_us（收尾时回抠和辅助流核对要它）
         self.t_us = 0
         self.win: list[dict] = []               # `--rec-window`：已 stage1、等文本的帧（按帧序）
         self.win_q: list[tuple] = []            # 同步路径：排队的裁剪 (窗内第几帧, 框下标, 裁剪)
@@ -1216,7 +1200,7 @@ class Loop:
                 continue
             texts[pos][i] = (r["rec_text"], float(r["rec_score"]))
         if n_none:
-            print(f"  ⚠ 窗口 帧 {win[0]['idx']}–{win[-1]['idx']}: 送进去 {len(win_q)} 个框，"
+            print(f"  ⚠ 窗口 {win[0]['t_us'] / 1e6:.3f}–{win[-1]['t_us'] / 1e6:.3f} s: 送进去 {len(win_q)} 个框，"
                   f"丢了 {n_none} 个", flush=True)
             n.lost += n_none
         t_st = time.perf_counter()
@@ -1256,7 +1240,7 @@ class Loop:
         lag = self.n.frames - 1 - st_["seq"]     # 结算时它后面已经判决了几帧（rec-batching 计划：逐帧结算延迟）
         self.settle_lag[lag] = self.settle_lag.get(lag, 0) + 1
         if n_none:
-            print(f"  ⚠ 帧 {st_['idx']}: rec 丢了 {n_none} 个框", flush=True)
+            print(f"  ⚠ 帧 {st_['t_us'] / 1e6:.3f} s: rec 丢了 {n_none} 个框", flush=True)
             self.n.lost += n_none
         t_st = time.perf_counter()
         # 回补用掉的调用数由池子自己数（`stats().calls` 含它），这里只并裁剪数
@@ -1282,29 +1266,27 @@ class Loop:
         args, n = self.args, self.n
         if args.progress_every and n.frames % args.progress_every == 0:
             el = time.time() - self.t_start
-            done = (self.idx - self.vp.start_idx) / max(1, self.vp.end_idx - self.vp.start_idx)
+            done = (self.t_us - self.vp.window.start_us) / self.vp.requested_us()
             print(f"[{done:5.1%}] 视频 {self.t_us/1e6/60:6.1f}min(pts)  已用 {el/60:5.1f}min  "
                   f"框 {n.boxes} rec {n.rec} 回补 {self.v2.stats['recover_reads']}", flush=True)
 
     def run(self, frames_in) -> None:
         for idx, t_sec, frame, polys, pre in frames_in:
-            self.idx = idx
             if not self.step(idx, t_sec, frame, polys, pre):
                 break
 
     def step(self, idx: int, t_sec: float, frame, polys, pre) -> bool:
-        """一个采样帧。返回 False = 时间轴坏了、停下（`bad_pts`）。"""
+        """一个采样帧（`idx` 是它的身份 `t_us`）。返回 False = 时间轴坏了、停下（`bad_pts`）。"""
         args, grp, v2, pool, n = self.args, self.grp, self.v2, self.pool, self.n
-        W, H, src_fps = self.vp.W, self.vp.H, self.vp.src_fps
+        W, H = self.vp.W, self.vp.H
         tl.mark("frame", idx)
-        # 真实 PTS。`cv2` 那条是 `read()` 之后的 `CAP_PROP_POS_MSEC`
-        # （实测对齐 ffprobe 的 `pts_time`），ffmpeg 那条是 `showinfo` 报的
-        # `pts_time`——两条都是解码器给的，不是帧号推的（docs/architecture/pipeline.md §4）。
+        # 真实 PTS：`showinfo` 报的 `pts_time` 减去容器的 start_time（`Frame.t`），解码器给的、不是帧号推的。和身份是同一个换算（`framegrid.frame_key`）
         try:
-            t_us = self.t_us = self.clock.push(t_sec, where=f"帧 {idx}")
+            t_us = self.t_us = self.clock.push(t_sec, where=f"{t_sec:.6f} s")
         except ptsclock.BadPts as exc:
             self.bad_pts = str(exc)
             return False
+        self.last_us = t_us
         boxes = [poly_to_box(p) for p in polys]
         own_of: dict = {}
         if grp is not None:
@@ -1392,7 +1374,7 @@ class Loop:
         n.tiny += len(todo_r) - len(keep)  # 太小送不进 rec 的：既不是复用也不是识别
         if v2 is not None and tr0 is not None:
             for i, c in zip(keep, crops):     # 真读的裁剪指纹（`--trace`，量"同一张图重复读"有多少）
-                v2.trace[tr0 + i].update(idx=idx, **crop_hashes(c))
+                v2.trace[tr0 + i].update(t_us=t_us, **crop_hashes(c))
         if args.rec_window:
             # 组批（inference-runtime 计划）：这一帧**不发 rec**，裁剪排进队列；
             # 判决里和文本无关的那一半（stage1）照常做完，等文本的那一半（stage2）留到窗口结算。
@@ -1410,7 +1392,7 @@ class Loop:
             t_st = time.perf_counter()
             if args.record_corr:
                 corr_of.update(v2.last_corr)
-            st = v2.commit_stage1(n.frames, idx, t_us, boxes, polys,
+            st = v2.commit_stage1(n.frames, t_us, boxes, polys,
                                   decided + [(i, "", 0.0, 0) for i in keep], set(keep),
                                   v2_assign, rec_crop, corr_of, args.record_corr)
             stage("commit", t_st)
@@ -1434,7 +1416,7 @@ class Loop:
         n_none = sum(r is None for r in results)
         if len(results) != len(crops) or n_none:
             lost = len(crops) - len(results) + n_none
-            print(f"  ⚠ 帧 {idx}: rec 返回 {len(results) - n_none} 条，"
+            print(f"  ⚠ 帧 {t_us / 1e6:.3f} s: rec 返回 {len(results) - n_none} 条，"
                   f"送进去 {len(crops)} 个框，丢了 {lost} 个", flush=True)
             n.lost += lost
         for i, r in zip(keep, results):
@@ -1451,7 +1433,7 @@ class Loop:
             t_st = time.perf_counter()
             if args.record_corr:
                 corr_of.update(v2.last_corr)   # v2 的相关系数在它自己那儿算（上面 corr_of 只有老路径会填）
-            extra = v2.commit(n.frames, idx, t_us, boxes, polys, decided, read_set, v2_assign,
+            extra = v2.commit(n.frames, t_us, boxes, polys, decided, read_set, v2_assign,
                               rec_crop, corr_of, args.record_corr, self.fh)
             stage("commit", t_st)
             n.rec += extra
@@ -1465,14 +1447,7 @@ class Loop:
             b = boxes[i]
             reused = i not in read_set
             self.fh.write(json.dumps({
-                # **`frame` 认 pts，不认"这是第几个采样帧"**（2026-09-20，owner："是 bug 就直接修掉"）。
-                # 09-09 把 `t_us` 改成了真实 pts，`frame` 当时没跟着改，于是有丢帧缺口的素材上
-                # 它是"第几个采样帧 × 采样间隔 + 起点"而不是源帧号（f3 跨缺口窗实测差 309~330 帧，
-                # 606 行里 335 行的 `frame/src_fps` 对不上 `t_us`）。下游只拿它当身份用、
-                # 时间一律走 `t_us`，所以轨没被带偏；但"拿 frame 回视频找那一帧"会找错。
-                # ⚠ **只在写出去的这一处换**：`idx` 本身必须留在交付序号那个空间里，
-                # 因为辅助流的帧环是按交付序号编号的（framesource 的 yield 注释）。
-                "frame": framesource.pts_frame(t_us, idx, src_fps),
+                # 帧身份就是 `t_us`（frame-pts 计划：obs 行不再有 `frame`）；写 obs 的另一处在 reuse_v2，两处字段一致
                 "t_us": t_us, "box": b,
                 "poly": [[round(float(p[0])), round(float(p[1]))] for p in polys[i]],
                 "text": text, "conf": round(score, 4),
@@ -1488,16 +1463,15 @@ class Loop:
         # 文件里最后一条的时间戳会远远落后于实际处理到的位置。
         if args.progress_every and n.frames % args.progress_every == 0:
             el = time.time() - self.t_start
-            done = (idx - self.vp.start_idx) / max(1, self.vp.end_idx - self.vp.start_idx)
-            # 分子是真 pts、分母是帧号推算的——有丢帧缺口的素材上这两个口径
-            # 差几秒（f3 尾端 9.5 s），所以两边都标出来，别看着像同一把尺
+            req = self.vp.requested_us()
+            done = (t_us - self.vp.window.start_us) / req
             print(f"[{done:5.1%}] 视频 {t_us/1e6/60:6.1f}min(pts) / "
-                  f"{self.vp.end_idx/src_fps/60:.0f}min(帧号推算)  "
+                  f"{(self.vp.window.start_us + req)/1e6/60:.0f}min  "
                   f"已用 {el/60:5.1f}min  预计还要 {el*(1-done)/max(done,1e-6)/60:5.1f}min  "
                   f"框 {n.boxes} rec {n.rec} 丢 {n.dropped}", flush=True)
         return True
 
-    def finish(self, meta: dict, edge, aux, source, side_clis: list) -> None:
+    def finish(self, meta: dict, edge, source, side_clis: list) -> None:
         """循环之后、产物文件关上之前：结算最后不满一窗的几帧（edge.finish 会排空队列，必须在它之前）、
         回抠收尾与辅助流的账、组批自检、复用判据剩下的行落盘。"""
         args, pool, v2 = self.args, self.pool, self.v2
@@ -1516,11 +1490,10 @@ class Loop:
             self.settle_window()
         if edge is not None:
             if self.bad_pts is None:
-                meta["edge"] = edge.finish(self.idx)
+                meta["edge"] = edge.finish(self.last_us if self.last_us is not None else self.vp.window.start_us)
             else:
                 edge.abort()
-            if aux is None:                             # shared：第二路读线程挂在采样流上
-                aux = getattr(source, "inner", source).aux
+            aux = getattr(source, "inner", source).aux       # 第二路读线程挂在采样流上（不是 --edge-proc / 分片时）
             if aux is not None:
                 aux.join()
                 meta.setdefault("edge", {})["aux_sent"] = aux.sent
@@ -1531,7 +1504,6 @@ class Loop:
                     meta["edge"]["aux_misaligned"] = aux.misaligned
                     print(f"[回抠] ⚠ 辅助流的 pts 和帧对不上、提前停了：{aux.misaligned}", flush=True)
                 meta["edge"]["aux_cpu_sec"] = round(getattr(aux, "cpu_sec", 0.0), 2)
-                meta["edge"]["aux_shift"] = getattr(aux, "shift", 0)
                 meta["edge"]["aux_mode"] = args.refine_aux
                 meta["edge"]["noop"] = edge.noop
             elif args.edge_proc and "edge" in meta:     # 辅助流收在回抠进程里，它的统计随 finish 一起回来
@@ -1556,25 +1528,18 @@ def close_source(meta: dict, source, dec) -> None:
         meta["decode_shards"].update(dec.shards or {})   # 各路领了几块、各花多久、预取峰值
         meta["decode_shards"]["wait_sec"] = round(dec.wait_sec, 2)   # 这边等解码进程交帧的时间
         meta["hw_preroll_ticks"] = dec.preroll_ticks   # 第一块才知道（开流时读到的是 0）
-    # 采样格核对（framesource.grid_step）：**偏离格子**的帧 vs **没交付的格**分开记（复审 P1 第 2 条）。
-    # 软解两样都只记——偏离格子只在 index 选帧遇到缺口时出现，缺格是素材自己的缺口；
-    # 硬解那条路在来源里就判过了（偏离、或者源里有却没交付，都 raise HwaccelMismatch -> 整段改软解）
-    off = getattr(source, "grid_off", {}) or {}
-    skipped = getattr(source, "grid_skipped", 0) or 0
-    if off:
-        meta["grid_off"] = {str(k): v for k, v in sorted(off.items())}
+    # 相邻采样帧之间的空桶（素材缺口和 VFR 的稀处都会有）：只记账。硬解那条路在来源里核过（源里有却没交付 -> HwaccelMismatch）
+    skipped = getattr(source, "cells_skipped", 0) or 0
     if skipped:
-        meta["grid_skipped"] = skipped
-    if off or skipped:
-        print(f"[采样格] ⚠ 偏离格子 {sum(off.values())} 帧（偏移取值 {sorted(off)}）、没交付的格 {skipped} 个。"
-              f"有丢帧缺口的素材上这是正常的；否则见 hw-decode-results 报告", flush=True)
+        meta["cells_skipped"] = skipped
     if getattr(source, "stderr_tail", None):
         print("[解码] ffmpeg 最后几行：\n  " + "\n  ".join(source.stderr_tail[-4:]),
               flush=True)
 
 
-def final_meta(args, meta: dict, loop: Loop, source, edge, aux_grid, clis: dict) -> None:
+def final_meta(args, meta: dict, loop: Loop, source, edge, clis: dict) -> None:
     """一趟跑完的账：ORT 分因、完成判据、计数、各段耗时，并进 `meta`。"""
+    from flowocr.extract import recort
     n, vp, v2, clock = loop.n, loop.vp, loop.v2, loop.clock
     for _tag, _cli in clis.items():
         if _cli is not None:                       # ORT 那条路的分因数据（ortclient.stats 的说明）
@@ -1588,25 +1553,15 @@ def final_meta(args, meta: dict, loop: Loop, source, edge, aux_grid, clis: dict)
                 print(f"[后端] ⚠ {_tag} 有 {_st.get('trt_oop', 0)} 次形状超出 TensorRT 引擎的范围、{_st.get('trt_err', 0)} 次 TensorRT 报错，"
                       f"这些退回 CUDA EP 跑了" + (f"；第一次的错：{_st['trt_err_first'][:200]}" if _st.get("trt_err_first") else ""), flush=True)
     wall = time.time() - loop.t_start
-    # 完成判据看**实际推进到哪一帧**，不看"文件里有没有东西"。
-    # `total_frames` 在某些容器上不准，所以留 2% 余量，只有明显短缺才判未完成。
-    want = max(1, vp.end_idx - vp.start_idx)
-    # **推进了多少源帧由来源自己报**：`cv2` 数的是 grab/read 的次数，
-    # ffmpeg 那条数的是"最后一个采样帧的下一格 − 起点"——两者口径一致，
-    # 都能喂进同一个 `is_complete`。别再用 `loop.idx`：
-    # 它是**最后一个采样帧的帧号**，天生比推进量少最多一个采样间隔。
-    got = source.advanced
-    # **`stopped_early` 不能直接当"没跑完"**（2026-09-08 修）：解码器读到文件真正的
-    # 结尾也会置上它，而 `CAP_PROP_FRAME_COUNT` 在这批切片上比实际多报了 1%
-    # （36,361 声称 vs 36,001 实际）。于是**九段切片每次跑完都自称未完成**、
-    # 退出码 3，驱动脚本会永远重跑它们。当时我是把产物的 `complete` 手工回填了，
-    # **改数据没改代码**，这次连代码一起改。
-    # 覆盖率这道门本来就是为容器元数据不准留的余量；中途真断了（比如 40% 处
-    # 解码失败）`got/want` 自然过不了这道门，`stopped_early` 那一项是多余且有害的。
-    # 它仍然记进 `_meta`，因为"是读到头了还是被我们停了"是排查时要看的信息。
-    # **坏 PTS 一票否决。** 覆盖率那道门管的是"推进到哪一帧"，管不着时间轴对不对。
+    # 完成判据看**实际推进到哪儿**，不看"文件里有没有东西"（µs，frame-pts 计划）：要的是窗口长度（`--end 0` 时到容器时长，
+    # 容器时长不准，所以留 2% 余量）；推进到的是"最后一个采样帧所在桶的结束 − 窗口起点"，由来源自己报——缺口 / VFR 稀处的空桶不算没跑完。
+    # **`stopped_early` 不能直接当"没跑完"**（2026-09-08 修）：读到文件真正的结尾也会置上它，九段切片曾每次跑完都自称未完成。
+    # 中途真断了（比如 40% 处解码失败）`got/want` 自然过不了这道门。它仍然记进 `_meta`，排查时要看。
+    # **坏 PTS 一票否决。** 覆盖率那道门管的是"推进到哪儿"，管不着时间轴对不对。
     # **辅助流没交够也一票否决**（2026-09-24 审计）：回抠证据半路断掉的 obs 不能当成做完了、被一直复用
-    aux_bad = (ocr_complete.aux_shortfall(meta.get("edge"), loop.idx if n.frames else None, aux_grid)
+    want = vp.requested_us()
+    got = source.advanced_us
+    aux_bad = (ocr_complete.aux_shortfall(meta.get("edge"), loop.last_us if n.frames else None)
                if edge is not None and loop.bad_pts is None else None)
     if aux_bad:
         meta["aux_incomplete"] = aux_bad
@@ -1617,7 +1572,9 @@ def final_meta(args, meta: dict, loop: Loop, source, edge, aux_grid, clis: dict)
     # `start_sec` 仍是**请求的**窗口起点：`tools/ocr_complete.obs_reusable` 拿它和
     # `data/samples.json` 的 `start_s` 对账，那是"跑的是不是同一段"的判据，不是时间轴。
     # 实际覆盖到的 PTS 区间另记两个键，谁要判覆盖用它们。
-    meta.update({"complete": complete, "frames_advanced": got, "frames_requested": want,
+    # 首末采样帧的桶号（`--workers` 拼缝核对，`ocr_parallel.seam_problems`）
+    meta.update({"complete": complete, "advanced_us": got, "requested_us": want,
+                 "cell_first": getattr(source, "cell_first", None), "cell_last": getattr(source, "cell_last", None),
                  "stopped_early": source.stopped_early, "bad_pts": loop.bad_pts,
                  "sampled_frames": n.frames, "boxes": n.boxes,
                  "rec_calls": n.rec, "rec_predict_calls": n.rec_calls, "reused_boxes": n.reused,
@@ -1635,6 +1592,8 @@ def final_meta(args, meta: dict, loop: Loop, source, edge, aux_grid, clis: dict)
                  # 平均批直接记下来：**这次就是它把"窗口分支被误删"抓出来的**（5.01 -> 1.67），
                  # 而 rec_calls / rec_predict_calls 两个数要自己相除才看得出来
                  "rec_avg_batch": round(n.rec / max(1, n.rec_calls), 2),
+                 # 竖排读法多花的（`recort.VERTICAL_COST`）：`extra_runs / runs` 是多出的推理次数占比
+                 "rec_vertical": dict(recort.VERTICAL_COST),
                  })
 
 
@@ -1676,8 +1635,8 @@ def exit_status(meta: dict) -> int:
     if not meta["complete"]:
         # 部分产物留着（可以拿来续跑/排查），但**退出码必须非零**，
         # 而且 `_meta.complete=false` 会让驱动脚本不把它当成已完成。
-        want, got = meta["frames_requested"], meta["frames_advanced"]
-        print(f"**没跑完**：请求 {want} 帧，只推进到 {got} 帧"
+        want, got = meta["requested_us"], meta["advanced_us"]
+        print(f"**没跑完**：要 {want / 1e6:.3f} s，只推进到 {got / 1e6:.3f} s"
               f"（{got/want:.1%}）；stopped_early={meta['stopped_early']}。"
               f"\n  产物留着但**不算完成**——不要拿它进正式成绩。", flush=True)
         return 3
@@ -1704,24 +1663,22 @@ def main() -> int:
     dec = decode_proc.connect_decoder() if args.workers == 1 and args.decode_shards > 1 else None
 
     vp = probe_video(args)
-    src_fps, W, H, grid = vp.src_fps, vp.W, vp.H, vp.grid
-    total_frames, start_idx, end_idx = vp.total_frames, vp.start_idx, vp.end_idx
+    W, H = vp.W, vp.H
 
-    aux_grid = resolve_aux_grid(args, src_fps)
+    aux_clock = resolve_aux_clock(args, vp)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    meta = base_meta(args, config, vp, aux_grid)
+    meta = base_meta(args, config, vp, aux_clock)
     grp = setup_regions(args, meta, W, H)
 
     if args.workers > 1:
         # **在建模型之前分叉**：父进程只切段、起子进程、拼结果，不占 GPU。
-        # `--workers 3` 是默认（owner 2026-09-16），所以开不了的情况（窗口太短切不出段、有丢帧缺口的素材
-        # 切点会漂）**不能再退出**，退回单进程、把原因打出来、meta 记 `workers_effective`。
+        # 开不了的情况（窗口太短切不出段）**不退出**，退回单进程、把原因打出来、meta 记 `workers_effective`。
         # `config.workers` 仍记**请求的**值——复用判据比的是同一段 + 同一条臂，退回是这段素材的确定性行为，
         # 同样的 argv 再跑一遍还是退回，产物可复现
-        why = parallel_blocker(args, src_fps, grid, start_idx, end_idx, total_frames)
+        why = parallel_blocker(args, vp)
         if why is None:
-            return run_parallel(args, meta, src_fps, grid, start_idx, end_idx, total_frames)
+            return run_parallel(args, meta, vp)
         print(f"[并行] --workers {args.workers} 开不了，退回单进程：{why}", flush=True)
         if not args.det_prefetch:
             print("[并行] 提示：`--det-prefetch` 被显式关掉了；它现在默认是 2，quick 六段上省 15%~25%"
@@ -1733,14 +1690,14 @@ def main() -> int:
                           **({"decode_off": args.decode_shards_off} if getattr(args, "decode_shards_off", "") else {}),
                           **({"off": split_off} if split_off else {})}
 
-    # 硬解试解（ffmpeg 解 4 格，约 0.65 s）和建模型无关：后台先跑着，用到的时候（建取帧层之前）再取结论
+    # 硬解试解（硬解、软解各解 4 个采样桶）和建模型无关：后台先跑着，用到的时候（建取帧层之前）再取结论
     hw_probe = hw_pool = None
     if args.hwaccel:
         import concurrent.futures as _cf
         hw_pool = _cf.ThreadPoolExecutor(1, thread_name_prefix="hw-probe")
         hw_probe = hw_pool.submit(
-            framesource.hwaccel_blocker, args.video, grid=grid, start_idx=start_idx, src_fps=src_fps,
-            width=W, height=H, hwaccel=args.hwaccel, select_by=args.frame_select)
+            framesource.hwaccel_blocker, args.video, stream=vp.stream, window=vp.window,
+            width=W, height=H, hwaccel=args.hwaccel)
     tl.mark("boot", "probed")
     try:
         device, fallback, (rec, fast_det, det_cli, ort_cli) = resolve_device(args)
@@ -1754,50 +1711,45 @@ def main() -> int:
     record_devices(args, meta, device, fallback, fast_det, det_cli, ort_cli)
     fast_det = apply_region_crop(args, grp, fast_det, meta, W, H)
     side_clis, pool = make_rec_pool(args, device, rec, ort_cli)
-    v2 = make_reuse(args, rec, pool, src_fps) if args.reuse_v2 else None
+    v2 = make_reuse(args, rec, pool) if args.reuse_v2 else None
     dense = load_dense(args)
     t_start = time.time()
 
-    aux = None
-    edge = setup_edge(args, v2, meta, grp, vp, aux_grid) if args.refine_fused else None
+    edge = setup_edge(args, v2, meta, grp, vp, aux_clock) if args.refine_fused else None
     tl.mark("boot", "edge")
     settle_hwaccel(args, hw_probe, hw_pool, meta)
     tl.mark("boot", "hw_checked")
-    source, dec = open_source(args, dec, edge, meta, vp, aux_grid)
+    source, dec = open_source(args, dec, edge, meta, vp, aux_clock)
     print(f"[解码] {source.describe()}", flush=True)   # 7aa8e1a 删 --front-proc 时连这两行一起删了（2026-09-24 审计找回）
     tl.mark("boot", "source")
     # 有前摇的 av1 从文件头起硬解时的平移修法（framesource.av1_preroll_ticks）：生效就记刻度，追溯用
     meta["hw_preroll_ticks"] = getattr(getattr(source, "inner", source), "preroll_ticks", 0)
-    meta["seek_rev"] = framesource.SEEK_REV
     if meta["hw_preroll_ticks"]:
         print(f"[硬解] 有前摇的 av1：-ignore_editlist + setpts 平移 {meta['hw_preroll_ticks']} 刻度（试解已核对像素）",
               flush=True)
-    if edge is not None and args.refine_aux in ("nvdec", "cuvid"):
-        aux = framesource.FfmpegFullRate(args.video, start_idx=start_idx, end_idx=end_idx, src_fps=src_fps,
-                                         width=W, height=H, step=aux_grid.step, scale=args.refine_scale,
-                                         sink=edge.ring, hwaccel="cuda", cuvid=args.refine_aux == "cuvid").start()
     if edge is not None:
-        print(f"[回抠] 在线：辅助流 {edge.Ws}x{edge.Hs} 灰度、{aux_grid.describe(src_fps)}，"
+        print(f"[回抠] 在线：辅助流 {edge.Ws}x{edge.Hs} 灰度、{aux_clock.describe()}，"
               f"帧环 {edge.ring.cap} 帧（{edge.ring.cap * edge.Ws * edge.Hs / 1e6:.0f} MB）", flush=True)
 
     with out_path.open("w", encoding="utf-8") as fh:
         fh.write(json.dumps({"_meta": meta}, ensure_ascii=False) + "\n")
         loop = Loop(args, vp, grp=grp, v2=v2, pool=pool, rec=rec, dense=dense, fh=fh, t_start=t_start)
-        if start_idx:
-            print(f"[窗口] 帧 {start_idx}–{end_idx}"
-                  f"（{start_idx/src_fps/60:.1f}–{end_idx/src_fps/60:.1f} min，"
-                  f"时间戳仍按原片绝对时间）", flush=True)
+        w = vp.window
+        if w.a or w.b is not None:
+            print(f"[窗口] 采样桶 [{w.a}, {w.b if w.b is not None else '文件尾'})"
+                  f"（{w.start_sec:.3f}–{f'{w.end_sec:.3f}' if w.b is not None else '…'} s，"
+                  f"时间戳和整片跑一样从片头算）", flush=True)
         # 自选范围：det 之前把范围外涂灰（取帧那一层包一下，其余属性照旧从 `source` 取）
         src_in = regions.MaskedSource(source, grp) if grp is not None else source
         frames_in = (det_stream_threaded(src_in, fast_det, args.det_batch, args.det_prefetch, args.pregate, args.det_lookahead)
                      if args.det_prefetch else det_stream(src_in, fast_det, args.det_batch, args.pregate, args.det_lookahead))
         loop.run(frames_in)
-        loop.finish(meta, edge, aux, source, side_clis)
+        loop.finish(meta, edge, source, side_clis)
     tl.mark("boot", "loop_done")
     close_source(meta, source, dec)
-    final_meta(args, meta, loop, source, edge, aux_grid, {"rec": ort_cli, "det": det_cli})
+    final_meta(args, meta, loop, source, edge, {"rec": ort_cli, "det": det_cli})
     if args.trace and v2 is not None and v2.trace is not None:
-        write_trace(args.trace, v2, out_path, args, int(round(grid.interval_us(src_fps))))
+        write_trace(args.trace, v2, out_path, args, int(round(vp.clock.interval_us)))
     if args.timeline:
         tl.mark("boot", "end")
         print(f"[时间线] -> {tl.dump()}", flush=True)

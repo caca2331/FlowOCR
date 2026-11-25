@@ -8,7 +8,7 @@ import cv2 和 paddleocr，共享层的自检够不着，够不着就等于测�
 
 ## 为什么不能再用 `idx / src_fps`
 
-`src_fps` 是 `CAP_PROP_FPS`，即**容器的平均帧率**。直播录像有丢帧缺口时它低于
+当时的 `src_fps` 是 `CAP_PROP_FPS`，即**容器的平均帧率**。直播录像有丢帧缺口时它低于
 标称的 60，于是帧计数 × (1/59.978) 在缺口**之前**就已经比真实 pts 慢，
 缺口之后还要再跳一次。实测（fps-and-rec-budget 报告）：
 
@@ -21,16 +21,16 @@ import cv2 和 paddleocr，共享层的自检够不着，够不着就等于测�
 旧产物**不能**乘 `src_fps / round(src_fps)` 修回来：那只消掉伸缩，
 缺口之后仍缺累计丢帧时长。
 
-## `CAP_PROP_POS_MSEC` 的语义（2026-09-09 实测）
+## 和帧身份的关系
 
-`read()` 之后 `cap.get(CAP_PROP_POS_MSEC)` 给的是**刚读到那一帧**的 pts，
-逐帧对齐 ffprobe 的 `frame=pts_time`（从 0.0 起，不是下一帧）。
+`t_us` 由 `framegrid.frame_key` 换算（唯一换算处）；喂进来的是取帧层交出的相对秒（`Frame.t`，已减过容器的 `start_time`），
+所以这里推出来的 `t_us` 和取帧层交出的帧身份是同一个数。
 """
 from __future__ import annotations
 
-import bisect
-import json
 import math
+
+from flowocr.extract.framegrid import frame_key   # 帧身份的唯一换算处
 
 
 class BadPts(ValueError):
@@ -55,7 +55,7 @@ class PtsClock:
         tag = f"{where}：" if where else ""
         if not math.isfinite(t_sec) or t_sec < 0:
             raise BadPts(f"{tag}解码器给的 PTS 无效（{t_sec!r}）")
-        t_us = int(round(t_sec * 1_000_000))
+        t_us = frame_key(t_sec)
         if self.last_us is not None and t_us <= self.last_us:
             raise BadPts(f"{tag}PTS 没有严格递增"
                          f"（{self.last_us / 1e6:.6f}s -> {t_sec:.6f}s）")
@@ -77,74 +77,3 @@ class PtsClock:
         return {"timebase": "pts",
                 "pts_first_sec": self.first_us / 1e6 if self.first_us is not None else None,
                 "pts_last_sec": self.last_us / 1e6 if self.last_us is not None else None}
-
-
-class IndexClock:
-    """**帧号 ↔ 真实时间**的双向映射（回抠这一级用）。
-
-    为什么需要它（2026-09-17，reuse-budget 计划第 1 条）：回抠拿 run 的时间（**真实 pts**）
-    换算成帧号去开解码窗，再把窗内的帧号换算回时间写进产物——两头都用 `us_per_frame = 1e6 / src_fps`，
-    而 `src_fps` 是**容器的平均帧率**。于是在丢帧缺口的素材上，窗口位置和输出时刻都带着那份偏差：
-    实测 yuka f4 一个 20 分钟窗口里**一处缺口都没有**，光是"平均帧率 59.9870 vs 窗内真实 60.000"这一项，
-    从头到尾就漂 **−260 ms**（≈ 15 帧）；f3 在 7.2 h 处是 **9.5 s**（本文件开头那张表）。
-
-    做法：拿 obs 里逐采样点的 `(帧号, t_us)` 当锚点做**分段线性**插值——采样点本身就是解码器给的真实 pts，
-    不用再解一遍视频；锚点之间只剩局部帧率的抖动。锚点之外（窗口首尾探出去的几十帧）退回名义帧率。
-
-    **不给锚点时它就是原来的常量换算**（`t_of(i) = i × us_per_frame`，逐位相同），所以 CFR 素材上产物不变。
-    """
-
-    __slots__ = ("us", "f", "t", "rate")
-
-    def __init__(self, us_per_frame: float, pairs=()) -> None:
-        self.us = float(us_per_frame)
-        pairs = sorted(pairs)
-        self.f = [int(p[0]) for p in pairs]
-        self.t = [float(p[1]) for p in pairs]
-        # 每段的局部帧率（µs/帧）；只有一个锚点时全程退回名义值
-        self.rate = [((self.t[i + 1] - self.t[i]) / (self.f[i + 1] - self.f[i]))
-                     for i in range(len(self.f) - 1)]
-
-    def __len__(self) -> int:
-        return len(self.f)
-
-    def t_of(self, idx: float) -> float:
-        """帧号 -> 时间（µs，**浮点**：调用方按原来的口径自己 `int(round(...))`）。"""
-        if not self.f:
-            return idx * self.us
-        k = bisect.bisect_right(self.f, idx) - 1
-        if k < 0:
-            return self.t[0] - (self.f[0] - idx) * self.us
-        if k >= len(self.f) - 1:
-            return self.t[-1] + (idx - self.f[-1]) * self.us
-        return self.t[k] + (idx - self.f[k]) * self.rate[k]
-
-    def idx_of(self, t_us: float) -> float:
-        """时间（µs）-> 帧号（浮点，同上）。和 `t_of` 严格互逆。"""
-        if not self.t:
-            return t_us / self.us
-        k = bisect.bisect_right(self.t, t_us) - 1
-        if k < 0:
-            return self.f[0] - (self.t[0] - t_us) / self.us
-        if k >= len(self.t) - 1:
-            return self.f[-1] + (t_us - self.t[-1]) / self.us
-        return self.f[k] + (t_us - self.t[k]) / self.rate[k]
-
-
-def index_clock_from_obs(obs_path, us_per_frame: float) -> IndexClock:
-    """从 obs 的逐采样点 `(frame, t_us)` 建 `IndexClock`。只流式扫一遍、按帧号去重；
-    `timebase` 不是 pts 的旧产物一律退回常量换算（那种时间轴本身就不可信，拿来归因的工具一律只认 pts 时间轴）。"""
-    pairs: dict[int, int] = {}
-    with open(obs_path, encoding="utf-8") as fh:
-        meta = json.loads(fh.readline()).get("_meta", {})
-        if meta.get("timebase") != "pts":
-            return IndexClock(us_per_frame)
-        for line in fh:
-            i = line.find('"frame": ')
-            j = line.find('"t_us": ')
-            if i < 0 or j < 0:
-                continue
-            f = int(line[i + 9:line.find(",", i)])
-            if f not in pairs:
-                pairs[f] = int(line[j + 8:line.find(",", j)])
-    return IndexClock(us_per_frame, pairs.items())

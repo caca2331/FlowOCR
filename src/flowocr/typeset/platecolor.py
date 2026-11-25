@@ -60,7 +60,8 @@ STYLE = "P"
 """底板样式名的词干（加上派生后缀 `.fo-fx`，`restore` 照删；和源样式的派生名撞了就加序号，由调用方挑）。"""
 
 POS = re.compile(r"\\pos\(([-\d.]+),([-\d.]+)\)")
-MOVE = re.compile(r"\\move\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)(?:,(\d+),(\d+))?\)")
+MOVE = re.compile(r"\\move\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)(?:,(-?\d+),(-?\d+))?\)")
+"""时刻可以是负的：晚出现的元素从人写的 `\\move` 中间切开时（`core.shift_move`），起点在这一行开始之前，libass 照算进度。"""
 DRAW = re.compile(r"\}m 0 0 l ([\d.]+) 0 ([\d.]+) ([\d.]+) 0 ([\d.]+)\{\\p0\}$")
 BACK = re.compile(r"\\1c&H[0-9A-Fa-f]+&\\1a&H[0-9A-Fa-f]+&")
 CLIP_STEP = re.compile(r"\\t\((\d+),(\d+),\\clip\((-?\d+),(-?\d+),(-?\d+),(-?\d+)\)\)")
@@ -509,15 +510,21 @@ class Result:
 
 def blocks_of(lines: list[str], kinds: list[str | None]) -> list[Block]:
     """`kinds[k]` 是 `lines[k]` 的种类：`"src"` 是一条处理过的源行，开一块；它后面的生成行里 `"plate"`（底板）、`"text"`（正文）
-    收进这一块，别的（区域号、扩展效果的元素、不是生成行的 None）不碰。"""
+    收进这一块，别的（区域号、扩展效果的元素、不是生成行的 None）不碰。
+    `"plate#<g>"` / `"text#<g>"` 是同一条源行里分开的几块（竖排的 `col` 行：每列一块底板，逐字行的字色按它所在那块定），各自一块。"""
     blocks: list[Block] = []
-    cur: Block | None = None
+    cur: dict[str, Block] | None = None
     for k, (ln, kind) in enumerate(zip(lines, kinds)):
         if kind == "src":
-            cur = Block([], [])
-            blocks.append(cur)
-        elif cur is not None and (kind == "text" or kind == "plate" and DRAW.search(ln)):     # 扩展效果自称底板、形状却不是矩形的不碰
-            (cur.plates if kind == "plate" else cur.texts).append((k, parse(ln)))
+            cur = {"": Block([], [])}
+            blocks.append(cur[""])
+            continue
+        base, _, g = (kind or "").partition("#")
+        if cur is not None and (base == "text" or base == "plate" and DRAW.search(ln)):     # 扩展效果自称底板、形状却不是矩形的不碰
+            if g not in cur:
+                cur[g] = Block([], [])
+                blocks.append(cur[g])
+            (cur[g].plates if base == "plate" else cur[g].texts).append((k, parse(ln)))
     return blocks
 
 

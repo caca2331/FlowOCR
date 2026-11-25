@@ -85,7 +85,7 @@ python -m flowocr.output.timing_check <tracks 或 matched> [--opt …] [--json x
 python dev_tools/usage1_health.py <tracks.json> --obs <obs.jsonl>   # 用途 1 的产物体检
 python dev_tools/main_invariants.py "<目录>/*/*-tracks.json"   # 主轨的不变量：main.regions、band_merged 和主轨 cue 对得上（改并带 / 主轨后跑，违反退出码 1）
 python dev_tools/typewriter_eval.py <tracks.json> data/gt/typewriter-<tag>.json --split validation   # 默认建轨已回抠；--refine off 的产物加 --sampled
-python dev_tools/refine_offline_probe.py <--refine off 的 tracks.json> --video <mp4>   # 回抠的在线证据 vs 开视频离线测量，逐事件比三个时刻（不写产物）
+python dev_tools/pyrun.py dev_tools/framegt_eval.py data/gt/<集>/gt.jsonl --arm=<臂>   # 读帧真值（逐帧转写的字块，分横排 / 竖排）对区域轨：字准、读到、读序反、多出（竖排集 data/gt/vertical/）
 python -m flowocr.analyze.slot_pairs score data/gt/slotpairs-*.json --split dev    # 聚类的尺；改聚类先跑
 python dev_tools/delivery_cases.py score data/gt/delivery-<片段>.json <最终 .ass> …   # 交付病例：标注时刻的整句、画的位置、上下屏时刻，按对白 / 名牌 / 选项 / UI / 主播字幕 / 评论墙分项（量最终 ASS，不量字幕稿）
 python dev_tools/evalset.py run <清单.json> --arm <臂> --out <x.jsonl> && python dev_tools/evalset.py compare <a.jsonl> <b.jsonl>   # 逐条记录、两臂逐条配对（共同集合 + 判定转移）
@@ -115,7 +115,7 @@ python dev_tools/preview.py <tracks.json|matched.json> --preset dev [--opt lang=
 - rec 的 workload / 推理服务诊断探针（`dev_tools/rec_*.py` 十几个：去 det 回放、让行、填批、共享信用、前瞻搭载、自有服务的 capture / replay、备用 session、节点 profile 等，2026-10-12~14）2026-10-16 删掉；最后一版在提交 29439b8，结论在 rec-workload 计划和对应的报告里。`NSYS_READINESS` 那一支随之去掉。
 - 事件级对账 `dev_tools/arm_events.py`（IoU≥0.7 + 时间重叠，A/A、B/B 底噪 0）；ORT 臂的观测对账用 `dev_tools/obs_textdiff.py` / `dev_tools/rec_engine_accept.py`；逐字节对账用 `dev_tools/obs_identical.py`。
 - 复用判据的因果轨迹：`run_ocr2 --trace` 产出，`dev_tools/rec_window_replay.py` 重放（a1-mask-reuse 实验里的 `rec_window_sim.py` 把窗长高估了一倍多，别拿它的数）。
-- 解码契约测试：`dev_tools/aux_identity_check.py`（同号同画面）、`dev_tools/hw_retry_check.py`（重试前整棵进程树退干净）。
+- 解码契约测试：`dev_tools/aux_identity_check.py`（同一个 `t_us` 同一张画面）、`dev_tools/hw_retry_check.py`（重试前整棵进程树退干净）。
 - 某一处漏在哪一层：归因用 `dev_tools/probe_gap_locate.py`（位置判据），匹配器的配对导出用 `dev_tools/match_probe.py`。
 - 上屏事件真值：`dev_tools/sample_events.py <tracks.json> --video <mp4> --n 8 --seed 1 --outdir tmp/gt/<tag>`（人标或模型看图标都算真值，每帧记 `labeled_by`；owner 2026-09-08）。
 - 和采样网格无关的打字机真值：`dev_tools/tw_sample.py plan|fine <mp4> --band <上,下> --xband <左,右>`（均匀随机时刻之后的第一句，按源帧率逐帧摆图标首字 / 全字，不看产物；写成 `data/gt/twfree-<份>.json`、`split = free`）。
@@ -168,6 +168,6 @@ python dev_tools/preview.py <tracks.json|matched.json> --preset dev [--opt lang=
   中途提交会让一批产物出现两个 `git_head`；中途改文件会让后半批带 `+dirty`，`h2h_report` 会拒收。要改就等它跑完，或改完整体重跑。
 - **不改正在运行的 shell 脚本**。bash 边读边执行，改到一半的脚本会从错位的偏移继续读，退出码和日志都会骗人。
 - **判断活没活看产物，不看日志**。管道里的 `grep` / `sed` / `awk` 写文件时是 4 KB 块缓冲，进度行攒不满一块就不落盘；
-  驱动里一律加 `--line-buffered`。查进度用 `dev_tools/ocr_progress.py`（读产物尾部的 `frame` 和 mtime）。
+  驱动里一律加 `--line-buffered`。查进度用 `dev_tools/ocr_progress.py`（读产物尾部的 `t_us` 和 mtime）。
   读正在被写的文件大小用 bash 的 `stat`，PowerShell 的目录枚举报过 0 字节。
 - 合回 `dev` 之前先确认主 checkout 上没有长任务在跑，理由同第一条。

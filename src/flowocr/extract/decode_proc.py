@@ -1,7 +1,7 @@
 """只解码的子进程（`--decode-shards`，decode-buffer）：`decode_shards.ShardedSource` 跑在这里，采样帧经共享内存槽交给管线进程
 （det 在那边），辅助流按块序直接转给回抠进程。**不 import 推理库**（起动约 1 s，和管线进程建模型并行）。
 
-帧怎么过去：这边建一块共享内存、切成若干槽（BGR 整帧），写进空槽后发 `("f", 帧号, 时刻, 槽)`；管线进程**拷出来**（整帧 6 MB，约 1 ms）
+帧怎么过去：这边建一块共享内存、切成若干槽（BGR 整帧），写进空槽后发 `("f", t_us, 时刻, 槽, 采样桶号, 整数 pts)`；管线进程**拷出来**（整帧 6 MB，约 1 ms）
 就发 `("r", 槽)` 还回去——那边没有任何东西会指着槽（"以后谁存了一个切片"会静默写坏，所以先拷；零拷贝没量过）。
 槽满了这边就停（背压一路传回各路 ffmpeg），槽数按 det 的前瞻给（`slots_for`），帧环容量也要把它算进在途（`edge_refine.ring_in_flight`）。
 
@@ -37,21 +37,21 @@ def make_source(cfg: dict, remote):
 
     kw = cfg["source_kw"]
     a = cfg.get("aux") or {}
+    st, win = kw["stream"], kw["window"]
     return decode_shards.ShardedSource(
-        cfg["video"], lanes=cfg["lanes"], grid=kw["grid"], src_fps=kw["src_fps"], width=kw["width"],
-        height=kw["height"], pix=kw["pix"], select_by=kw["select_by"], hwaccel=kw["hwaccel"],
-        start_idx=kw["start_idx"], end_idx=kw["end_idx"],
-        blocks=decode_shards.BlockPlan(cfg["video"], kw["start_idx"], kw["end_idx"], kw["src_fps"], cfg["block_sec"],
-                                       len(cfg["lanes"])),
-        aux_remote=remote, aux_grid=a.get("grid"), aux_scale=a.get("scale", 0.35))
+        cfg["video"], lanes=cfg["lanes"], stream=st, window=win, width=kw["width"],
+        height=kw["height"], pix=kw["pix"], hwaccel=kw["hwaccel"],
+        blocks=decode_shards.BlockPlan(cfg["video"], win, st.axis, cfg["block_sec"], len(cfg["lanes"]), t1=st.duration),
+        aux_remote=remote, aux_clock=a.get("clock"), aux_scale=a.get("scale", 0.35))
 
 
 def end_stats(source, slot_wait: float) -> dict:
-    return {"stopped_early": source.stopped_early, "advanced": source.advanced,
-            "grid_off": dict(source.grid_off), "grid_skipped": source.grid_skipped,
+    return {"stopped_early": source.stopped_early, "advanced_us": source.advanced_us,
+            "cells_skipped": source.cells_skipped, "cell_first": source.cell_first, "cell_last": source.cell_last,
             "stderr_tail": list(source.stderr_tail), "preroll": source.preroll_ticks,
             "slot_wait": round(slot_wait, 2),
             "shards": {"lanes": source.lanes, "blocks": len(source.blocks), "lane_blocks": source.lane_blocks,
+                       "seam_dropped": source.seam_dropped, "probes": source.packets.probes,
                        "lane_sec": [round(x, 2) for x in source.lane_sec], "peak_mb": round(source.peak_mb),
                        **({"probe_unknown": source.probe_unknown} if source.probe_unknown else {}),
                        **({"plan_error": source.plan_error} if source.plan_error else {})}}
@@ -124,14 +124,14 @@ def serve() -> int:
             raise RuntimeError("解码器在取帧层登记前已取消")
         send(("hello", {"shm": shm.name, "slots": n, "describe": source.describe()}))
         slot_wait = 0.0
-        for idx, t_sec, frame in source:
+        for f in source:
             t0 = time.perf_counter()
             slot = free.get()
             slot_wait += time.perf_counter() - t0
             if slot is None or stop.is_set():
                 break
-            np.ndarray((H, W, 3), np.uint8, buffer=shm.buf[slot * nb:(slot + 1) * nb])[...] = frame
-            send(("f", idx, t_sec, slot))
+            np.ndarray((H, W, 3), np.uint8, buffer=shm.buf[slot * nb:(slot + 1) * nb])[...] = f.image
+            send(("f", f.key, f.t, slot, f.cell, f.pts))
         source.close()
         tl.dump()                                    # 在回 end 之前：管线进程收到就收摊了
         send(("end", end_stats(source, slot_wait)))
@@ -171,17 +171,18 @@ def serve() -> int:
 
 
 class DecodeProxy:
-    """管线进程这边：取帧层的接口——迭代吐 `(帧号, 时刻, BGR 帧)`；流结束后 `stopped_early` / `advanced` / `grid_off` /
-    `grid_skipped` / `stderr_tail` / `preroll_ticks` / `shards` 从子进程带回来。构造只起进程、不等；`start(cfg)` 开流。"""
+    """管线进程这边：取帧层的接口——迭代吐 `framesource.Frame`；流结束后 `stopped_early` / `advanced_us` / `cells_skipped` /
+    `stderr_tail` / `preroll_ticks` / `shards` 从子进程带回来。构造只起进程、不等；`start(cfg)` 开流。"""
 
     def __init__(self, link=None) -> None:
         self.child = link or childproc.Child("flowocr.extract.decode_proc", "解码进程")
         self.shm = None
         self.aux = None                                  # 辅助流收在回抠进程里（--edge-proc）
         self.stopped_early = False
-        self.advanced = 0
-        self.grid_off: dict = {}
-        self.grid_skipped = 0
+        self.advanced_us = 0
+        self.cells_skipped = 0
+        self.cell_first: int | None = None
+        self.cell_last: int | None = None
         self.stderr_tail: list = []
         self.preroll_ticks = 0
         self.shards: dict | None = None                  # 各路领了几块、各花多久、预取峰值
@@ -209,21 +210,23 @@ class DecodeProxy:
     def __iter__(self):
         import numpy as np
 
+        from flowocr.extract.framesource import Frame
+
         while True:
             t0 = time.perf_counter()
             msg = self.child.recv_checked()              # "hw" / "err" 在这里抛
             self.wait_sec += time.perf_counter() - t0
             if msg[0] == "f":
-                _, idx, t_sec, slot = msg
+                _, key, t_sec, slot, cell, pts = msg
                 frame = np.ndarray((self.H, self.W, 3), np.uint8,
                                    buffer=self.shm.buf[slot * self.nb:(slot + 1) * self.nb]).copy()
                 self.child.send(("r", slot))
-                yield idx, t_sec, frame
+                yield Frame(key, t_sec, frame, cell, pts)
             elif msg[0] == "end":
                 a = msg[1]
-                self.stopped_early, self.advanced = a["stopped_early"], a["advanced"]
-                self.grid_off = {int(k): v for k, v in a["grid_off"].items()}
-                self.grid_skipped, self.stderr_tail = a["grid_skipped"], a["stderr_tail"]
+                self.stopped_early, self.advanced_us = a["stopped_early"], a["advanced_us"]
+                self.cells_skipped, self.stderr_tail = a["cells_skipped"], a["stderr_tail"]
+                self.cell_first, self.cell_last = a["cell_first"], a["cell_last"]
                 self.preroll_ticks, self.shards = a["preroll"], a["shards"]
                 return
             else:
@@ -362,8 +365,8 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
         cfg0 = live[0][1]
         same = ("video", "source_kw", "lanes", "block_sec", "H", "W")
         bad = [k for k in same for _, c in live if c.get(k) != cfg0.get(k)]
-        # 辅助流也只有一路：各组的取帧网格 / 缩放要相同（广播的是同一个 ffmpeg 的辅路）
-        bad += [f"aux.{k}" for k in ("grid", "scale") for _, c in live
+        # 辅助流也只有一路：各组的辅助桶 / 缩放要相同（广播的是同一个 ffmpeg 的辅路）
+        bad += [f"aux.{k}" for k in ("clock", "scale") for _, c in live
                 if (c.get("aux") or {}).get(k) != (cfg0.get("aux") or {}).get(k)]
         if bad or any(bool(c.get("aux")) != bool(cfg0.get("aux")) for _, c in live):
             raise RuntimeError(f"广播解码：各组的取帧参数不一致（{sorted(set(bad))}）——同一个视频、同一个窗口、同一组解码旋钮才能共用")
@@ -425,7 +428,7 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
         tell_all(("hello", {"shm": shm.name, "slots": n, "describe": source.describe() + f"、广播给 {len(live)} 组"}))
         print(json.dumps({"started": len(live)}), flush=True)   # run_groups 看到它才不再"有组退出就收掉广播进程"
         slot_wait = 0.0
-        for idx, t_sec, frame in source:
+        for f in source:
             t0 = time.perf_counter()
             while True:
                 try:
@@ -438,7 +441,7 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
             slot_wait += time.perf_counter() - t0
             if slot is None or stop.is_set():
                 break
-            np.ndarray((H, W, 3), np.uint8, buffer=shm.buf[slot * nb:(slot + 1) * nb])[...] = frame
+            np.ndarray((H, W, 3), np.uint8, buffer=shm.buf[slot * nb:(slot + 1) * nb])[...] = f.image
             with lock:
                 who = [i for i in range(len(live)) if alive[i]]
                 ref[slot] = len(who)
@@ -446,7 +449,7 @@ def hub_serve(n_subs: int, accept_timeout: float = 120.0) -> int:
                     held[i].add(slot)
             for i in who:
                 try:
-                    live[i][0].send(("f", idx, t_sec, slot))
+                    live[i][0].send(("f", f.key, f.t, slot, f.cell, f.pts))
                 except OSError:
                     release(i, slot)
         source.close()

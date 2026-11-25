@@ -66,10 +66,26 @@ def raises(fn, exc: type[BaseException] = Exception) -> bool:
     return False
 
 
-def _every(k: int):
-    """每 k 帧一帧的采样网格（取帧层现在收网格、不收整数步长；`framegrid` 只有标准库）。"""
-    from flowocr.extract.framegrid import TimeGrid
-    return TimeGrid.every(k)
+def fake_stream(fps: int = 60, duration: float | None = None, width: int = 4, height: int = 4):
+    """假视频流的元数据：时间基 1/fps（整数 pts 就是帧序号）、名义 = 平均帧率 = fps。"""
+    from fractions import Fraction
+
+    from flowocr.extract.framesource import StreamInfo
+    return StreamInfo(tb=(1, fps), nominal=Fraction(fps), avg=Fraction(fps), duration=duration, width=width, height=height)
+
+
+def window2(a: int = 0, b: int | None = None, fps: float = 2):
+    """采样 `fps`（默认 2）的窗口：采样桶号 `[a, b)`（`framegrid.Window`）。"""
+    from flowocr.extract.framegrid import SampleClock, Window
+    return Window(SampleClock(fps), a, b)
+
+
+def fake_frame(pts: int, cell: int, fps: int = 60, image=None):
+    """取帧层交的一帧（`framesource.Frame`）：时间基 1/fps 上的整数 pts。"""
+    from flowocr.extract.framegrid import frame_key
+    from flowocr.extract.framesource import Frame
+    t = pts / fps
+    return Frame(frame_key(t), t, image, cell, pts)
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -117,47 +133,57 @@ SRT_OK = """1
 
 def _shard_behaviour_checks(dsh, fsx) -> None:
     """`ShardedSource` 的**行为**（2026-09-24 两份审计：原来只测了三条 ValueError，而它是默认开的路径）。
-    假 `FfmpegSource`：按块交 `[lo, hi)` 里的格（源缺的 `missing` 不交、解码器吞的 `eaten` 不交），辅助流逐帧推进 sink；
-    `source_has_frames` 按"源里有 = 不在 missing"答。窗口 [0, 240)、stride 30、4 块 × 60 帧。"""
+    假 `FfmpegSource`：60 fps、时间基 1/60（整数 pts 就是帧序号），采样 2 fps（采样桶 = pts // 30）；按块交 `[lo, hi)` 里每个新桶的第一帧
+    （块首帧看不到上一块，按新桶交——接缝去重靠合流），源缺的 `missing` 没有、解码器吞的 `eaten` 不交；辅助流逐帧推进 sink（辅助桶 60 fps）；
+    源里有没有包问假的 `PacketIndex`（"源里有 = 不在 missing"）。窗口 4 块 × 60 帧。"""
     import threading as _th
+    import time
     from types import SimpleNamespace as NS
     from unittest import mock
 
     import numpy as np
+
+    from flowocr.extract.framegrid import frame_key
+
+    def key(i):
+        return frame_key(i / 60)
 
     class Fake:
         missing: set = set()
         eaten: set = set()
         aux_cut: dict = {}          # 块起点 -> 辅助流推到哪一帧为止（模拟半路断）
         fail_at: dict = {}          # 块起点 -> 交到这一帧时抛的异常（模拟块内硬解失败）
+        lead: dict = {}             # 块起点 -> 块首多交的一帧（模拟和上一块同桶的块首帧，接缝去重）
         cancel_fails = False        # 失败块的 cancel 自己也出错（模拟清理超时）
         delay = 0.0
-        probe_fails = False
 
         def __init__(self, video, **kw):
-            self.kw, self.grid_off, self.grid_skipped = kw, {}, 0
+            self.kw = kw
             self.stopped_early, self.stderr_tail, self.preroll_ticks = False, [], 0
             self.aux = NS(join=lambda t=None: None, th=NS(is_alive=lambda: False), misaligned="", refused="") if kw["aux"] else None
 
         def __iter__(self):
-            lo, hi, st = self.kw["start_idx"], self.kw["end_idx"], self.kw["grid"].step
+            w = self.kw["window"]
+            lo, hi = self.kw["block"]
+            lo = w.a * 30 if lo is None else lo
+            hi = (w.b * 30 if w.b is not None else 1 << 30) if hi is None else hi
             sink = self.kw["aux"]["sink"] if self.kw["aux"] else None
-            g0 = -(-lo // st) * st
-            got = [i for i in range(g0, hi, st) if i not in Fake.missing and i not in Fake.eaten]
-            if got:                                   # 块自己核"起点 -> 最后一帧"之间的缺格（同真的 FfmpegSource）
-                self.grid_skipped = len([i for i in range(g0, got[-1], st) if i not in got])
             cut = Fake.aux_cut.get(lo, hi)
+            prev = None
             for i in range(lo, hi):
                 if i in Fake.missing:
                     continue
                 if sink is not None and i < cut:
-                    sink.push(i, np.zeros(4, np.uint8))
+                    sink.push(key(i), np.zeros(4, np.uint8), (i // 30, i))
                 if i - lo == 30 and lo in Fake.fail_at:
                     raise Fake.fail_at[lo]
-                if i in got:
+                if i in Fake.eaten:
+                    continue
+                if i // 30 != prev:
+                    prev = i // 30
                     if Fake.delay:
                         time.sleep(Fake.delay)
-                    yield i, i / 60.0, np.zeros(8, np.uint8)
+                    yield fsx.Frame(key(i), i / 60, np.zeros(8, np.uint8), i // 30, i)
             if sink is not None:
                 sink.close()
 
@@ -167,6 +193,16 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         def cancel(self):
             if Fake.cancel_fails:
                 raise RuntimeError("假的：辅助流取消后读线程未退出")
+
+    class Packets:
+        fails = False
+        probes = 0
+
+        def between(self, lo_sec, hi_sec):
+            if Packets.fails:
+                return None
+            hi = 1 << 30 if hi_sec is None else hi_sec
+            return [i for i in range(0, 4000) if i not in Fake.missing and lo_sec <= i / 60 < hi]
 
     class Sock:
         def __init__(self, fail_after=None):
@@ -183,22 +219,24 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         def close(self):
             pass
 
-    import time
+    def blocks_of(n):
+        return [(None if k == 0 else k * 60, None if k == n - 1 else (k + 1) * 60) for k in range(n)]
 
     def run(nblocks=4, lanes=("hw", "hw", "hw"), aux=True, sock=None, conn_err=None, budget_mb=1024, blocks=None,
             timeout=10.0):
-        """跑一遍，返回 (交出的帧号, pts 表, 源, 抛的异常, 卡没卡住)。"""
+        """跑一遍，返回 (交出的 pts, 转发的 pts 项, 源, 抛的异常, 卡没卡住)。"""
         pts: list = []
-        bl = blocks if blocks is not None else [(k * 60, (k + 1) * 60, None if k == 0 else k + 0.0005) for k in range(nblocks)]
+        bl = blocks if blocks is not None else blocks_of(nblocks)
         remote = NS(url="tcp://127.0.0.1:1", pts_put=pts.append, abort=lambda: None) if aux else None
-        s = dsh.ShardedSource("v", lanes=list(lanes), blocks=bl, start_idx=0, end_idx=nblocks * 60, grid=_every(30), src_fps=60.0,
-                              width=4, height=4, hwaccel="cuda", aux_remote=remote, budget_mb=budget_mb)
+        s = dsh.ShardedSource("v", lanes=list(lanes), blocks=bl, stream=fake_stream(), window=window2(0, nblocks * 2),
+                              width=4, height=4, hwaccel="cuda", aux_remote=remote, aux_clock=[60, 1, 2, 1],
+                              budget_mb=budget_mb, packets=Packets())
         out, err = [], []
 
         def consume():
             try:
-                for idx, _t, _f in s:
-                    out.append(idx)
+                for f in s:
+                    out.append(f.pts)
             except BaseException as exc:          # noqa: BLE001
                 err.append(exc)
 
@@ -210,19 +248,16 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
                 if conn_err is not None:
                     raise conn_err
                 return self
-            def send(self, frame, n, t):
+            def send(self, frame, n, info):
                 self.sock.sendall(frame)
-                self.remote.pts_put((n, t))
+                self.remote.pts_put((n, *info))
             def close(self):
                 self.remote.pts_put(dsh.framesource.QUEUE_SENTINEL)
                 self.sock.close()
             def abort(self):
                 self.sock.close()
         cc = mock.patch.object(dsh, "TcpAux", Writer)
-        with mock.patch.object(dsh.framesource, "FfmpegSource", Fake), cc, \
-                mock.patch.object(dsh.framesource, "probe_source_frames",
-                                  side_effect=lambda v, idxs, fps: (None if Fake.probe_fails
-                                                                    else [i for i in idxs if i not in Fake.missing])):
+        with mock.patch.object(dsh.framesource, "FfmpegSource", Fake), cc:
             th = _th.Thread(target=consume, daemon=True)
             th.start()
             th.join(timeout)
@@ -232,15 +267,17 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         return out, pts, s, (err[0] if err else None), stuck
 
     def reset():
-        Fake.missing, Fake.eaten, Fake.aux_cut, Fake.delay, Fake.probe_fails = set(), set(), {}, 0.0, False
+        Fake.missing, Fake.eaten, Fake.aux_cut, Fake.delay, Packets.fails = set(), set(), {}, 0.0, False
         Fake.fail_at, Fake.cancel_fails = {}, False
 
     reset()
     out, pts, s, e, stuck = run()
-    keys = [p[1] * 60 for p in pts if p is not dsh.framesource.QUEUE_SENTINEL]
-    check("ShardedSource 正常路径：4 块 3 路，采样帧按帧号全交、辅助流 240 帧按帧号顺序转发、末尾有 pts 结束标记",
-          not stuck and e is None and out == list(range(0, 240, 30)) and [round(k) for k in keys] == list(range(240))
-          and pts and pts[-1] is dsh.framesource.QUEUE_SENTINEL and s.grid_skipped == 0 and s.advanced == 240,
+    keys = [p[1] for p in pts if p is not dsh.framesource.QUEUE_SENTINEL]
+    check("ShardedSource 正常路径：4 块 3 路，采样帧全交（按时间顺序）、辅助流 240 帧按时间顺序转发（桶号随帧走）、末尾有 pts 结束标记；"
+          "推进量 = 最后一个采样帧所在桶的结束 − 起点",
+          not stuck and e is None and out == list(range(0, 240, 30)) and keys == [key(i) for i in range(240)]
+          and all(len(p) == 4 for p in pts[:-1]) and pts and pts[-1] is dsh.framesource.QUEUE_SENTINEL
+          and s.cells_skipped == 0 and s.advanced_us == 4_000_000 and (s.cell_first, s.cell_last) == (0, 7),
           (stuck, e, out, len(keys)))
 
     reset()
@@ -251,36 +288,52 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
     out, pts, s, e, stuck = run(lanes=("sw", "sw"))
     check("ShardedSource：首块没交、软解路 -> RuntimeError（不当成素材缺口放过去）",
           not stuck and isinstance(e, RuntimeError) and not isinstance(e, fsx.HwaccelMismatch), (stuck, e))
-    Fake.probe_fails = True
+    Packets.fails = True
     out, pts, s, e, stuck = run(lanes=("sw", "sw"))
-    check("ShardedSource：软解路块尾缺格、**源探不出来** -> 放行、记 probe_unknown（2026-09-24 审核：探失败 ≠ 真吞帧）",
-          not stuck and e is None and s.probe_unknown == 1, (stuck, e, s.probe_unknown))
+    check("ShardedSource：软解路块尾核对、**源探不出来** -> 放行、每块记一笔 probe_unknown（2026-09-24 审核：探失败 ≠ 真吞帧）",
+          not stuck and e is None and s.probe_unknown == 4, (stuck, e, s.probe_unknown))
     out, pts, s, e, stuck = run()
-    check("ShardedSource：硬解路块尾缺格、源探不出来 -> 保守当吞帧（整段退软解）",
+    check("ShardedSource：硬解路块尾、源探不出来 -> 保守当吞帧（整段退软解）",
           not stuck and isinstance(e, fsx.HwaccelMismatch), (stuck, e))
 
     reset()
     Fake.missing = set(range(0, 60))
     out, pts, s, e, stuck = run()
-    check("ShardedSource：首块整块是**素材缺口**（源里也没有）-> 放行，缺格记 2 个",
-          not stuck and e is None and out == [60, 90, 120, 150, 180, 210] and s.grid_skipped == 2, (stuck, e, out, s.grid_skipped))
+    check("ShardedSource：首块整块是**素材缺口**（源里也没有）-> 放行，空桶记 2 个",
+          not stuck and e is None and out == [60, 90, 120, 150, 180, 210] and s.cells_skipped == 2, (stuck, e, out, s.cells_skipped))
 
     reset()
-    Fake.missing = set(range(100, 150))          # 缺口从第 1 块尾（100~119，没有格）跨进第 2 块头（缺格 120）
+    Fake.missing = set(range(150, 180))          # 第 2 块后半整个桶缺（块首的关键帧 120 在）：空桶在合流处只数一次
     out, pts, s, e, stuck = run()
-    check("ShardedSource：跨接缝的缺口**只数一次**（块尾归这里核、块头归块自己核；原来接缝核从上一帧数到下一帧、和块自己的重了）",
-          not stuck and e is None and out == [0, 30, 60, 90, 150, 180, 210] and s.grid_skipped == 1, (e, out, s.grid_skipped))
+    check("ShardedSource：块里的缺口空桶**只数一次**（合流处统一数；块尾核对不数）",
+          not stuck and e is None and out == [0, 30, 60, 90, 120, 180, 210] and s.cells_skipped == 1, (e, out, s.cells_skipped))
 
     reset()
-    Fake.eaten = {210}
+    Fake.eaten = set(range(210, 240))
     out, pts, s, e, stuck = run()
-    check("ShardedSource：**末块尾**源里有却没交 -> 照样抛（只是不数进缺格）",
+    check("ShardedSource：**末块尾**源里有却没交 -> 照样抛",
           not stuck and isinstance(e, fsx.HwaccelMismatch), (stuck, e, out))
     reset()
-    Fake.missing = {210}
+    Fake.missing = set(range(210, 240))
     out, pts, s, e, stuck = run()
-    check("ShardedSource：末块尾是素材缺口 -> 放行、不数缺格（同单路：窗口尾归覆盖率那道门）",
-          not stuck and e is None and out[-1] == 180 and s.grid_skipped == 0 and s.advanced == 210, (e, out, s.grid_skipped))
+    check("ShardedSource：末块尾是素材缺口 -> 放行、不数空桶（同单路：窗口尾归覆盖率那道门）",
+          not stuck and e is None and out[-1] == 180 and s.cells_skipped == 0 and s.advanced_us == 3_500_000,
+          (e, out, s.cells_skipped))
+
+    # 接缝去重：块首帧和合流里上一帧同桶就丢（块边界不在桶边界上时，下一块的第一帧 ffmpeg 会当新桶选中）
+    reset()
+    out, pts, s, e, stuck = run(blocks=[(None, 45), (45, 105), (105, None)], nblocks=2)
+    fwd = [p[1] for p in pts if p is not dsh.framesource.QUEUE_SENTINEL]
+    check("接缝去重：块边界在桶中间（45、105）时块首帧和上一块同桶 -> 丢掉；采样帧和整片跑同一批，辅助流也不重复（按辅助桶 + 采样桶成对判）",
+          not stuck and e is None and out == [0, 30, 60, 90] and s.seam_dropped == 2 and fwd == [key(i) for i in range(120)],
+          (e, out, s.seam_dropped, len(fwd)))
+    check("接缝去重的判据：同格才丢（采样流比桶号，辅助流比 (采样桶, 辅助桶)）；合流里还没有帧时不丢",
+          dsh.seam_drop(3, 3) and not dsh.seam_drop(3, 4) and not dsh.seam_drop(None, 0)
+          and dsh.seam_drop((1, 40), (1, 40)) and not dsh.seam_drop((1, 40), (1, 41)) and not dsh.seam_drop((1, 40), (2, 40)))
+    reset()
+    out, pts, s, e, stuck = run(blocks=[(None, 10), (10, 20), (20, None)], nblocks=1)
+    check("接缝去重：一块整个落在一个桶里时去重之后一帧不交，同样正确",
+          not stuck and e is None and out == [0, 30] and s.seam_dropped == 2, (e, out, s.seam_dropped))
 
     for nb in (3, 4):
         reset()
@@ -304,15 +357,15 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
     check("ShardedSource：字节预算小到几乎为 0 也不互等（有消费者在等的块永远放行），帧照样按序交全",
           not stuck and e is None and out == list(range(0, 360, 30)) and s.peak_mb * (1 << 20) < 6 * 256, (stuck, e, out, s.peak_mb))   # 全部 6 块共 1,536 字节：从没攒满过
 
-    # 主流交到块的最后一个格之后，辅助流不再按预算挡（审核第三轮：FfmpegSource 读完主流会自己收摊、等 10 s 就杀，
-    # 这时还被预算挡着的辅助帧会让 ffmpeg 卡在写上被杀掉）。直接测 `_admit`：预算 0、没人在等
-    s0 = dsh.ShardedSource("v", lanes=["hw"], blocks=[(0, 60, None)], start_idx=0, end_idx=60, grid=_every(30), src_fps=60.0,
+    # 主流交到块最后可能的那个桶之后，辅助流不再按预算挡（审核第三轮：块尾辅助帧不是预取，挡着它只会让 ffmpeg 卡在写上）。
+    # 直接测 `_admit`：预算 0、没人在等
+    s0 = dsh.ShardedSource("v", lanes=["hw"], blocks=[(None, 60)], stream=fake_stream(), window=window2(0, 2),
                            width=4, height=4, hwaccel="cuda", budget_mb=0)
-    b0 = dsh._Block(s0, 0, "hw", 60)
+    b0 = dsh._Block(s0, 0, "hw", None, 60)
     s0._buffered = 10
 
-    def try_admit(last_main):
-        b0.last_main = last_main
+    def try_admit(last_cell):
+        b0.last_main = fake_frame(last_cell * 30, last_cell)
         def admit():
             with s0._cv:
                 try:
@@ -330,13 +383,13 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
             th.join(2)
             s0._closed = False
         return blocked
-    check("ShardedSource._admit：主流还没到块尾时按预算挡；主流交到块的最后一个格之后放行（块尾辅助帧不是预取）",
-          try_admit(0) and not try_admit(30))
+    check("ShardedSource._admit：主流还没到块尾时按预算挡；主流交到块里最后可能的那个桶（块终点前一刻所在的桶）之后放行",
+          b0.max_cell == 1 and try_admit(0) and not try_admit(1))
 
     # 预取块失败 / 辅助读端被取消时，被预算挡着的辅助写入要当场退出（否则 cancel 的 join 超时，清理错误盖掉硬解失败）
     def parked_exits(kill):
-        b1 = dsh._Block(s0, 1, "hw", 60)
-        b1.last_main = 0
+        b1 = dsh._Block(s0, 1, "hw", None, 60)
+        b1.last_main = fake_frame(0, 0)
         s0._buffered = 10
         res = []
         def admit():
@@ -362,13 +415,18 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
           parked_exits(fail_block) and parked_exits(lambda b1: b1.close()))
 
     # 契约（效率分支复审）：**真实的** `FfmpegSource.cancel -> AuxReader.abort -> _Block.close` 叫得醒被预算挡在 `_admit` 里的辅助读线程。
-    # 替身只有 ffmpeg 那一头（本机 socket 往 AuxReader 写像素）和 FfmpegSource 的进程状态，不用 GPU、不起 ffmpeg
+    # 替身只有 ffmpeg 那一头（本机 socket 往 AuxReader 写像素 + 它的 pts 项）和 FfmpegSource 的进程状态，不用 GPU、不起 ffmpeg
     import socket as _so
+    from queue import Queue as _Q
+
     from flowocr.extract import framesource as _fsr
-    b2 = dsh._Block(s0, 2, "hw", 60)
-    b2.last_main = 0
+    b2 = dsh._Block(s0, 2, "hw", None, 60)
+    b2.last_main = fake_frame(0, 0)
     s0._buffered = 10
-    rd = _fsr.AuxReader(start_idx=0, n_frames=8, step=1, width=4, height=4, sink=b2).start()
+    _pq = _Q()
+    for _k in range(8):
+        _pq.put((_k, key(_k), 0, _k))
+    rd = _fsr.AuxReader(width=4, height=4, sink=b2, pts_q=_pq).start()
     feed = _so.create_connection(("127.0.0.1", int(rd.url.rsplit(":", 1)[1])))
     feed.sendall(bytes(16 * 8))
     t_park = time.monotonic()
@@ -399,22 +457,50 @@ def _shard_behaviour_checks(dsh, fsx) -> None:
         later = None
     except RuntimeError as exc:
         later = exc
+    # 第 2 块先交帧 120、交到帧 150 才抛。消费者赶在抛之前读到第 2 块就会先拿到 120（机器忙时会这样），同单路 FfmpegSource
+    # 交过几帧再抛 HwaccelMismatch：worker 退出、整段软解重跑，已交的帧作废。所以按块序 = 第 0、1 块交全、第 2 块只交失败点之前的帧
     check("ShardedSource：预取块硬解失败且清理也出错 -> 消费者仍按块序拿到 HwaccelMismatch（才会走软解重跑），清理错误由之后的 close() 报",
-          not stuck and isinstance(e, dsh.framesource.HwaccelMismatch) and out == list(range(0, 120, 30))
+          not stuck and isinstance(e, dsh.framesource.HwaccelMismatch)
+          and out[:4] == list(range(0, 120, 30)) and out[4:] in ([], [120])
           and later is not None and "清理失败" in str(later), (stuck, e, out, later))
 
     reset()
 
     def slow_plan():
-        for k in range(4):
+        for blk in blocks_of(4):
             time.sleep(0.01)
-            yield (k * 60, (k + 1) * 60, None if k == 0 else k + 0.0005)
+            yield blk
     out, pts, s, e, stuck = run(blocks=slow_plan())
     check("ShardedSource：块表边探边给（可迭代对象 + 规划线程）-> 结果同整张表",
           not stuck and e is None and out == list(range(0, 240, 30)) and len(s.blocks) == 4, (stuck, e, out))
-    out, pts, s, e, stuck = run(blocks=iter([(0, 60, None), (90, 240, 1.5)]))
+    out, pts, s, e, stuck = run(blocks=iter([(None, 60), (90, None)]))
     check("ShardedSource：块表不连续 -> 规划失败、抛出来（不往下解）",
           not stuck and isinstance(e, RuntimeError) and "不连续" in str(e), (stuck, e))
+    reset()
+
+    # 硬解路每块交出的第一帧（owner 2026-11-23）：块里的 ① ② 看不到它真正的上一帧，合流处补一道（纯函数）
+    from flowocr.extract.framegrid import Axis
+    w = window2(0, 8)
+    TB = Axis((1, 60))
+    pk = Packets()
+    check("block_first_eaten：关键帧是新桶、交出的第一帧却不是关键帧 -> 关键帧被吞（NVDEC 少交块头）；关键帧就是第一帧 -> 没事",
+          dsh.block_first_eaten(w, TB, 120, 121, 4, 3, 60.0, pk) == [120]
+          and dsh.block_first_eaten(w, TB, 120, 120, 4, 3, 60.0, pk) == [])
+    check("block_first_eaten：关键帧和上一帧同桶（它不该交）、第一帧是下一桶的第一帧 -> 没事；下一桶的第一帧被吞、交出的晚了 -> 问源、抛",
+          dsh.block_first_eaten(w, TB, 100, 120, 4, 3, 60.0, pk) == []
+          and dsh.block_first_eaten(w, TB, 100, 150, 5, 3, 60.0, pk) == list(range(120, 150)))
+    Fake.missing = set(range(120, 150))
+    check("block_first_eaten：隔开的那个桶是素材缺口（源里没有）-> 放行；探不出来 -> None（硬解路按吞帧算）",
+          dsh.block_first_eaten(w, TB, 100, 150, 5, 3, 60.0, pk) == [])
+    Packets.fails = True
+    check("block_first_eaten：探不出来返回 None", dsh.block_first_eaten(w, TB, 100, 150, 5, 3, 60.0, pk) is None)
+    reset()
+    Fake.eaten = {120}
+    out, pts, s, e, stuck = run()
+    check("ShardedSource：硬解路块头的关键帧被吞（同桶下一帧顶上、只晚一帧）-> 合流处抛 HwaccelMismatch",
+          not stuck and isinstance(e, fsx.HwaccelMismatch) and "第一帧" in str(e), (stuck, e, out))
+    out, pts, s, e, stuck = run(lanes=("sw", "sw"))
+    check("同样的形状在软解路上不加这道（软解不吞帧），照常交出", not stuck and e is None and 121 in out, (e, out))
     reset()
 
 
@@ -519,4 +605,4 @@ def _zip_bundle(src: Path, dst: Path, game: str = "genshin", tamper: str | None 
     return dst
 
 
-__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', '_every', 'check', 'high_quality_default', 'FIXED_PAD', 'fixed_pad', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']
+__all__ = ['ROOT', 'FAILED', 'evalkit', 'srtio', 'importlib', 'subprocess', 'sys', 'inspect', 'tempfile', 'Path', 'raises', 'fake_stream', 'window2', 'fake_frame', 'check', 'high_quality_default', 'FIXED_PAD', 'fixed_pad', 'fake_widths', 'render_overlay', 'SRT_OK', '_shard_behaviour_checks', 'COMMON', 'synthetic_gamescript', '_mini_bundle', '_zip_bundle']

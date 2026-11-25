@@ -10,6 +10,9 @@
   内置的 `gametext` 返回的是 `scriptmatch.SCHEMA` 那种完整产物。
 
 `options["table"]` 是一份 JSON 文件路径：`{"ocr 读到的文本": "原文", ...}`。
+
+`CONTEXT_KEYS` / `OPTION_KEYS`（可选）声明它认哪些 `--ctx` / `--opt` 键：命令行给了别的键会打警告（写错键名、写错边）。
+多读一个键记得加进来；不写这两行就不查。
 """
 from __future__ import annotations
 
@@ -17,6 +20,9 @@ import json
 from pathlib import Path
 
 from flowocr.artifacts import tracksio
+
+CONTEXT_KEYS = ()
+OPTION_KEYS = ("table",)
 
 
 def cluster_patch(context: dict, options: dict | None = None) -> dict:

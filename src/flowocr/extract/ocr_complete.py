@@ -10,12 +10,12 @@ from __future__ import annotations
 import os
 
 COVER_TOL = 0.98
-"""容器元数据允许虚报多少。`CAP_PROP_FRAME_COUNT` 在游戏切片上多报 1%
+"""容器元数据允许虚报多少（`--end 0` 时要求的长度按容器时长算）。游戏切片上帧数多报过 1%
 （声称 36,361、实际 36,001）——这不是没跑完，是元数据不准。"""
 
 
 def is_complete(got: int, want: int, tol: float = COVER_TOL) -> bool:
-    """推进到的帧数够不够。
+    """推进到的时长够不够（µs：`_meta.advanced_us` 对 `_meta.requested_us`）。
 
     **不要再把"解码器提前返回"当成没跑完**（2026-09-08）：读到文件真正的结尾
     也会提前返回，于是九段切片每次跑完都自称未完成、退出码 3，
@@ -23,29 +23,28 @@ def is_complete(got: int, want: int, tol: float = COVER_TOL) -> bool:
     **改数据没改代码**。
 
     中途真断了这道门自己会拦：40% 处解码失败时 `got/want` 就是 0.4。
+    推进量 = 最后一个采样帧所在桶的结束 − 窗口起点（frame-pts 计划）：缺口 / VFR 稀处那几个空桶不算"没跑完"。
     """
     return got >= max(1, want) * tol
 
 
-def aux_shortfall(edge_meta: dict | None, last_idx: int | None, grid) -> str | None:
+def aux_shortfall(edge_meta: dict | None, last_sample_us: int | None) -> str | None:
     """辅助流（两遍合一遍的回抠证据）有没有**交够**：返回问题（None = 没问题）。**纯函数，守卫直接测。**
 
     2026-09-24 审计（Claude / Codex 两份都指出）：辅助流出错原来只记进 `_meta.edge`、`complete` 照样为真，
-    于是回抠证据半路断掉的 obs 会被一直复用。**`aux_stopped_early` 不能当判据**——有丢帧缺口的素材上单路也会置上
-    （辅助流按数量收口、缺口处凑不够数，f3 / f4 每一臂都是 True）。判据是两条：
-    ①pts 和帧对不上（`aux_misaligned`，停下来的那一刻起证据就没了）；②**辅助流没盖到采样流的最后一帧**
-    （同一个 ffmpeg 出两路，最后一个辅助帧号不该早于 `grid.cover_floor(最后一个采样帧)`；`grid` 是 `AuxGrid`）。
-    `aux_last_key` 不在（旧产物 / 不经 `AuxReader` 的 nvdec / cuvid 那几路）就只判第①条。"""
+    于是回抠证据半路断掉的 obs 会被一直复用。判据是两条：①pts 和帧对不上（`aux_misaligned`，停下来的那一刻起证据就没了）；
+    ②**辅助流没盖到采样流的最后一帧**：采样帧一定在辅助流里，所以最后一个辅助帧的 `t_us`（`aux_last_key`）不能早于最后一个采样帧的。
+    `aux_stopped_early` 不当判据（读到半帧才置，单看它分不出谁先断）。"""
     e = edge_meta or {}
     if "aux_sent" not in e:
         return None
     if e.get("aux_misaligned"):
         return f"辅助流的 pts 和帧对不上、提前停了：{e['aux_misaligned']}"
-    if last_idx is None or "aux_last_key" not in e:
+    if last_sample_us is None:
         return None
-    k = e["aux_last_key"]
-    if k is None or k < grid.cover_floor(last_idx):
-        return f"辅助流只到帧 {k}、采样流到了帧 {last_idx}（辅助流半路断了，之后的回抠证据是缺的）"
+    k = e.get("aux_last_key")
+    if k is None or k < last_sample_us:
+        return f"辅助流只到 {k} µs、采样流到了 {last_sample_us} µs（辅助流半路断了，之后的回抠证据是缺的）"
     return None
 
 
@@ -60,7 +59,7 @@ def obs_reusable(path, argv=None) -> tuple[bool, str]:
     四个条件，缺一不可：
     - `_meta.complete` 为真（跑完了）；
     - **`_meta.timebase == "pts"`**（时间轴是新口径的）；
-    - **`_meta.decoder` 是当前默认**（`framesource.DEFAULT_DECODER`，两种解码器不混用）；
+    - **`_meta.frame_key == "t_us"`**（帧身份是这一帧自己的 pts，frame-pts 计划；之前的帧号口径整份重跑）；
     - 给了 `argv`（这一趟**要跑的** `run_ocr2` 命令行）时，**生效配置**对得上
       （**跑的是同一段、同一条臂**——`--start` / `--end` 就在配置里）：用 `flowocr.extract.ocr_args` 那同一个解析器把 `argv` 解析出来，
       和产物的 `_meta.config` 逐键比，`--out` / `--progress-every` 除外。
@@ -93,15 +92,9 @@ def obs_reusable(path, argv=None) -> tuple[bool, str]:
     if meta.get("timebase") != "pts":
         return False, (f"时间轴不是 pts（产物记的是 {meta.get('timebase')!r}）"
                        f"——旧口径 `idx / src_fps` 的产物一律重跑，回填补不回丢帧缺口")
-    # **解码器也要是当前默认那个**（owner 2026-09-10："不想有的用 cv2 有的用 ffmpeg"）。
-    # 两种解码器的产物不逐字节相同，不拦的话，默认一改，磁盘上旧默认产的那批仍然
-    # "已跑完"、被驱动脚本跳过——于是同一批里两种混着，而且不报错。和上面 timebase
-    # 那道门是同一个形状：写在文档里 ≠ 代码上拦得住。
-    from flowocr.extract import framesource
-
-    if meta.get("decoder") != framesource.DEFAULT_DECODER:
-        return False, (f"解码器是 {meta.get('decoder')!r}，当前默认是 "
-                       f"{framesource.DEFAULT_DECODER!r}——两种解码器的产物不混用")
+    if meta.get("frame_key") != "t_us":
+        # 帧身份 2026-11-23 改成按帧自己的时间戳（frame-pts 计划）：之前的产物按帧号选帧、证据按帧号记，owner 定整体重转
+        return False, "帧身份是旧的帧号，重跑阶段 1"
     if want_cfg is not None:
         got = meta.get("config")
         if got is None:
@@ -115,31 +108,24 @@ def obs_reusable(path, argv=None) -> tuple[bool, str]:
         if diff:
             return False, "参数对不上：" + "，".join(
                 f"{k} 产物 {got.get(k)!r} / 要的是 {want_cfg.get(k)!r}" for k in diff)
-        # **采样网格和辅助流网格按生效值比**（2026-09-24 时间网格）：两者都要结合素材的帧率才定得下来，
-        # 按产物自己的 `src_fps` 算要的网格。时间网格之前的产物只记整数步长：采样 `_meta.stride`；
-        # 辅助流 `_meta.aux_step_effective`（加 `--aux-max-fps` 之后）或 `config.refine_step`（更早，没封顶）
-        from flowocr.extract.framegrid import AuxGrid, TimeGrid
+        # **采样桶和辅助桶按生效值比**：两者都要结合素材的名义帧率才定得下来（吸附、名义 / k），按产物自己的 `nominal_fps` 算要的值
+        from flowocr.extract.framegrid import AuxClock, SampleClock
 
-        src = meta.get("src_fps") or 0.0
+        nom = meta.get("nominal_fps")
         try:
-            want_s = ocr_args.sample_grid(src, want_cfg["fps"], want_cfg.get("frame_select", "pts"))
-            want_a = (ocr_args.aux_grid(src, want_cfg["fps"], want_cfg.get("aux_max_fps", ocr_args.AUX_MAX_FPS),
-                                        want_cfg.get("frame_select", "pts")) if want_cfg.get("refine_fused") else None)
+            want_s = ocr_args.sample_clock(nom, want_cfg["fps"])
+            want_a = (ocr_args.aux_clock(nom, want_cfg["fps"], want_cfg.get("aux_max_fps", ocr_args.AUX_MAX_FPS))
+                      if want_cfg.get("refine_fused") else None)
         except ValueError as exc:
             return False, str(exc)
-        got_s = (TimeGrid(*meta["sample_grid"]) if meta.get("sample_grid")
-                 else TimeGrid.every(meta["stride"]) if meta.get("stride") else None)
+        got_s = SampleClock(_frac(meta["sample_clock"])) if meta.get("sample_clock") else None
         if got_s != want_s:
-            return False, (f"采样网格对不上：产物 {got_s.describe(src) if got_s else '没记'} / "
-                           f"要的是 {want_s.describe(src)}（--fps）")
+            return False, (f"采样桶对不上：产物 {got_s.describe() if got_s else '没记'} / 要的是 {want_s.describe()}（--fps）")
         if want_a is not None:
-            got_a = (AuxGrid.from_list(meta["aux_grid"]) if meta.get("aux_grid")
-                     else AuxGrid(TimeGrid.every(meta.get("aux_step_effective", got.get("refine_step", 1))), got_s))
+            got_a = AuxClock.from_list(meta["aux_clock"]) if meta.get("aux_clock") else None
             if got_a != want_a:
-                return False, (f"辅助流的生效网格对不上：产物 {got_a.describe(src)} / 要的是 {want_a.describe(src)}（--aux-max-fps）")
-    stale = seek_dropped_first(meta)
-    if stale:
-        return False, stale
+                return False, (f"辅助流的生效桶对不上：产物 {got_a.describe() if got_a else '没记'} / "
+                               f"要的是 {want_a.describe()}（--aux-max-fps）")
     # **代码指纹对不上时至少要吭一声**（2026-09-19 复审第 3 条）。
     # `code_fp` **故意不进复用判据**——进了就等于"动一下 tools/ 就重跑所有整片"，代价和收益不成比例。
     # 但"旋钮没变、代码变了"正是 09-06 / 09-10 那一族的形状：文件名和配置都没动，驱动静默复用旧产物。
@@ -156,33 +142,15 @@ def obs_reusable(path, argv=None) -> tuple[bool, str]:
     return True, ""
 
 
-def seek_dropped_first(meta: dict) -> str:
-    """修之前的精确 seek 丢了窗口首格的产物（`framesource.SEEK_REV`）：返回作废的原因，不是就返回空串。
-
-    代码指纹故意不进复用判据（见 `obs_reusable` 末尾），所以一次改了"读哪一帧"的修复要自己认出受影响的旧产物，
-    否则沿用原臂名的驱动会一直复用坏的那份（2026-09-26 审计：`--fps 2.2` 的 yuka-f5 窗口）。认的是那个形状本身——
-    没有 `seek_rev`、窗口从片中起、记了缺格、首个采样点比起点晚了至少一个采样间隔；别的旧产物照旧复用。"""
-    if (meta.get("seek_rev") or 1) >= _seek_rev() or not (meta.get("start_sec") or 0) > 0:
-        return ""
-    fps, first = meta.get("sample_fps"), meta.get("pts_first_sec")
-    if not (meta.get("grid_skipped") or 0) > 0 or not fps or first is None:
-        return ""
-    late = first - meta["start_sec"]
-    if late < 1 / fps:
-        return ""
-    return (f"精确 seek 修之前的产物丢了窗口首格（首个采样点晚起点 {late:.3f} s ≥ 一个采样间隔、缺格 {meta['grid_skipped']}）"
-            f"——重跑（framesource.SEEK_REV）")
-
-
-def _seek_rev() -> int:
-    from flowocr.extract import framesource
-    return framesource.SEEK_REV
+def _frac(nd: list[int]):
+    from fractions import Fraction
+    return Fraction(int(nd[0]), int(nd[1]))
 
 
 def obs_finished(path) -> tuple[bool, str]:
     """只问"写完了没有"——给**读**观测的下游用（`gametext_eval.sh`），不是给决定重不重跑的驱动用。
 
-    读的一侧不在乎时间轴口径和解码器（文本检索不看时间，老的 gamestream 观测也照读），
+    读的一侧不在乎时间轴口径和帧身份（文本检索不看时间，老的 gamestream 观测也照读），
     但**半截产物**照样要拦：整场 OCR 跑着的时候 `out/gamestream/<tag>.jsonl` 已经非空，
     `[ -s ]` 会放它进去，量出来是"前二十分钟"的数、而且不报错（2026-09-11 起整场绝区零 /
     星铁和评测同时在跑）。"""
@@ -211,7 +179,7 @@ def _main(argv: list[str] | None = None) -> int:
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="观测产物能不能复用（跑完了 + pts + 默认解码器 + 同一组生效参数，含窗口）")
+        description="观测产物能不能复用（跑完了 + pts 时间轴 + 帧身份是 t_us + 同一组生效参数，含窗口）")
     ap.add_argument("obs")
     ap.add_argument("--finished", action="store_true",
                     help="只问写完了没有（读观测的下游用，见 obs_finished）；不能和 --argv 同给")

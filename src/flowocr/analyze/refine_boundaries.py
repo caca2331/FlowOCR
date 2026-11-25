@@ -12,17 +12,14 @@
 原来的"整框相关系数过门"在打字机上系统性偏早（最后一两个字对整框贡献太小，没打完就过门），
 五款游戏的盲标上全字出现几乎全在 4 帧以外（text-effects 报告）。
 
-2026-09-22 拆成两半（正规化 project-structure）：**像素测量**在 `flowocr.extract.refine_video`（开视频、取裁剪、
-`measure()` 写 `job["measured"]`），这里只做**在已有证据上结算**——`refine_from_obs` 从 obs 行的 `edge`（在线量的）
-重建同一种 `measured`，`apply` 把 `measured` 结算成三个时刻，`attach_ocr` 挂 OCR 中途读数。`refine_tracks` 串起
-"测量 + 结算"：`build_tracks --refine auto`（默认，2026-09-25）用 obs 证据那条路在建轨末尾结算；开视频测的两条路（cv2 / ffmpeg）只给开发探针
-`dev_tools/refine_offline_probe.py` 核对在线证据用。**没有命令行入口**（owner 2026-09-26：测量只在阶段 1、结算只在阶段 2，不另存 `-tracks-refined.json`）。
-提取侧的名字这里 re-export，老调用方的 `rb.make_job` / `rb.measure` 不变。
+**像素测量只在阶段 1 在线做**（`run_ocr2 --refine-fused` -> `flowocr.extract.edge_refine`，证据写进 obs 行的 `edge`），这里只做
+**在已有证据上结算**：`refine_from_obs` 从 obs 行的 `edge` 重建 `measured`，`apply` 把 `measured` 结算成三个时刻，`attach_ocr` 挂 OCR 中途读数。
+`refine_tracks` 由 `build_tracks --refine auto`（默认，2026-09-25）在建轨末尾调。**没有命令行入口**（owner 2026-09-26：测量只在阶段 1、
+结算只在阶段 2，不另存 `-tracks-refined.json`）。开视频按帧号区间开窗的离线测量 frame-pts 计划删了（证据里的时刻都是帧自己的 `t_us`）。
 
-2 fps 采样意味着边界天然有 ±0.25 s 的量化误差，而真正缺的信息只在**每条 run 首尾那一段**里：
-单向顺序解码一遍视频（局部 seek 比顺序读贵：1080p60 上 HEVC 约 35 倍、VP9 约 64 倍，随编码和 GOP 变，boundary-refinement 报告），窗内的帧 retrieve、窗外只 grab。
+2 fps 采样意味着边界天然有 ±0.25 s 的量化误差，而真正缺的信息只在**每条 run 首尾那一段**里，阶段 1 的辅助流正好盖住它。
 
-obs 里没有在线证据（旧 obs、`--no-refine-fused`、非默认的解码器 / 复用设置）时，建轨停在采样级并提示；
+obs 里没有在线证据（旧 obs、`--no-refine-fused`、非默认的复用设置）时，建轨停在采样级并提示；
 要帧级时刻就用默认设置重跑阶段 1（`run_ocr2` 默认在线量证据）。
 """
 from __future__ import annotations
@@ -35,21 +32,17 @@ from pathlib import Path
 
 from flowocr.analyze import build_tracks as bt
 from flowocr.artifacts import tracksio
-from flowocr.extract import edge_refine, ptsclock
+from flowocr.extract import edge_refine
 from flowocr.extract import typewriter_fuse as TF
-from flowocr.extract.framegrid import TimeGrid
-from flowocr.extract.refine_video import (  # noqa: F401   提取那一半（re-export 给老调用方）
-    LEAD_US, PAD, SEEK_WORTH_FRAMES, crop_of, first_true, last_true, make_job, measure, refine_ffmpeg,
-    refine_sequential, video_codec, video_fps, wants,
-)
+from flowocr.extract.framegrid import AuxClock
+from flowocr.extract.refine_video import make_job
 
 
 CODE_FP_FILES = ("src/flowocr/analyze/refine_boundaries.py", "src/flowocr/extract/refine_video.py",
                  "src/flowocr/extract/typewriter_fuse.py",
                  "src/flowocr/extract/edge_refine.py", "src/flowocr/artifacts/tracksio.py",
-                 # `ptsclock` 定的是窗口开在哪一帧、以及帧号换回什么时刻——**它一变，回抠的数就变**
-                 # （2026-09-18 审计补上；`framesource` 的窗口 seek 也读同一份时钟）
-                 "src/flowocr/extract/ptsclock.py", "src/flowocr/extract/framesource.py")
+                 # 吸附的目标点（`AuxClock.targets_us`）由它算——**它一变，回抠的数就变**
+                 "src/flowocr/extract/framegrid.py")
 """回抠这一级的代码指纹覆盖哪些文件（口径同 build_tracks.code_fp，仓库相对路径）。"""
 
 FADE_MAX_US = 500_000
@@ -58,13 +51,11 @@ FADE_MAX_US = 500_000
 MAX_GROW_US = 30_000_000
 """按 obs 证据回抠时，一条 run 的采样级全字最多比它的起点晚这么久（找段首行只往前看这么远）。"""
 
-def obs_sample_grid(meta: dict) -> TimeGrid:
-    """obs 的采样网格（帧号上）：`_meta.sample_grid`（2026-09-24 起）；更早的只有等距的 `stride`。"""
-    if meta.get("sample_grid"):
-        return TimeGrid(*meta["sample_grid"])
-    if meta.get("stride"):
-        return TimeGrid.every(int(meta["stride"]))
-    raise ValueError("obs 的 _meta 既没有 sample_grid 也没有 stride：判不了回抠证据的查找终点（开放边界），用默认设置重跑阶段 1")
+def obs_aux_clock(meta: dict) -> AuxClock:
+    """obs 的辅助流时间桶（`_meta.aux_clock`）：结算时把候选时刻吸附到它的目标点上（`edge_refine.sig_from_records`）。"""
+    if not meta.get("aux_clock"):
+        raise ValueError("obs 的 _meta 没有 aux_clock：判不了回抠证据吸附到哪些目标点，用默认设置重跑阶段 1")
+    return AuxClock.from_list(meta["aux_clock"])
 
 
 def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame_us: int,
@@ -89,7 +80,7 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
     # 它的左沿离 run 左沿 100 px，按左沿判被拒、只剩窄框那条早了 48 帧的证据（2026-09-16）。
     # 同一时刻多条都配上：取 x 重叠最大的；全字那一侧再在所有候选里取模板最晚（hi 最大）的
     with open(obs_path, encoding="utf-8") as f:
-        sgrid = obs_sample_grid(json.loads(next(f))["_meta"])
+        clock = obs_aux_clock(json.loads(next(f))["_meta"])
         for line in f:
             if '"edge"' not in line:
                 continue
@@ -107,8 +98,7 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
                     ov = edge_refine.overlap_match(box, run["boxes"][0][1] if run.get("boxes") else run["box"])
                     if ov and run["t_start"] - prev_tol <= t <= (tfs if tfs is not None else run["t_start"]) + prev_tol \
                             and (t >= run["t_start"]
-                                 or edge_refine.rec_time(ev["on"], ev["on"]["hi"], us_per_frame)
-                                 >= run["t_start"] - us_per_frame):
+                                 or ev["on"]["hi"] >= run["t_start"] - us_per_frame):
                         j.setdefault("ev_on", []).append((t, ov, ev["on"]))
             off = ev.get("off")
             # 被回补作废的结尾证据（`salvage_stale_end`）：回补改写的是那一段的**文本**，结尾窗量的是框里像素什么时候变、
@@ -147,7 +137,7 @@ def refine_from_obs(jobs: list[dict], obs_path: Path, us_per_frame: float, frame
         got_last += last is not None
         got_off += "ev_off" in j
         got_salvaged += bool(j.get("ev_off_salvaged"))
-        m = edge_refine.measured_from_records(first, last, j.get("ev_off"), run["t_end"], us_per_frame, frame_us, sgrid)
+        m = edge_refine.measured_from_records(first, last, j.get("ev_off"), run["t_end"], frame_us, clock)
         if m is not None:
             j["measured"] = m
     # `on_rows` / `off_rows` 数的是**能用的**证据行（`edge_refine.usable`：窗口凑齐、没被回补作废；开了救回时含救回的结尾证据）；
@@ -345,14 +335,12 @@ def obs_evidence(obs_path: Path) -> tuple[dict, bool]:
     return meta, fused
 
 
-def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, video: str = "", thr: float = 0.80,
+def refine_tracks(data: dict, *, fps: float, obs: Path | None, thr: float = 0.80,
                   labels: str = DEFAULT_LABELS, regions: str = "", window: tuple[int, int] | None = None,
-                  step: int = 1, scale: float = 1.0, progress_every: int = 200, obs_code_fp: str = "",
-                  salvage_stale_end: bool = bt.REFINE_SALVAGE_END) -> dict:
-    """在 `data`（`tracksio.load` 读出的 tracks）上**就地**回抠：测量（obs 证据 / 开视频）-> 结算三个时刻 ->
+                  obs_code_fp: str = "", salvage_stale_end: bool = bt.REFINE_SALVAGE_END) -> dict:
+    """在 `data`（`tracksio.load` 读出的 tracks）上**就地**回抠：读 obs 里的在线证据 -> 结算三个时刻 ->
     整段文字效果 `text_effect` -> `boundary_refined` -> cue 首尾按成员重算。返回打印用的统计。
-    `decoder="obs"`（读 obs 里的在线证据）是产物流程唯一的路：`build_tracks --refine auto` 在建轨末尾调它；
-    `"cv2"` / `"ffmpeg"`（开视频测）只给开发探针 `dev_tools/refine_offline_probe.py` 核对在线证据。"""
+    `build_tracks --refine auto` 在建轨末尾调它。`fps` 是参考帧率（`_meta.src_fps`，"一个源帧多长"的容差）。"""
     # **回抠之前把每个事件的首尾抄一份**：cue 的边界只跟着"当初生成它的那个成员边界"走，
     # 靠这份快照配对（tracksio.refresh_cue_bounds 的注释里写了为什么不能按 min/max 重算）。
     before = tracksio.event_times(data)
@@ -371,13 +359,7 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
     evidence: dict = {}
     if obs is None or not obs.is_file():
         raise SystemExit(f"找不到 OCR 观测 {obs}（首字 / 全字融合要用中途读数）：用 --obs 指定")
-    # 帧号 <-> 真实时间：拿 obs 逐采样点的 pts 当锚点（`ptsclock.IndexClock`，见 make_job）。
-    # 没有锚点（旧产物的时间轴不是 pts）时它就是原来的常量换算
-    clock = ptsclock.index_clock_from_obs(obs, us_per_frame)
-    print(f"  [时钟] {len(clock)} 个 pts 锚点"
-          + ("（帧号 × 1/src_fps，旧时间轴）" if not len(clock) else
-             f"；不锚的话首尾差 {(clock.t_of(clock.f[-1]) - clock.f[-1] * us_per_frame) / 1000:+.1f} ms"), flush=True)
-    jobs = [dict(make_job(run, frame_us, us_per_frame, clock), effect_pool=region["label"] in EFFECT_LABELS,
+    jobs = [dict(make_job(run, frame_us), effect_pool=region["label"] in EFFECT_LABELS,
                  frame_size=tuple(data["size"]) if data.get("size") else None)
             for region in regions_view
             if (only is None or region["index"] in only)
@@ -385,34 +367,18 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
             for run in region["runs"]
             if not window or (run["t_start"] < window[1] and run["t_end"] > window[0])]
     v_ocr = attach_ocr(jobs, obs)
-    if decoder == "obs":
-        evidence = refine_from_obs(jobs, obs, us_per_frame, frame_us, salvage_stale_end)
-        evidence["obs_code_fp"] = obs_code_fp   # 产这些证据的是哪一版代码（不是本工具的 code_fp）
-        print(f"  [证据] obs 里 on {evidence.get('on_rows', 0)} 行 / off {evidence.get('off_rows', 0)} 行；"
-              f"{evidence.get('jobs', 0)} 条 run 里段首证据 {evidence.get('jobs_with_on', 0)}、"
-              f"结尾证据 {evidence.get('jobs_with_off', 0)}"
-              + (f"（其中救回被回补作废的 {evidence['jobs_with_off_salvaged']} 条）" if "jobs_with_off_salvaged" in evidence else ""),
-              flush=True)
-        # 一条都没认领到 = 这份 obs 配不上这份轨（换了段、换了区域、或者证据全被作废）。
-        # **静默退回采样级是错的**，口径同 compare_timing"配上 0 条非零退出"
-        if jobs and not evidence["jobs_with_on"] and not evidence["jobs_with_off"]:
-            raise SystemExit(f"[证据] {len(jobs)} 条 run 一条证据都没认领到（obs {obs}）："
-                             f"obs 和轨对不上，或者证据都被回补作废了。要开视频就给 --decoder ffmpeg / cv2")
-    elif decoder == "ffmpeg":
-        if step > 1:
-            for j in jobs:
-                j["step"] = step
-                # 窗口两端对齐到 step 的格子，不然"两端都在"永远不成立
-                j["tw_lo"] -= j["tw_lo"] % step
-                j["hi_start"] -= j["hi_start"] % step
-                j["end_lo"] -= j["end_lo"] % step
-                j["end_hi"] -= j["end_hi"] % step
-                j["lo"] = min(j["lo"], j["tw_lo"], j["end_lo"])
-        refine_ffmpeg(video, jobs, thr, progress_every, step=step, scale=scale)
-    elif step > 1 or scale < 1.0:
-        raise SystemExit("--step / --scale 只在 ffmpeg 窗口模式下有效（--decoder ffmpeg）")
-    else:
-        refine_sequential(video, jobs, thr, progress_every)
+    evidence = refine_from_obs(jobs, obs, us_per_frame, frame_us, salvage_stale_end)
+    evidence["obs_code_fp"] = obs_code_fp   # 产这些证据的是哪一版代码（不是本工具的 code_fp）
+    print(f"  [证据] obs 里 on {evidence.get('on_rows', 0)} 行 / off {evidence.get('off_rows', 0)} 行；"
+          f"{evidence.get('jobs', 0)} 条 run 里段首证据 {evidence.get('jobs_with_on', 0)}、"
+          f"结尾证据 {evidence.get('jobs_with_off', 0)}"
+          + (f"（其中救回被回补作废的 {evidence['jobs_with_off_salvaged']} 条）" if "jobs_with_off_salvaged" in evidence else ""),
+          flush=True)
+    # 一条都没认领到 = 这份 obs 配不上这份轨（换了段、换了区域、或者证据全被作废）。
+    # **静默退回采样级是错的**，口径同 compare_timing"配上 0 条非零退出"
+    if jobs and not evidence["jobs_with_on"] and not evidence["jobs_with_off"]:
+        raise SystemExit(f"[证据] {len(jobs)} 条 run 一条证据都没认领到（obs {obs}）："
+                         f"obs 和轨对不上，或者证据都被回补作废了")
     # 打字速度：OCR 中途读数拟得出来就用它；拟不出来（魔裁：打字快，中途读数都只有一个）
     # 借逐字格直线斜率的全片中位数——**只给首字外推用**，借给全字外推在淡入字体上系统性偏晚
     speeds = [v for j in jobs if j.get("effect_pool", True) and (v := TF.cell_speed(j["measured"][2] if "measured" in j else None))]
@@ -438,8 +404,7 @@ def refine_tracks(data: dict, *, decoder: str, fps: float, obs: Path | None, vid
     mean_end = sum(end_shifts) / len(end_shifts) if end_shifts else 0.0
     data["boundary_refined"] = {"thr": thr, "labels": labels, "regions": regions or "all",
                                 "typewriter": "fuse", "code_fp": bt.code_fp(CODE_FP_FILES),
-                                "decoder": decoder, "step": step, "scale": scale,
-                                **({"evidence": evidence} if decoder == "obs" else {}),
+                                "decoder": "obs", "evidence": evidence,
                                 "runs": n_runs, "moved": n_moved, "how": dict(how), "end_moving": n_moving_end,
                                 # 起点/终点分开报，别再合成一个"平均移动"
                                 "mean_start_shift_s": round(mean_start, 4),
@@ -462,11 +427,11 @@ def refine_code_changed(doc: dict) -> str | None:
     return None if br.get("code_fp") == now else f"回抠代码指纹对不上：产物是 {br.get('code_fp')}，现在是 {now}"
 
 
-def summary_lines(tag: str, st: dict, data: dict, fps: float, decoder: str) -> list[str]:
-    """回抠之后打印的几行（CLI 与 build_tracks 同一份）。"""
+def summary_lines(tag: str, st: dict, data: dict, fps: float) -> list[str]:
+    """回抠之后打印的几行（build_tracks 用）。"""
     out = [f"{tag}: 回抠成功 {st['runs']} 条，其中 {st['moved']} 条边界被移动，"
            f"起点平均移动 {st['mean_start']:.3f}s、终点 {st['mean_end']:.3f}s"
-           f"（{fps:.0f} fps，采样间隔 {data['frame_us']/1e6:.2f}s，{decoder}）"]
+           f"（参考 {fps:.0f} fps，采样间隔 {data['frame_us']/1e6:.2f}s，读 obs 证据）"]
     if st["how"]:
         out.append("   首字 / 全字 / 消失从哪来：" + "、".join(f"{k} {v}" for k, v in sorted(st["how"].items())))
     if st.get("end_moving"):

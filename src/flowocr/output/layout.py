@@ -23,11 +23,13 @@ def plate_pad(size: float) -> float:
 EDGE_PAD = 6
 """字离画面边的最小距离（锚轴往里推、扩出的行不出画面、译文字号的宽度上限）。和底板外扩分开：边距加大不该把贴满整屏的长译文字号压小一档。"""
 
-PLATE_MODES = ("box", "rows", "text", "src")
+PLATE_MODES = ("box", "rows", "text", "textbox", "src")
 """底板怎么画（owner 2026-09-12 要三种比观感）：
 * `box`：原字幕正文框的并集，一整块；
 * `rows`：逐行一块，每行宽 = max(原文这一行的区间, 译文这一行的区间)——多行字幕不填满矩形；
-* `text`：只有译文文字底下有底板；
+* `text`：只有译文文字底下有底板，逐行一块；
+* `textbox`：只盖译文，几行译文（连读音）一整块——`text` 的整块版，不盖原文（owner 2026-11-24：两种需求各有人要）；
+  整块画在 `\\pos` 上的行（free）和别的方案一样取原框；
 * `src`：只盖原文各行（原文框外扩边距），译文超出原文的部分不加底板，更接近原生字幕（owner 2026-10-30；
   阶段 5 的 inpainting 路线默认用它，只抹原文）。调用方传原文框（`src_box`），`text_w` / `axis` / `text_h` 不看；
   整块画的行（单框、行数对不上）和别的方案一样取原文框的外接矩形，几个框之间的空隙也盖上。"""
@@ -38,6 +40,29 @@ OVERLAY_MIN_SCALE = 0.75
 ANCHOR = {"left": 4, "center": 5, "right": 6}
 """对齐方式 → `\\an`（竖直居中，横向锚左沿 / 中心 / 右沿）。"""
 ALIGN_OF = {v: k for k, v in ANCHOR.items()}
+
+
+EMPTY_LINE = 0.5
+"""libass 里一个字也没有的空行只占半行高；行距就是字号（ASS 把字体缩放到 ascender + descender = 字号）；末尾的一个换行不画。
+2026-11-24 用 libass 渲微软雅黑 48 / 100 号量的：「国\\N国」两行的墨迹中心差正好一个字号，「国\\N\\N国」差 1.5 个，`\\an5` 的「\\N国」比「国」低 0.25 个，
+「国\\N」和「国」一样。"""
+
+
+def valign_of(an: int) -> str:
+    """`\\an` 的竖直锚法：1–3 下、4–6 中、7–9 上。"""
+    return "bottom" if an in (1, 2, 3) else "top" if an in (7, 8, 9) else "middle"
+
+
+def line_centers(empty: list[bool], y: float, valign: str, size: float) -> list[float]:
+    """一个元素画出来的几行（末尾的换行已去掉）各自行框的竖直中心：竖直锚点 `y`、锚法 `valign`，有字的行高一个字号、空行半个（`EMPTY_LINE`）。
+    墨迹中心还要往下 `export.ink_dy` 个字号。读音（`ruby.place`）和整块画的底板跟着字长（`core.free_lines`）共用。"""
+    hs = [size * (EMPTY_LINE if e else 1.0) for e in empty]
+    acc = y if valign == "top" else y - sum(hs) / 2 if valign == "middle" else y - sum(hs)
+    out = []
+    for h in hs:
+        out.append(acc + h / 2)
+        acc += h
+    return out
 
 
 def text_span(axis: float, w: float, align: str) -> tuple[float, float]:
@@ -113,6 +138,35 @@ def bands(rects: list[list[float]]) -> list[tuple[list[float], frozenset[int]]]:
     return out
 
 
+def pieces(rects: list[list[float]]) -> list[tuple[list[float], frozenset[int]]]:
+    """几块可能互相重叠的矩形 → 不重叠的矩形，正好拼出它们的并（`bands` 会把同一横条里隔开的几块连成一条，这里不连）：
+    按全部上下沿切成横条，横条里盖着的那几块的横向区间连起来（挨着的也连）各成一段；上下相邻、横向区间和盖着的矩形都相同的段并成一块。
+    返回（矩形, 盖着它的矩形下标）。竖排列横排时的 `rows` 底板（盖原列 + 逐行盖译文）用它：半透明的底板叠起来的地方更黑。"""
+    ys = sorted({v for r in rects for v in (r[1], r[3])})
+    out: list[tuple[list[float], frozenset[int]]] = []
+    live: dict[tuple, int] = {}                 # 上一条横条里的段 (x0, x1, 盖着的) → 它在 out 里的下标
+    for ya, yb in zip(ys, ys[1:]):
+        segs: list[list] = []
+        for x0, x1, i in sorted((r[0], r[2], i) for i, r in enumerate(rects) if r[1] <= ya and r[3] >= yb and r[2] > r[0]):
+            if segs and x0 <= segs[-1][1]:
+                segs[-1][1] = max(segs[-1][1], x1)
+                segs[-1][2].add(i)
+            else:
+                segs.append([x0, x1, {i}])
+        nxt = {}
+        for x0, x1, cov in segs:
+            key = (x0, x1, frozenset(cov))
+            j = live.get(key)
+            if j is None:
+                out.append(([x0, ya, x1, yb], key[2]))
+                j = len(out) - 1
+            else:
+                out[j][0][3] = yb
+            nxt[key] = j
+        live = nxt
+    return out
+
+
 def row_bands(rows: list[list[float]], text_w: list[float], axis, align: str, text_h: float | list[float],
               src_rows: list[list[float]], pad: float, extra: list[list[float]] = ()) -> list[tuple[list[float], frozenset[int]]]:
     """`rows` 方案在译文行数和原文整块不同时的底板（`place_rows` 的 n ≠ k）：译文各行（`row_plates`）、原文整块各行、
@@ -124,7 +178,7 @@ def row_bands(rows: list[list[float]], text_w: list[float], axis, align: str, te
 def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str, pad: float,
                 align: str = "center", text_h: float | list[float] = 0.0,
                 src_rows: list[list[float]] | None = None) -> list[list[float]]:
-    """每行一个底板矩形 [x0, y0, x1, y1]（`box` 模式一整块）。`axis` 是锚轴（一个数 = 各行共用，或逐行一个）；
+    """每行一个底板矩形 [x0, y0, x1, y1]（`box` / `textbox` 模式一整块）。`axis` 是锚轴（一个数 = 各行共用，或逐行一个）；
     译文区间按锚点算（`text_span`）。上下相邻的两行外扩后会叠一条，半透明时叠的地方更黑，所以从中间劈开。
     **字不出底板**：`text_h` 是正文画出来的高（以这一行的中心为准），比原文框高时底板跟着长；`box` 也把译文的左右范围并进来
     （2026-10-05 owner 截图：两行原文框隔得远、字号按两框合起来的高定成 90 号，字形 67 px 高而底板只有 46 px）。
@@ -140,9 +194,15 @@ def plate_rects(rows: list[list[float]], text_w: list[float], axis, mode: str, p
         return row_span(r, th_of.get(id(r), max(ths, default=0.0)))
     if mode == "src":
         out = [padded(r, p) for r in rows]
-    elif mode == "box":
+    elif mode in ("box", "textbox"):
         spans = [text_span(a, w, align) for w, a in zip(text_w, axes)] if text_w and axis is not None else []
-        extra = list(src_rows or [])
+        if mode == "textbox":
+            # 只盖译文：横向取译文区间、竖直按各行（`row_span`），原文整块不并进来；没有字的行（首尾的空行）不算——跟着字长的底板全字后也不含它
+            got = [(s, tall(r)) for s, r, w in zip(spans, rows, text_w) if w > 0]
+            if not got:
+                return []
+            return [[min(s[0] for s, _ in got) - p, min(y[0] for _, y in got) - p, max(s[1] for s, _ in got) + p, max(y[1] for _, y in got) + p]]
+        extra = list(src_rows or []) if mode == "box" else []
         x0 = min([r[0] for r in rows + extra] + [s[0] for s in spans])
         x1 = max([r[2] for r in rows + extra] + [s[1] for s in spans])
         y0 = min([tall(r)[0] for r in rows] + [r[1] for r in extra])
@@ -226,6 +286,45 @@ EM_KEYS = (EM_REF, EM_REF * 2, LATIN_REF, LATIN_REF + " " + LATIN_REF)
 LATIN_EM_DEFAULT = 0.55
 """游戏的版式文件没给 `latin_em`（英文一个拉丁字平均占几个原文一字宽）时用的值：三款量过的游戏原神 0.56、星铁 0.53、绝区零 0.66 的中间
 （en-target 计划，英文版录像的断点尺上取的）。"""
+
+
+COL_INK = 0.82
+"""竖排的列（`fo` 的 `col` 行）字号的**上限**：一个全角字画出来的墨迹宽 ≤ 原列宽 × 这么多（`col_size`；原文字距量不出时就取它）。
+量法：竖排 8 段真值帧上 439 个竖排列框，框内笔画（含描边）的横向范围 / 列框宽，中位数 0.818、四分位 0.733–0.947（vertical-text 计划）。"""
+COL_PITCH = 1.04
+"""竖排的字距：相邻两个字中心的竖直间隔 = 一个全角字的步进宽（`em_unit` × 字号）× 这么多（`col_pitch`）。"""
+COL_INK_KEYS = tuple(EM_REF)
+"""量"一个全角字的墨迹宽"的字：`EM_REF` 的每个字单独量，取中位数（`col_ink_unit`）。阶段 3 / 4 量字宽时带上。"""
+
+
+def col_ink_unit(font: str, widths: dict) -> float:
+    """字号 1 时一个全角字的墨迹宽（`COL_INK_KEYS` 各字的中位数）；没量过退回 `em_unit`（步进宽），再没有是 1。"""
+    got = sorted(w for k in COL_INK_KEYS if (w := widths.get((font, k), 0.0)) > 0)
+    return got[len(got) // 2] if got else em_unit(font, widths) or 1.0
+
+
+def col_pitch(size: float, font: str, widths: dict) -> float:
+    """竖排字号 `size` 时的字距（像素）：`COL_PITCH` 个全角字步进宽（`em_unit`；没量过按字号算）。"""
+    return COL_PITCH * (em_unit(font, widths) or 1.0) * size
+
+
+def col_size(cols: list[list[float]], texts: list[str], font: str, widths: dict) -> int:
+    """竖排列的字号**按原文自己的字距定**，原文照原样一定放得回原列：原文字距 p = 各列"列长 ÷ 这一列的字数"的**最小值**
+    （字数是去掉空白后的字数，标点也算一格；只取字数 ≥ 2 的列）。取最小不取中位数：几列字距不一时按中位数定的字号会让最密那列
+    长出原列（竖排 8 段原文不翻译时 2 条放不回去，取最小是 0），代价是这种条目的字小一点。字号 = p ÷ (`COL_PITCH` × `em_unit`)；
+    上限是一个全角字的墨迹宽 ≤ 原列宽（几列取中位数）× `COL_INK`，没有字数 ≥ 2 的列时就取这个上限。
+    阶段 3 写字幕稿的预览字号、阶段 4 竖排原位都用它。"""
+    ws = sorted(c[2] - c[0] for c in cols)
+    w = ws[(len(ws) - 1) // 2] if ws else 0.0
+    cap = w * COL_INK / col_ink_unit(font, widths)
+    ps = sorted((c[3] - c[1]) / n for c, t in zip(cols, texts) if (n := len("".join(t.split()))) >= 2)
+    size = min(cap, ps[0] / col_pitch(1.0, font, widths)) if ps else cap
+    return max(export.FIT_MIN_SIZE, int(size))
+
+
+def union(rects: list[list[float]]) -> list[float]:
+    """几个框的外接矩形。"""
+    return [min(r[0] for r in rects), min(r[1] for r in rects), max(r[2] for r in rects), max(r[3] for r in rects)]
 
 
 def em_unit(font: str, widths: dict) -> float:
@@ -432,14 +531,16 @@ def motion_segments(boxes: list | None, s: int, e: int) -> list[tuple[int, int, 
     return out or [(s, e, None, None)]
 
 
-def pos_tag(x: float, y: float, seg: tuple, base: tuple[float, float]) -> str:
+def pos_tag(x: float, y: float, seg: tuple, base: tuple[float, float], late: int = 0) -> str:
     """一个元素在一段里的位置标签：静止用 `\\pos`，位移用 `\\move`。`(x, y)` 是按 `base`（条目框的左上角）
-    排出来的静止位置，在动的段把它平移到轨迹上。"""
+    排出来的静止位置，在动的段把它平移到轨迹上。平移量先取整到像素：同一条的各元素（拼严的几块底板、字）平移同样多，
+    截段插值出来的半像素端点不会让各块各自取整、错开一像素。`late`（微秒）：元素比这一段晚这么久才出现，`\\move` 照整段的端点、
+    起止时刻减去它（起点是负的，libass 照样按整段插值）。"""
     a, z, p0, p1 = seg
     if p0 is None:
         return "\\pos(%.0f,%.0f)" % (x, y)
-    x0, y0 = x + p0[0] - base[0], y + p0[1] - base[1]
+    x0, y0 = x + round(p0[0] - base[0]), y + round(p0[1] - base[1])
     if p0 == p1:
         return "\\pos(%.0f,%.0f)" % (x0, y0)
-    x1, y1 = x + p1[0] - base[0], y + p1[1] - base[1]
-    return "\\move(%.0f,%.0f,%.0f,%.0f,0,%d)" % (x0, y0, x1, y1, max(z - a, 0) // 1000)
+    x1, y1 = x + round(p1[0] - base[0]), y + round(p1[1] - base[1])
+    return "\\move(%.0f,%.0f,%.0f,%.0f,%d,%d)" % (x0, y0, x1, y1, -(late // 1000), max(z - a, 0) // 1000 - late // 1000)
